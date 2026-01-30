@@ -20,8 +20,8 @@ LINE_CHANNEL_SECRET = os.getenv("LINE_CHANNEL_SECRET", "")
 LINE_CHANNEL_ACCESS_TOKEN = os.getenv("LINE_CHANNEL_ACCESS_TOKEN", "")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
 
-DATABASE_URL = os.getenv("DATABASE_URL", "")  # Render Environment に入れる
-SHOP_ID = os.getenv("SHOP_ID", "tokyo_01")    # Render Environment に入れる
+DATABASE_URL = os.getenv("DATABASE_URL", "")  # Render Environmentに入れる
+SHOP_ID = os.getenv("SHOP_ID", "tokyo_01")    # Render Environmentに入れる
 
 # ===== In-memory history (MVP) =====
 CHAT_HISTORY = defaultdict(lambda: deque(maxlen=40))  # max 20 turns
@@ -52,11 +52,10 @@ def extract_json(text: str) -> Dict[str, Any]:
         return json.loads(text)
     except Exception:
         pass
-
     start, end = text.find("{"), text.rfind("}")
     if start != -1 and end != -1 and end > start:
         try:
-            return json.loads(text[start : end + 1])
+            return json.loads(text[start:end + 1])
         except Exception:
             pass
     return {}
@@ -65,8 +64,8 @@ def extract_json(text: str) -> Dict[str, Any]:
 def coerce_level(raw: Any, default: int = 5) -> int:
     try:
         if isinstance(raw, str):
-            raw = raw.strip()
-            digits = "".join(ch for ch in raw if ch.isdigit())
+            s = raw.strip()
+            digits = "".join(ch for ch in s if ch.isdigit())
             if digits:
                 raw = int(digits)
         lvl = int(raw)
@@ -76,15 +75,17 @@ def coerce_level(raw: Any, default: int = 5) -> int:
 
 
 def coerce_confidence(raw: Any, default: float = 0.7) -> float:
-    # numbers
+    """
+    OpenAIが '高い' '低い' '80%' などを返しても落ちないように数値化する。
+    返り値は 0.0〜1.0 にクランプ。
+    """
     if isinstance(raw, (int, float)):
         return max(0.0, min(1.0, float(raw)))
 
-    # strings
     if isinstance(raw, str):
         s = raw.strip().lower()
 
-        # Japanese-ish labels
+        # 日本語ラベル
         if s in {"高い", "高め", "high"}:
             return 0.85
         if s in {"中", "普通", "ふつう", "medium"}:
@@ -92,7 +93,7 @@ def coerce_confidence(raw: Any, default: float = 0.7) -> float:
         if s in {"低い", "低め", "low"}:
             return 0.40
 
-        # percent "80%"
+        # "80%"
         if s.endswith("%"):
             try:
                 v = float(s[:-1]) / 100.0
@@ -100,10 +101,9 @@ def coerce_confidence(raw: Any, default: float = 0.7) -> float:
             except Exception:
                 return default
 
-        # numeric "0.8"
+        # "0.8" / "80"
         try:
             v = float(s)
-            # if user wrote 80 instead of 0.8, clamp
             if v > 1.0 and v <= 100.0:
                 v = v / 100.0
             return max(0.0, min(1.0, v))
@@ -131,24 +131,15 @@ def parse_database_url(url: str) -> Dict[str, Any]:
 def db_connect():
     cfg = parse_database_url(DATABASE_URL)
     ctx = ssl.create_default_context()
-    try:
-        return pg8000.connect(
-            user=cfg["user"],
-            password=cfg["password"],
-            host=cfg["host"],
-            port=cfg["port"],
-            database=cfg["database"],
-            ssl_context=ctx,
-        )
-    except Exception:
-        # fallback without ssl if needed
-        return pg8000.connect(
-            user=cfg["user"],
-            password=cfg["password"],
-            host=cfg["host"],
-            port=cfg["port"],
-            database=cfg["database"],
-        )
+    # Render PostgresはTLSが普通に通る
+    return pg8000.connect(
+        user=cfg["user"],
+        password=cfg["password"],
+        host=cfg["host"],
+        port=cfg["port"],
+        database=cfg["database"],
+        ssl_context=ctx,
+    )
 
 
 def ensure_tables_sync():
@@ -272,7 +263,7 @@ async def analyze_and_generate_reply(
         "1:ほぼ脈なし 2:低反応 3:情報収集 4:条件相談 5:検討中 6:前向き 7:候補比較 8:内見検討 9:内見日程調整 10:申込/今すぐ\n\n"
         "【返信】丁寧な日本語で2〜5文。断定しない（必要なら『確認します』）。"
         "温度が高いほど次アクションを具体化（内見日程2択など）。\n\n"
-        "【出力】必ずJSONのみ。"
+        "【出力】必ずJSONのみ。\n"
         "temperature_level は 1〜10 の整数、confidence は 0〜1 の数値（文字は禁止）。\n"
         "keys: temperature_level, confidence, signals, next_goal, reply_text"
     )
@@ -306,8 +297,10 @@ async def analyze_and_generate_reply(
 
         lvl = coerce_level(result.get("temperature_level", 5), default=5)
         conf = coerce_confidence(result.get("confidence", 0.7), default=0.7)
+
+        # 安全側（自信低いときは真ん中寄せ）
         if conf < 0.6:
-            lvl = 5  # safety
+            lvl = 5
 
         reply_text = (result.get("reply_text") or "").strip() or fallback
         temp_info = {
@@ -328,7 +321,7 @@ async def analyze_and_generate_reply(
 
 @app.on_event("startup")
 async def on_startup():
-    # ensure tables (best effort)
+    # テーブルを保証（失敗しても起動は続ける）
     try:
         await asyncio.to_thread(ensure_tables_sync)
     except Exception as e:
@@ -382,7 +375,7 @@ async def line_webhook(
         # memory
         CHAT_HISTORY[conv_key].append({"role": "assistant", "content": reply_text})
 
-        # DB write (best-effort)
+        # DB write (best-effort / never block LINE reply)
         if can_db():
             try:
                 await asyncio.to_thread(db_insert_message_sync, SHOP_ID, conv_key, "user", user_text)
