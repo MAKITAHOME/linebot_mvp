@@ -1,8 +1,8 @@
-raw_conf = result.get("confidence", 0.7)
-try:
-    conf = float(raw_conf)
-except (TypeError, ValueError):
-    conf = 0.7
+fastapi==0.115.0
+uvicorn==0.30.6
+httpx==0.27.2
+pg8000==1.30.5
+
 
 
 
