@@ -3,33 +3,35 @@ import json
 import hmac
 import hashlib
 import base64
-import subprocess
+import asyncio
+import ssl
 from collections import deque, defaultdict
 from typing import Any, Dict, List, Tuple
+from urllib.parse import urlparse, unquote
 
 import httpx
+import pg8000
 from fastapi import FastAPI, Request, Header, HTTPException
 
 app = FastAPI()
 
-# ====== ENV ======
+# ===== ENV =====
 LINE_CHANNEL_SECRET = os.getenv("LINE_CHANNEL_SECRET", "")
 LINE_CHANNEL_ACCESS_TOKEN = os.getenv("LINE_CHANNEL_ACCESS_TOKEN", "")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
 
-DATABASE_URL = os.getenv("DATABASE_URL", "")  # postgres://... (Render Environment)
-SHOP_ID = os.getenv("SHOP_ID", "tokyo_01")
+DATABASE_URL = os.getenv("DATABASE_URL", "")  # Render Environment に入れる
+SHOP_ID = os.getenv("SHOP_ID", "tokyo_01")    # Render Environment に入れる
 
-# ====== In-memory history (MVP) ======
+# ===== In-memory history (MVP) =====
 CHAT_HISTORY = defaultdict(lambda: deque(maxlen=40))  # max 20 turns
 TEMP_HISTORY = defaultdict(lambda: deque(maxlen=3))   # median smoothing
 
 
 # ---------------------------
-# Utils
+# Helpers
 # ---------------------------
 def verify_signature(body: bytes, signature: str) -> bool:
-    """Verify LINE webhook signature."""
     if not LINE_CHANNEL_SECRET:
         return False
     mac = hmac.new(LINE_CHANNEL_SECRET.encode("utf-8"), body, hashlib.sha256).digest()
@@ -45,7 +47,6 @@ def median(values: List[int], default: int = 5) -> int:
 
 
 def extract_json(text: str) -> Dict[str, Any]:
-    """Extract JSON object from model output (handles fenced or extra text)."""
     text = (text or "").strip()
     try:
         return json.loads(text)
@@ -61,8 +62,181 @@ def extract_json(text: str) -> Dict[str, Any]:
     return {}
 
 
+def coerce_level(raw: Any, default: int = 5) -> int:
+    try:
+        if isinstance(raw, str):
+            raw = raw.strip()
+            digits = "".join(ch for ch in raw if ch.isdigit())
+            if digits:
+                raw = int(digits)
+        lvl = int(raw)
+        return max(1, min(10, lvl))
+    except Exception:
+        return default
+
+
+def coerce_confidence(raw: Any, default: float = 0.7) -> float:
+    # numbers
+    if isinstance(raw, (int, float)):
+        return max(0.0, min(1.0, float(raw)))
+
+    # strings
+    if isinstance(raw, str):
+        s = raw.strip().lower()
+
+        # Japanese-ish labels
+        if s in {"高い", "高め", "high"}:
+            return 0.85
+        if s in {"中", "普通", "ふつう", "medium"}:
+            return 0.60
+        if s in {"低い", "低め", "low"}:
+            return 0.40
+
+        # percent "80%"
+        if s.endswith("%"):
+            try:
+                v = float(s[:-1]) / 100.0
+                return max(0.0, min(1.0, v))
+            except Exception:
+                return default
+
+        # numeric "0.8"
+        try:
+            v = float(s)
+            # if user wrote 80 instead of 0.8, clamp
+            if v > 1.0 and v <= 100.0:
+                v = v / 100.0
+            return max(0.0, min(1.0, v))
+        except Exception:
+            return default
+
+    return default
+
+
+def can_db() -> bool:
+    return bool(DATABASE_URL) and bool(SHOP_ID)
+
+
+def parse_database_url(url: str) -> Dict[str, Any]:
+    u = urlparse(url)
+    return {
+        "user": unquote(u.username or ""),
+        "password": unquote(u.password or ""),
+        "host": u.hostname or "",
+        "port": u.port or 5432,
+        "database": (u.path or "").lstrip("/"),
+    }
+
+
+def db_connect():
+    cfg = parse_database_url(DATABASE_URL)
+    ctx = ssl.create_default_context()
+    try:
+        return pg8000.connect(
+            user=cfg["user"],
+            password=cfg["password"],
+            host=cfg["host"],
+            port=cfg["port"],
+            database=cfg["database"],
+            ssl_context=ctx,
+        )
+    except Exception:
+        # fallback without ssl if needed
+        return pg8000.connect(
+            user=cfg["user"],
+            password=cfg["password"],
+            host=cfg["host"],
+            port=cfg["port"],
+            database=cfg["database"],
+        )
+
+
+def ensure_tables_sync():
+    if not can_db():
+        print("[DB] skipped ensure_tables (missing DATABASE_URL or SHOP_ID)")
+        return
+    conn = db_connect()
+    try:
+        cur = conn.cursor()
+        cur.execute("""
+        CREATE TABLE IF NOT EXISTS customers (
+          id BIGSERIAL PRIMARY KEY,
+          shop_id TEXT NOT NULL,
+          conv_key TEXT NOT NULL,
+          last_user_text TEXT,
+          temp_level_raw INT,
+          temp_level_stable INT,
+          confidence REAL,
+          next_goal TEXT,
+          updated_at TIMESTAMPTZ DEFAULT now(),
+          UNIQUE (shop_id, conv_key)
+        );
+        """)
+        cur.execute("""
+        CREATE TABLE IF NOT EXISTS messages (
+          id BIGSERIAL PRIMARY KEY,
+          shop_id TEXT NOT NULL,
+          conv_key TEXT NOT NULL,
+          role TEXT NOT NULL,
+          content TEXT NOT NULL,
+          created_at TIMESTAMPTZ DEFAULT now()
+        );
+        """)
+        conn.commit()
+        print("[DB] tables ensured")
+    finally:
+        conn.close()
+
+
+def db_insert_message_sync(shop_id: str, conv_key: str, role: str, content: str):
+    conn = db_connect()
+    try:
+        cur = conn.cursor()
+        cur.execute(
+            "INSERT INTO messages (shop_id, conv_key, role, content) VALUES (%s,%s,%s,%s)",
+            (shop_id, conv_key, role, content),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def db_upsert_customer_sync(
+    shop_id: str,
+    conv_key: str,
+    last_user_text: str,
+    raw_level: int,
+    stable_level: int,
+    conf: float,
+    next_goal: str,
+):
+    conn = db_connect()
+    try:
+        cur = conn.cursor()
+        cur.execute(
+            """
+            INSERT INTO customers
+              (shop_id, conv_key, last_user_text, temp_level_raw, temp_level_stable, confidence, next_goal, updated_at)
+            VALUES
+              (%s,%s,%s,%s,%s,%s,%s, now())
+            ON CONFLICT (shop_id, conv_key)
+            DO UPDATE SET
+              last_user_text=EXCLUDED.last_user_text,
+              temp_level_raw=EXCLUDED.temp_level_raw,
+              temp_level_stable=EXCLUDED.temp_level_stable,
+              confidence=EXCLUDED.confidence,
+              next_goal=EXCLUDED.next_goal,
+              updated_at=now()
+            """,
+            (shop_id, conv_key, last_user_text, raw_level, stable_level, conf, next_goal),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
 # ---------------------------
-# LINE Reply
+# LINE reply
 # ---------------------------
 async def reply_message(reply_token: str, text: str) -> None:
     url = "https://api.line.me/v2/bot/message/reply"
@@ -78,14 +252,16 @@ async def reply_message(reply_token: str, text: str) -> None:
 
 
 # ---------------------------
-# OpenAI: temperature(10) + reply (single call)
+# OpenAI: temp(10) + reply
 # ---------------------------
-async def analyze_and_generate_reply(last_messages: List[Dict[str, str]], user_text: str) -> Tuple[Dict[str, Any], str]:
+async def analyze_and_generate_reply(
+    last_messages: List[Dict[str, str]], user_text: str
+) -> Tuple[Dict[str, Any], str]:
     fallback = "お問い合わせありがとうございます。内容を確認して改めてご連絡いたします。"
 
     if not OPENAI_API_KEY:
         return (
-            {"temperature_level": 5, "confidence": 0.4, "next_goal": "条件整理", "signals": ["no_api_key"]},
+            {"temperature_level": 5, "confidence": 0.4, "signals": ["no_api_key"], "next_goal": "条件整理"},
             fallback,
         )
 
@@ -94,9 +270,11 @@ async def analyze_and_generate_reply(last_messages: List[Dict[str, str]], user_t
         "温度感に合う返信文を作ってください。\n\n"
         "【温度感10段階】\n"
         "1:ほぼ脈なし 2:低反応 3:情報収集 4:条件相談 5:検討中 6:前向き 7:候補比較 8:内見検討 9:内見日程調整 10:申込/今すぐ\n\n"
-        "【返信】丁寧な日本語で2〜5文。断定せず、必要なら『確認します』。"
-        "温度が高いほど次アクションを具体化（例：内見日程2択）。\n\n"
-        "【出力】必ずJSONのみ。keys: temperature_level, confidence, signals, next_goal, reply_text"
+        "【返信】丁寧な日本語で2〜5文。断定しない（必要なら『確認します』）。"
+        "温度が高いほど次アクションを具体化（内見日程2択など）。\n\n"
+        "【出力】必ずJSONのみ。"
+        "temperature_level は 1〜10 の整数、confidence は 0〜1 の数値（文字は禁止）。\n"
+        "keys: temperature_level, confidence, signals, next_goal, reply_text"
     )
 
     payload = {
@@ -122,17 +300,14 @@ async def analyze_and_generate_reply(last_messages: List[Dict[str, str]], user_t
         result = extract_json(data["choices"][0]["message"]["content"])
         if not result:
             return (
-                {"temperature_level": 5, "confidence": 0.4, "next_goal": "条件整理", "signals": ["json_parse_failed"]},
+                {"temperature_level": 5, "confidence": 0.4, "signals": ["json_parse_failed"], "next_goal": "条件整理"},
                 fallback,
             )
 
-        lvl = int(result.get("temperature_level", 5))
-        lvl = max(1, min(10, lvl))
-
-        conf = float(result.get("confidence", 0.7))
-        conf = max(0.0, min(1.0, conf))
+        lvl = coerce_level(result.get("temperature_level", 5), default=5)
+        conf = coerce_confidence(result.get("confidence", 0.7), default=0.7)
         if conf < 0.6:
-            lvl = 5
+            lvl = 5  # safety
 
         reply_text = (result.get("reply_text") or "").strip() or fallback
         temp_info = {
@@ -146,62 +321,18 @@ async def analyze_and_generate_reply(last_messages: List[Dict[str, str]], user_t
     except Exception as e:
         print(f"[OPENAI] error: {e}")
         return (
-            {"temperature_level": 5, "confidence": 0.4, "next_goal": "条件整理", "signals": ["openai_error"]},
+            {"temperature_level": 5, "confidence": 0.4, "signals": ["openai_error"], "next_goal": "条件整理"},
             fallback,
         )
 
 
-# ---------------------------
-# DB write via psql (no Python DB libs)
-# ---------------------------
-def can_db_write() -> bool:
-    return bool(DATABASE_URL) and bool(SHOP_ID)
-
-
-def psql_exec(sql: str) -> None:
-    """
-    Execute SQL using `psql` command.
-    Requires psql installed in runtime (Render usually has it) and DATABASE_URL.
-    """
-    if not DATABASE_URL:
-        raise RuntimeError("DATABASE_URL missing")
-
-    # Use psql with connection string. ON_ERROR_STOP makes failures non-silent.
-    cmd = ["psql", DATABASE_URL, "-v", "ON_ERROR_STOP=1", "-c", sql]
-    # Capture output for logs
-    out = subprocess.run(cmd, capture_output=True, text=True)
-    if out.returncode != 0:
-        raise RuntimeError(f"psql failed: {out.stderr.strip()}")
-
-
-def db_write_message(shop_id: str, conv_key: str, role: str, content: str) -> None:
-    safe = content.replace("'", "''")  # simplest escaping for single quotes
-    sql = (
-        "INSERT INTO messages (shop_id, conv_key, role, content) "
-        f"VALUES ('{shop_id}', '{conv_key}', '{role}', '{safe}');"
-    )
-    psql_exec(sql)
-
-
-def db_upsert_customer(shop_id: str, conv_key: str, last_user_text: str,
-                       raw_level: int, stable_level: int, conf: float, next_goal: str) -> None:
-    safe_text = last_user_text.replace("'", "''")
-    safe_goal = next_goal.replace("'", "''")
-    sql = f"""
-    INSERT INTO customers
-      (shop_id, conv_key, last_user_text, temp_level_raw, temp_level_stable, confidence, next_goal, updated_at)
-    VALUES
-      ('{shop_id}', '{conv_key}', '{safe_text}', {raw_level}, {stable_level}, {conf}, '{safe_goal}', now())
-    ON CONFLICT (shop_id, conv_key)
-    DO UPDATE SET
-      last_user_text=EXCLUDED.last_user_text,
-      temp_level_raw=EXCLUDED.temp_level_raw,
-      temp_level_stable=EXCLUDED.temp_level_stable,
-      confidence=EXCLUDED.confidence,
-      next_goal=EXCLUDED.next_goal,
-      updated_at=now();
-    """
-    psql_exec(sql)
+@app.on_event("startup")
+async def on_startup():
+    # ensure tables (best effort)
+    try:
+        await asyncio.to_thread(ensure_tables_sync)
+    except Exception as e:
+        print(f"[DB] ensure tables failed: {e}")
 
 
 @app.get("/")
@@ -223,6 +354,7 @@ async def line_webhook(
     for ev in data.get("events", []):
         if ev.get("type") != "message":
             continue
+
         msg = ev.get("message", {})
         if msg.get("type") != "text":
             continue
@@ -235,30 +367,29 @@ async def line_webhook(
         src_id = source.get("userId") or source.get("groupId") or source.get("roomId") or "unknown"
         conv_key = f"{src_type}:{src_id}"
 
-        # Memory log
+        # memory
         CHAT_HISTORY[conv_key].append({"role": "user", "content": user_text})
 
         # AI analyze + reply
         last_msgs = list(CHAT_HISTORY[conv_key])[-20:]
         temp_info, reply_text = await analyze_and_generate_reply(last_msgs, user_text)
 
-        # Stabilize temp
+        # stabilize
         TEMP_HISTORY[conv_key].append(int(temp_info["temperature_level"]))
         stable = median(list(TEMP_HISTORY[conv_key]), default=5)
         temp_info["temperature_level_stable"] = stable
 
-        # Memory log
+        # memory
         CHAT_HISTORY[conv_key].append({"role": "assistant", "content": reply_text})
 
-        # DB write (best-effort; never block reply)
-        if can_db_write():
+        # DB write (best-effort)
+        if can_db():
             try:
-                db_write_message(SHOP_ID, conv_key, "user", user_text)
-                db_write_message(SHOP_ID, conv_key, "assistant", reply_text)
-                db_upsert_customer(
-                    SHOP_ID,
-                    conv_key,
-                    user_text,
+                await asyncio.to_thread(db_insert_message_sync, SHOP_ID, conv_key, "user", user_text)
+                await asyncio.to_thread(db_insert_message_sync, SHOP_ID, conv_key, "assistant", reply_text)
+                await asyncio.to_thread(
+                    db_upsert_customer_sync,
+                    SHOP_ID, conv_key, user_text,
                     int(temp_info["temperature_level"]),
                     int(temp_info["temperature_level_stable"]),
                     float(temp_info["confidence"]),
@@ -270,14 +401,14 @@ async def line_webhook(
         else:
             print("[DB] skipped (missing DATABASE_URL or SHOP_ID)")
 
-        # Logs
+        # logs
         print(
             f"[TEMP] key={conv_key} level_raw={temp_info['temperature_level']} "
             f"level_stable={temp_info['temperature_level_stable']} conf={temp_info['confidence']} "
             f"goal={temp_info['next_goal']}"
         )
 
-        # Reply to LINE
+        # reply
         await reply_message(reply_token, reply_text)
 
     return {"ok": True}

@@ -1,2 +1,5 @@
 #!/usr/bin/env bash
-uvicorn app:app --host 0.0.0.0 --port ${PORT:-8000}
+set -e
+
+uvicorn app:app --host 0.0.0.0 --port "${PORT:-10000}"
+
