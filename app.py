@@ -27,39 +27,44 @@ def verify_signature(body: bytes, signature: str) -> bool:
 # ---------- AI返信生成 ----------
 async def generate_ai_reply(user_text: str) -> str:
     if not OPENAI_API_KEY:
-        return "AIの設定がまだ完了していません。"
+        return "現在AIの設定を確認中です。少々お待ちください。"
 
-    headers = {
-        "Authorization": f"Bearer {OPENAI_API_KEY}",
-        "Content-Type": "application/json",
-    }
+    try:
+        headers = {
+            "Authorization": f"Bearer {OPENAI_API_KEY}",
+            "Content-Type": "application/json",
+        }
 
-    payload = {
-        "model": "gpt-4o-mini",
-        "messages": [
-            {
-                "role": "system",
-                "content": (
-                    "あなたは不動産の追客担当です。"
-                    "丁寧で短い日本語で返信してください。"
-                    "必ず質問か次の提案を入れてください。"
-                ),
-            },
-            {"role": "user", "content": user_text},
-        ],
-        "temperature": 0.6,
-    }
+        payload = {
+            "model": "gpt-4o-mini",
+            "messages": [
+                {
+                    "role": "system",
+                    "content": (
+                        "あなたは不動産の追客担当です。"
+                        "丁寧で短い日本語で返信してください。"
+                        "必ず質問か次の提案を入れてください。"
+                    ),
+                },
+                {"role": "user", "content": user_text},
+            ],
+            "temperature": 0.6,
+        }
 
-    async with httpx.AsyncClient(timeout=15) as client:
-        r = await client.post(
-            "https://api.openai.com/v1/chat/completions",
-            headers=headers,
-            json=payload,
-        )
-        r.raise_for_status()
-        data = r.json()
+        async with httpx.AsyncClient(timeout=15) as client:
+            r = await client.post(
+                "https://api.openai.com/v1/chat/completions",
+                headers=headers,
+                json=payload,
+            )
+            r.raise_for_status()
+            data = r.json()
 
-    return data["choices"][0]["message"]["content"].strip()
+        return data["choices"][0]["message"]["content"].strip()
+
+    except Exception:
+        return "お問い合わせありがとうございます。内容を確認して改めてご連絡いたします。"
+
 
 # ---------- LINE返信 ----------
 async def reply_message(reply_token: str, text: str):
