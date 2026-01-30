@@ -2,7 +2,13 @@ import os, json, hmac, hashlib, base64
 import httpx
 from fastapi import FastAPI, Request, Header, HTTPException
 
+
 app = FastAPI()
+
+@app.get("/")
+def root():
+    return {"ok": True, "service": "linebot_mvp"}
+
 
 SECRET = os.getenv("LINE_CHANNEL_SECRET", "")
 TOKEN  = os.getenv("LINE_CHANNEL_ACCESS_TOKEN", "")
@@ -23,7 +29,10 @@ async def reply_message(reply_token: str, text: str):
         r.raise_for_status()
 
 @app.post("/line/webhook")
-async def line_webhook(request: Request, x_line_signature: str = Header(None)):
+async def line_webhook(
+    request: Request,
+    x_line_signature: str = Header(None, alias="X-Line-Signature"),
+):
     body = await request.body()
 
     if not x_line_signature or not verify_signature(body, x_line_signature):
