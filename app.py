@@ -5,6 +5,8 @@ import hashlib
 import base64
 import asyncio
 import ssl
+import html as html_lib
+from datetime import datetime
 from collections import deque, defaultdict
 from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import urlparse, unquote
@@ -13,6 +15,7 @@ import httpx
 import certifi
 import pg8000
 from fastapi import FastAPI, Request, Header, HTTPException
+from fastapi.responses import HTMLResponse
 
 app = FastAPI()
 
@@ -23,14 +26,17 @@ LINE_CHANNEL_SECRET = os.getenv("LINE_CHANNEL_SECRET", "")
 LINE_CHANNEL_ACCESS_TOKEN = os.getenv("LINE_CHANNEL_ACCESS_TOKEN", "")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
 
-DATABASE_URL = os.getenv("DATABASE_URL", "")
-SHOP_ID = os.getenv("SHOP_ID", "tokyo_01")
+DATABASE_URL = os.getenv("DATABASE_URL", "")          # Render Environment に入れる
+SHOP_ID = os.getenv("SHOP_ID", "tokyo_01")            # Render Environment に入れる（店舗ID）
 
 # /api/* を保護したいときだけ設定（未設定なら開発用に公開のまま）
 ADMIN_API_KEY = os.getenv("ADMIN_API_KEY", "")
 
 # DB SSLモード: auto(推奨) / verify / disable
 DB_SSL_MODE = os.getenv("DB_SSL_MODE", "auto").lower().strip()
+
+# ログを増やしたいときだけ 1
+DEBUG = os.getenv("DEBUG", "0") == "1"
 
 # =========================
 # In-memory (MVP)
@@ -42,6 +48,11 @@ TEMP_HISTORY = defaultdict(lambda: deque(maxlen=3))   # 揺れ止め：中央値
 # =========================
 # Helpers
 # =========================
+def log(msg: str) -> None:
+    if DEBUG:
+        print(msg)
+
+
 def verify_signature(body: bytes, signature: str) -> bool:
     """Verify LINE webhook signature."""
     if not LINE_CHANNEL_SECRET:
@@ -124,15 +135,18 @@ def coerce_confidence(raw: Any, default: float = 0.7) -> float:
     return default
 
 
-def check_admin_key(x_admin_key: Optional[str]) -> None:
+def check_admin_key(x_admin_key: Optional[str], query_key: Optional[str] = None) -> None:
     """
     ADMIN_API_KEY が設定されている時だけ認証を有効にする。
-    未設定なら開発用に公開のまま。
+    ブラウザ用に ?key= も許可（ヘッダー付けにくいので）。
     """
     if not ADMIN_API_KEY:
         return
-    if x_admin_key != ADMIN_API_KEY:
-        raise HTTPException(status_code=401, detail="Unauthorized")
+    if x_admin_key == ADMIN_API_KEY:
+        return
+    if query_key == ADMIN_API_KEY:
+        return
+    raise HTTPException(status_code=401, detail="Unauthorized")
 
 
 def can_db() -> bool:
@@ -150,12 +164,11 @@ def parse_database_url(url: str) -> Dict[str, Any]:
     }
 
 
-def make_ssl_context(mode: str) -> Optional[ssl.SSLContext]:
+def make_ssl_context(mode: str) -> ssl.SSLContext:
     """
     mode:
       - verify:  検証ON（certifi）
       - disable: 検証OFF
-      - auto:    まずverifyで試し、失敗したらdisableにフォールバック
     """
     if mode == "disable":
         ctx = ssl.create_default_context()
@@ -163,7 +176,7 @@ def make_ssl_context(mode: str) -> Optional[ssl.SSLContext]:
         ctx.verify_mode = ssl.CERT_NONE
         return ctx
 
-    # verify / auto の最初は certifi を使って検証ON
+    # verify
     ctx = ssl.create_default_context(cafile=certifi.where())
     ctx.check_hostname = True
     ctx.verify_mode = ssl.CERT_REQUIRED
@@ -176,10 +189,7 @@ def db_connect():
     if not cfg["host"]:
         raise RuntimeError("DATABASE_URL host is empty")
 
-    if DB_SSL_MODE not in {"auto", "verify", "disable"}:
-        mode = "auto"
-    else:
-        mode = DB_SSL_MODE
+    mode = DB_SSL_MODE if DB_SSL_MODE in {"auto", "verify", "disable"} else "auto"
 
     # 1) verify (or auto first try)
     if mode in {"auto", "verify"}:
@@ -264,7 +274,7 @@ def db_write_interaction_sync(
     conf: float,
     next_goal: str,
 ):
-    """1接続でまとめて書く（速く・きれい・失敗が少ない）。"""
+    """1接続でまとめて書く（速く・安定）。"""
     conn = db_connect()
     try:
         cur = conn.cursor()
@@ -456,7 +466,7 @@ async def on_startup():
 
 
 # =========================
-# APIs
+# Routes
 # =========================
 @app.get("/")
 async def root():
@@ -468,15 +478,115 @@ async def api_hot(
     shop_id: str = SHOP_ID,
     min_level: int = 8,
     limit: int = 50,
+    key: Optional[str] = None,  # ブラウザ用
     x_admin_key: Optional[str] = Header(None, alias="X-Admin-Key"),
 ):
-    check_admin_key(x_admin_key)
+    check_admin_key(x_admin_key, key)
 
     min_level = max(1, min(10, int(min_level)))
     limit = max(1, min(200, int(limit)))
 
     items = await asyncio.to_thread(db_fetch_hot_customers_sync, shop_id, min_level, limit)
     return {"shop_id": shop_id, "min_level": min_level, "count": len(items), "items": items}
+
+
+@app.get("/dashboard", response_class=HTMLResponse)
+async def dashboard(
+    shop_id: str = SHOP_ID,
+    min_level: int = 8,
+    limit: int = 50,
+    key: Optional[str] = None,  # ブラウザ用
+    x_admin_key: Optional[str] = Header(None, alias="X-Admin-Key"),
+):
+    check_admin_key(x_admin_key, key)
+
+    min_level = max(1, min(10, int(min_level)))
+    limit = max(1, min(200, int(limit)))
+
+    if not can_db():
+        return HTMLResponse(
+            "<h2>DBが未設定です</h2><p>DATABASE_URL / SHOP_ID をRenderのEnvironmentに入れてください。</p>",
+            status_code=500,
+        )
+
+    items = await asyncio.to_thread(db_fetch_hot_customers_sync, shop_id, min_level, limit)
+
+    now = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC")
+
+    rows_html = ""
+    for it in items:
+        rows_html += f"""
+        <tr>
+          <td>{html_lib.escape(str(it.get("updated_at","")))}</td>
+          <td style="text-align:center">{html_lib.escape(str(it.get("temp_level_stable","")))}</td>
+          <td style="text-align:center">{html_lib.escape(str(it.get("confidence","")))}</td>
+          <td>{html_lib.escape(str(it.get("next_goal","")))}</td>
+          <td><code>{html_lib.escape(str(it.get("user_id") or ""))}</code></td>
+          <td>{html_lib.escape(str(it.get("last_user_text","")))}</td>
+        </tr>
+        """
+
+    html_page = f"""
+    <!doctype html>
+    <html lang="ja">
+    <head>
+      <meta charset="utf-8">
+      <meta name="viewport" content="width=device-width, initial-scale=1">
+      <title>HOT顧客ダッシュボード</title>
+      <style>
+        body {{ font-family: system-ui, -apple-system, Segoe UI, Roboto, sans-serif; margin: 24px; }}
+        .top {{ display:flex; gap:16px; align-items:flex-end; flex-wrap:wrap; }}
+        .card {{ padding: 12px 16px; border: 1px solid #ddd; border-radius: 12px; }}
+        table {{ width: 100%; border-collapse: collapse; margin-top: 12px; }}
+        th, td {{ border-bottom: 1px solid #eee; padding: 10px; vertical-align: top; }}
+        th {{ text-align: left; background: #fafafa; position: sticky; top: 0; }}
+        .muted {{ color: #666; font-size: 12px; }}
+        .pill {{ display:inline-block; padding: 2px 8px; border-radius: 999px; background:#111; color:#fff; font-size:12px; }}
+        input {{ padding: 8px; border: 1px solid #ddd; border-radius: 10px; }}
+        button {{ padding: 8px 12px; border: 1px solid #111; background:#111; color:#fff; border-radius: 10px; cursor:pointer; }}
+        a {{ color: #0b5; text-decoration: none; }}
+      </style>
+    </head>
+    <body>
+      <div class="top">
+        <div class="card">
+          <div><span class="pill">HOT顧客</span> <b>{html_lib.escape(shop_id)}</b></div>
+          <div class="muted">min_level={min_level} / limit={limit} / count={len(items)} / {now}</div>
+          <div class="muted">JSON: <a href="/api/hot?shop_id={html_lib.escape(shop_id)}&min_level={min_level}&limit={limit}{'&key='+html_lib.escape(key) if (ADMIN_API_KEY and key) else ''}">/api/hot</a></div>
+        </div>
+
+        <form class="card" method="get" action="/dashboard">
+          <div class="muted">フィルタ</div>
+          <div style="display:flex; gap:8px; flex-wrap:wrap; margin-top:8px;">
+            <input name="shop_id" value="{html_lib.escape(shop_id)}" placeholder="shop_id">
+            <input name="min_level" value="{min_level}" placeholder="min_level (1-10)">
+            <input name="limit" value="{limit}" placeholder="limit (<=200)">
+            {"<input name='key' value='"+html_lib.escape(key)+"' placeholder='admin key'>" if ADMIN_API_KEY else ""}
+            <button type="submit">更新</button>
+          </div>
+          <div class="muted" style="margin-top:8px;">※ 必要なら次で自動更新も追加できる</div>
+        </form>
+      </div>
+
+      <table>
+        <thead>
+          <tr>
+            <th>更新</th>
+            <th>温度</th>
+            <th>確度</th>
+            <th>次のゴール</th>
+            <th>user_id</th>
+            <th>直近メッセージ</th>
+          </tr>
+        </thead>
+        <tbody>
+          {rows_html if rows_html else "<tr><td colspan='6' class='muted'>該当なし（HOTがまだいない）</td></tr>"}
+        </tbody>
+      </table>
+    </body>
+    </html>
+    """
+    return HTMLResponse(html_page)
 
 
 @app.post("/line/webhook")
