@@ -6,7 +6,7 @@ import base64
 import asyncio
 import ssl
 from collections import deque, defaultdict
-from typing import Any, Dict, List, Tuple
+from typing import Any, Dict, List, Tuple, Optional
 from urllib.parse import urlparse, unquote
 
 import httpx
@@ -20,8 +20,9 @@ LINE_CHANNEL_SECRET = os.getenv("LINE_CHANNEL_SECRET", "")
 LINE_CHANNEL_ACCESS_TOKEN = os.getenv("LINE_CHANNEL_ACCESS_TOKEN", "")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
 
-DATABASE_URL = os.getenv("DATABASE_URL", "")  # Render Environmentに入れる
-SHOP_ID = os.getenv("SHOP_ID", "tokyo_01")    # Render Environmentに入れる
+DATABASE_URL = os.getenv("DATABASE_URL", "")          # Render Environment に入れる
+SHOP_ID = os.getenv("SHOP_ID", "tokyo_01")            # Render Environment に入れる
+ADMIN_API_KEY = os.getenv("ADMIN_API_KEY", "")        # 設定すると /api/* を保護できる（任意）
 
 # ===== In-memory history (MVP) =====
 CHAT_HISTORY = defaultdict(lambda: deque(maxlen=40))  # max 20 turns
@@ -76,7 +77,7 @@ def coerce_level(raw: Any, default: int = 5) -> int:
 
 def coerce_confidence(raw: Any, default: float = 0.7) -> float:
     """
-    OpenAIが '高い' '低い' '80%' などを返しても落ちないように数値化する。
+    OpenAIが '低い/高い/80%' などを返しても落ちないように数値化する。
     返り値は 0.0〜1.0 にクランプ。
     """
     if isinstance(raw, (int, float)):
@@ -113,6 +114,17 @@ def coerce_confidence(raw: Any, default: float = 0.7) -> float:
     return default
 
 
+def check_admin_key(x_admin_key: Optional[str]) -> None:
+    """
+    ADMIN_API_KEY が設定されている時だけ認証を有効にする。
+    未設定なら誰でもアクセス可能（開発用）。
+    """
+    if not ADMIN_API_KEY:
+        return
+    if x_admin_key != ADMIN_API_KEY:
+        raise HTTPException(status_code=401, detail="Unauthorized")
+
+
 def can_db() -> bool:
     return bool(DATABASE_URL) and bool(SHOP_ID)
 
@@ -131,7 +143,6 @@ def parse_database_url(url: str) -> Dict[str, Any]:
 def db_connect():
     cfg = parse_database_url(DATABASE_URL)
     ctx = ssl.create_default_context()
-    # Render PostgresはTLSが普通に通る
     return pg8000.connect(
         user=cfg["user"],
         password=cfg["password"],
@@ -142,10 +153,14 @@ def db_connect():
     )
 
 
+# ---------------------------
+# DB (sync) - called via asyncio.to_thread
+# ---------------------------
 def ensure_tables_sync():
     if not can_db():
         print("[DB] skipped ensure_tables (missing DATABASE_URL or SHOP_ID)")
         return
+
     conn = db_connect()
     try:
         cur = conn.cursor()
@@ -172,6 +187,11 @@ def ensure_tables_sync():
           content TEXT NOT NULL,
           created_at TIMESTAMPTZ DEFAULT now()
         );
+        """)
+        # HOT一覧用にインデックス（速くなる）
+        cur.execute("""
+        CREATE INDEX IF NOT EXISTS idx_customers_shop_level_updated
+        ON customers (shop_id, temp_level_stable, updated_at DESC);
         """)
         conn.commit()
         print("[DB] tables ensured")
@@ -226,6 +246,58 @@ def db_upsert_customer_sync(
         conn.close()
 
 
+def db_fetch_hot_customers_sync(shop_id: str, min_level: int, limit: int):
+    conn = db_connect()
+    try:
+        cur = conn.cursor()
+        cur.execute(
+            """
+            SELECT
+              conv_key,
+              last_user_text,
+              temp_level_raw,
+              temp_level_stable,
+              confidence,
+              next_goal,
+              updated_at
+            FROM customers
+            WHERE shop_id = %s AND temp_level_stable >= %s
+            ORDER BY updated_at DESC
+            LIMIT %s
+            """,
+            (shop_id, min_level, limit),
+        )
+        rows = cur.fetchall()
+
+        items = []
+        for conv_key, last_user_text, raw, stable, conf, goal, updated_at in rows:
+            try:
+                updated_str = updated_at.isoformat()
+            except Exception:
+                updated_str = str(updated_at)
+
+            # conv_key から userId を抜けるなら抜く
+            user_id = None
+            if isinstance(conv_key, str) and conv_key.startswith("user:"):
+                user_id = conv_key.split("user:", 1)[1]
+
+            items.append(
+                {
+                    "conv_key": conv_key,
+                    "user_id": user_id,
+                    "last_user_text": last_user_text,
+                    "temp_level_raw": raw,
+                    "temp_level_stable": stable,
+                    "confidence": conf,
+                    "next_goal": goal,
+                    "updated_at": updated_str,
+                }
+            )
+        return items
+    finally:
+        conn.close()
+
+
 # ---------------------------
 # LINE reply
 # ---------------------------
@@ -264,7 +336,7 @@ async def analyze_and_generate_reply(
         "【返信】丁寧な日本語で2〜5文。断定しない（必要なら『確認します』）。"
         "温度が高いほど次アクションを具体化（内見日程2択など）。\n\n"
         "【出力】必ずJSONのみ。\n"
-        "temperature_level は 1〜10 の整数、confidence は 0〜1 の数値（文字は禁止）。\n"
+        "temperature_level は 1〜10 の整数、confidence は 0〜1 の数値（文字禁止）。\n"
         "keys: temperature_level, confidence, signals, next_goal, reply_text"
     )
 
@@ -319,18 +391,44 @@ async def analyze_and_generate_reply(
         )
 
 
+# ---------------------------
+# Startup
+# ---------------------------
 @app.on_event("startup")
 async def on_startup():
-    # テーブルを保証（失敗しても起動は続ける）
     try:
         await asyncio.to_thread(ensure_tables_sync)
     except Exception as e:
         print(f"[DB] ensure tables failed: {e}")
 
 
+# ---------------------------
+# APIs
+# ---------------------------
 @app.get("/")
 async def root():
     return {"ok": True}
+
+
+@app.get("/api/hot")
+async def api_hot(
+    shop_id: str = SHOP_ID,
+    min_level: int = 8,
+    limit: int = 50,
+    x_admin_key: Optional[str] = Header(None, alias="X-Admin-Key"),
+):
+    check_admin_key(x_admin_key)
+
+    min_level = max(1, min(10, int(min_level)))
+    limit = max(1, min(200, int(limit)))
+
+    items = await asyncio.to_thread(db_fetch_hot_customers_sync, shop_id, min_level, limit)
+    return {
+        "shop_id": shop_id,
+        "min_level": min_level,
+        "count": len(items),
+        "items": items,
+    }
 
 
 @app.post("/line/webhook")
@@ -402,6 +500,4 @@ async def line_webhook(
         )
 
         # reply
-        await reply_message(reply_token, reply_text)
-
-    return {"ok": True}
+        aw
