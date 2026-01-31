@@ -6,7 +6,8 @@ import base64
 import asyncio
 import ssl
 import html as html_lib
-from datetime import datetime
+from datetime import datetime, timezone, timedelta
+from zoneinfo import ZoneInfo
 from collections import deque, defaultdict
 from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import urlparse, unquote
@@ -29,7 +30,7 @@ OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
 DATABASE_URL = os.getenv("DATABASE_URL", "")
 SHOP_ID = os.getenv("SHOP_ID", "tokyo_01")
 
-# 設定すると /api/* と /dashboard を保護（未設定なら開発用に公開）
+# 設定すると /api/* と /dashboard と /jobs/* を保護（未設定なら開発用に公開のまま）
 ADMIN_API_KEY = os.getenv("ADMIN_API_KEY", "")
 
 # DB SSL: auto(推奨) / verify / disable
@@ -37,6 +38,13 @@ DB_SSL_MODE = os.getenv("DB_SSL_MODE", "auto").lower().strip()
 
 # デバッグログ増やしたい時だけ 1
 DEBUG = os.getenv("DEBUG", "0") == "1"
+
+# 自動追客
+FOLLOWUP_ENABLED = os.getenv("FOLLOWUP_ENABLED", "0") == "1"
+FOLLOWUP_JST_FROM = int(os.getenv("FOLLOWUP_JST_FROM", "10"))          # 10時
+FOLLOWUP_JST_TO = int(os.getenv("FOLLOWUP_JST_TO", "20"))              # 20時
+FOLLOWUP_LIMIT_PER_RUN = int(os.getenv("FOLLOWUP_LIMIT_PER_RUN", "30"))
+FOLLOWUP_MIN_HOURS_BETWEEN = int(os.getenv("FOLLOWUP_MIN_HOURS_BETWEEN", "24"))
 
 # =========================
 # In-memory (MVP)
@@ -129,7 +137,7 @@ def coerce_confidence(raw: Any, default: float = 0.7) -> float:
 
 
 def check_admin_key(x_admin_key: Optional[str], query_key: Optional[str] = None) -> None:
-    """ADMIN_API_KEYがある時だけ認証"""
+    """ADMIN_API_KEYがある時だけ認証（ブラウザ用に ?key= も許可）"""
     if not ADMIN_API_KEY:
         return
     if x_admin_key == ADMIN_API_KEY:
@@ -201,6 +209,36 @@ def db_connect():
     )
 
 
+def to_utc(dt):
+    """DBから返るdatetimeをUTCのawareに統一"""
+    if dt is None:
+        return None
+    if getattr(dt, "tzinfo", None) is None:
+        return dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc)
+
+
+def now_utc() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+def in_jst_sending_window() -> bool:
+    """追客送信可能時間帯（JST）か"""
+    jst = datetime.now(ZoneInfo("Asia/Tokyo"))
+    hour = jst.hour
+    return FOLLOWUP_JST_FROM <= hour < FOLLOWUP_JST_TO
+
+
+def conv_key_to_to_id(conv_key: str) -> str:
+    """
+    LINE pushMessage の to に入れるIDを返す
+    conv_key は webhook で作ってる "user:xxx" "group:xxx" "room:xxx"
+    """
+    if ":" not in conv_key:
+        return conv_key
+    return conv_key.split(":", 1)[1]
+
+
 # =========================
 # DB (sync) - use via asyncio.to_thread
 # =========================
@@ -256,6 +294,19 @@ def ensure_tables_sync():
         );
         """)
 
+        # 追客の状態（スパム防止）
+        cur.execute("""
+        CREATE TABLE IF NOT EXISTS followup_state (
+          id BIGSERIAL PRIMARY KEY,
+          shop_id TEXT NOT NULL,
+          conv_key TEXT NOT NULL,
+          followup_count INT DEFAULT 0,
+          last_followup_at TIMESTAMPTZ,
+          last_followup_reason TEXT,
+          UNIQUE (shop_id, conv_key)
+        );
+        """)
+
         # インデックス
         cur.execute("""
         CREATE INDEX IF NOT EXISTS idx_customers_shop_level_updated
@@ -264,6 +315,10 @@ def ensure_tables_sync():
         cur.execute("""
         CREATE INDEX IF NOT EXISTS idx_customer_events_shop_created
         ON customer_events (shop_id, created_at DESC);
+        """)
+        cur.execute("""
+        CREATE INDEX IF NOT EXISTS idx_followup_state_shop_last
+        ON followup_state (shop_id, last_followup_at DESC);
         """)
 
         conn.commit()
@@ -332,89 +387,139 @@ def db_write_interaction_sync(
         conn.close()
 
 
-def _rows_to_items(rows):
-    items = []
-    for conv_key, user_text, raw, stable, conf, goal, ts in rows:
-        try:
-            ts_str = ts.isoformat()
-        except Exception:
-            ts_str = str(ts)
-
-        user_id = None
-        if isinstance(conv_key, str) and conv_key.startswith("user:"):
-            user_id = conv_key.split("user:", 1)[1]
-
-        items.append(
-            {
-                "conv_key": conv_key,
-                "user_id": user_id,
-                "last_user_text": user_text,
-                "temp_level_raw": raw,
-                "temp_level_stable": stable,
-                "confidence": conf,
-                "next_goal": goal,
-                "updated_at": ts_str,
-            }
-        )
-    return items
-
-
-def db_fetch_hot_customers_sync(shop_id: str, min_level: int, limit: int):
-    """最新状態（customers）"""
+def db_insert_assistant_message_sync(shop_id: str, conv_key: str, content: str):
+    """追客送信など（assistantだけ）をmessagesに残す"""
     conn = db_connect()
     try:
         cur = conn.cursor()
         cur.execute(
-            """
-            SELECT
-              conv_key,
-              last_user_text,
-              temp_level_raw,
-              temp_level_stable,
-              confidence,
-              next_goal,
-              updated_at
-            FROM customers
-            WHERE shop_id = %s AND temp_level_stable >= %s
-            ORDER BY updated_at DESC
-            LIMIT %s
-            """,
-            (shop_id, min_level, limit),
+            "INSERT INTO messages (shop_id, conv_key, role, content) VALUES (%s,%s,%s,%s)",
+            (shop_id, conv_key, "assistant", content),
         )
-        return _rows_to_items(cur.fetchall())
+        conn.commit()
     finally:
         conn.close()
 
 
-def db_fetch_hot_events_sync(shop_id: str, min_level: int, limit: int):
-    """履歴（customer_events）"""
+def db_get_last_message_per_conv_sync(shop_id: str):
+    """
+    各conv_keyの最新メッセージ（role/created_at/content）＋ customers の温度
+    """
     conn = db_connect()
     try:
         cur = conn.cursor()
         cur.execute(
             """
-            SELECT
-              conv_key,
-              user_text,
-              temp_level_raw,
-              temp_level_stable,
-              confidence,
-              next_goal,
-              created_at
-            FROM customer_events
-            WHERE shop_id = %s AND temp_level_stable >= %s
+            SELECT DISTINCT ON (m.conv_key)
+              m.conv_key,
+              m.role,
+              m.content,
+              m.created_at,
+              c.temp_level_stable,
+              c.confidence,
+              c.next_goal
+            FROM messages m
+            JOIN customers c
+              ON c.shop_id = m.shop_id AND c.conv_key = m.conv_key
+            WHERE m.shop_id = %s AND c.shop_id = %s
+            ORDER BY m.conv_key, m.created_at DESC
+            """,
+            (shop_id, shop_id),
+        )
+        return cur.fetchall()
+    finally:
+        conn.close()
+
+
+def db_get_last_user_at_map_sync(shop_id: str) -> Dict[str, datetime]:
+    conn = db_connect()
+    try:
+        cur = conn.cursor()
+        cur.execute(
+            """
+            SELECT DISTINCT ON (conv_key)
+              conv_key, created_at
+            FROM messages
+            WHERE shop_id=%s AND role='user'
+            ORDER BY conv_key, created_at DESC
+            """,
+            (shop_id,),
+        )
+        rows = cur.fetchall()
+        m = {}
+        for conv_key, created_at in rows:
+            m[conv_key] = to_utc(created_at)
+        return m
+    finally:
+        conn.close()
+
+
+def db_get_followup_state_map_sync(shop_id: str) -> Dict[str, Dict[str, Any]]:
+    conn = db_connect()
+    try:
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT conv_key, followup_count, last_followup_at, last_followup_reason FROM followup_state WHERE shop_id=%s",
+            (shop_id,),
+        )
+        rows = cur.fetchall()
+        m = {}
+        for conv_key, cnt, last_at, reason in rows:
+            m[conv_key] = {
+                "followup_count": int(cnt or 0),
+                "last_followup_at": to_utc(last_at),
+                "last_followup_reason": reason,
+            }
+        return m
+    finally:
+        conn.close()
+
+
+def db_upsert_followup_state_sync(shop_id: str, conv_key: str, new_count: int, reason: str):
+    conn = db_connect()
+    try:
+        cur = conn.cursor()
+        cur.execute(
+            """
+            INSERT INTO followup_state (shop_id, conv_key, followup_count, last_followup_at, last_followup_reason)
+            VALUES (%s,%s,%s, now(), %s)
+            ON CONFLICT (shop_id, conv_key)
+            DO UPDATE SET
+              followup_count=EXCLUDED.followup_count,
+              last_followup_at=now(),
+              last_followup_reason=EXCLUDED.last_followup_reason
+            """,
+            (shop_id, conv_key, new_count, reason),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def db_fetch_recent_messages_sync(shop_id: str, conv_key: str, limit: int = 10) -> List[Dict[str, str]]:
+    conn = db_connect()
+    try:
+        cur = conn.cursor()
+        cur.execute(
+            """
+            SELECT role, content
+            FROM messages
+            WHERE shop_id=%s AND conv_key=%s
             ORDER BY created_at DESC
             LIMIT %s
             """,
-            (shop_id, min_level, limit),
+            (shop_id, conv_key, limit),
         )
-        return _rows_to_items(cur.fetchall())
+        rows = cur.fetchall()
+        # 古い→新しい順にしたいので逆順
+        rows = list(reversed(rows))
+        return [{"role": r, "content": c} for r, c in rows]
     finally:
         conn.close()
 
 
 # =========================
-# LINE Reply
+# LINE Reply / Push
 # =========================
 async def reply_message(reply_token: str, text: str) -> None:
     url = "https://api.line.me/v2/bot/message/reply"
@@ -423,7 +528,18 @@ async def reply_message(reply_token: str, text: str) -> None:
         "Content-Type": "application/json",
     }
     payload = {"replyToken": reply_token, "messages": [{"type": "text", "text": text}]}
+    async with httpx.AsyncClient(timeout=10) as client:
+        r = await client.post(url, headers=headers, json=payload)
+        r.raise_for_status()
 
+
+async def push_message(to_id: str, text: str) -> None:
+    url = "https://api.line.me/v2/bot/message/push"
+    headers = {
+        "Authorization": f"Bearer {LINE_CHANNEL_ACCESS_TOKEN}",
+        "Content-Type": "application/json",
+    }
+    payload = {"to": to_id, "messages": [{"type": "text", "text": text}]}
     async with httpx.AsyncClient(timeout=10) as client:
         r = await client.post(url, headers=headers, json=payload)
         r.raise_for_status()
@@ -459,14 +575,10 @@ async def analyze_and_generate_reply(
         "model": "gpt-4o-mini",
         "messages": [
             {"role": "system", "content": system_prompt},
-            {
-                "role": "user",
-                "content": f"【直近会話】\n{json.dumps(last_messages[-20:], ensure_ascii=False)}\n\n【最新】\n{user_text}\n",
-            },
+            {"role": "user", "content": f"【直近会話】\n{json.dumps(last_messages[-20:], ensure_ascii=False)}\n\n【最新】\n{user_text}\n"},
         ],
         "temperature": 0.4,
     }
-
     headers = {"Authorization": f"Bearer {OPENAI_API_KEY}", "Content-Type": "application/json"}
 
     try:
@@ -505,6 +617,61 @@ async def analyze_and_generate_reply(
         )
 
 
+async def generate_followup_text(
+    last_messages: List[Dict[str, str]],
+    temp_level: int,
+    hours_waited: int,
+) -> str:
+    """
+    追客用の1通を生成（失敗時はテンプレ）
+    """
+    # テンプレ（安全）
+    if temp_level >= 8:
+        fallback = "ご検討状況いかがでしょうか？もしよければ内見候補日を2つほど教えてください。こちらで調整いたします。"
+        tone = "前向き。日程確定へ。2択で提案。"
+    elif temp_level >= 4:
+        fallback = "ご検討状況いかがでしょうか？希望条件（エリア・家賃・入居時期）で変わった点があれば教えてください。"
+        tone = "丁寧。条件整理。質問は1つまで。"
+    else:
+        fallback = "ご状況いかがでしょうか。もし条件が固まりましたら、いつでもご連絡ください。"
+        tone = "軽め。追いすぎない。"
+
+    if not OPENAI_API_KEY:
+        return fallback
+
+    system_prompt = (
+        "あなたは不動産の追客担当です。未返信の方へのフォローメッセージを1通作成してください。\n"
+        f"温度感レベルは {temp_level}/10、最後の返信から約{hours_waited}時間経過。\n"
+        f"方針: {tone}\n"
+        "・日本語で2〜4文\n"
+        "・断定しない（空室などは確認します）\n"
+        "・最後に返信しやすい質問を1つ\n"
+        "・絵文字は不要\n"
+    )
+
+    payload = {
+        "model": "gpt-4o-mini",
+        "messages": [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": f"直近の会話:\n{json.dumps(last_messages[-10:], ensure_ascii=False)}"},
+        ],
+        "temperature": 0.5,
+    }
+    headers = {"Authorization": f"Bearer {OPENAI_API_KEY}", "Content-Type": "application/json"}
+
+    try:
+        async with httpx.AsyncClient(timeout=20) as client:
+            r = await client.post("https://api.openai.com/v1/chat/completions", headers=headers, json=payload)
+            r.raise_for_status()
+            data = r.json()
+
+        text = (data["choices"][0]["message"]["content"] or "").strip()
+        return text if text else fallback
+    except Exception as e:
+        print(f"[OPENAI followup] error: {e}")
+        return fallback
+
+
 # =========================
 # Startup
 # =========================
@@ -517,13 +684,132 @@ async def on_startup():
 
 
 # =========================
-# Routes
+# API / Job
 # =========================
 @app.get("/")
 async def root():
     return {"ok": True}
 
 
+@app.post("/jobs/followup")
+async def job_followup(
+    shop_id: str = SHOP_ID,
+    dry_run: int = 0,
+    limit: int = FOLLOWUP_LIMIT_PER_RUN,
+    key: Optional[str] = None,
+    x_admin_key: Optional[str] = Header(None, alias="X-Admin-Key"),
+):
+    """
+    自動追客を実行するジョブ。
+    Render Cron Job から叩く想定。
+    """
+    check_admin_key(x_admin_key, key)
+
+    if not FOLLOWUP_ENABLED:
+        return {"ok": False, "reason": "FOLLOWUP_ENABLED is off"}
+
+    if not in_jst_sending_window():
+        return {"ok": True, "skipped": True, "reason": "outside JST sending window"}
+
+    if not can_db():
+        return {"ok": False, "reason": "DB not configured"}
+
+    dry_run = 1 if int(dry_run) == 1 else 0
+    limit = max(1, min(200, int(limit)))
+
+    # 追客候補：各conv_keyの最新メッセージが assistant で、一定時間経過
+    rows = await asyncio.to_thread(db_get_last_message_per_conv_sync, shop_id)
+    user_last_map = await asyncio.to_thread(db_get_last_user_at_map_sync, shop_id)
+    fu_map = await asyncio.to_thread(db_get_followup_state_map_sync, shop_id)
+
+    now = now_utc()
+
+    # 追客ルール（安全め）
+    def threshold_hours(level: int) -> int:
+        if level >= 8:
+            return 24
+        if level >= 4:
+            return 48
+        return 72
+
+    def max_count(level: int) -> int:
+        if level >= 8:
+            return 3
+        if level >= 4:
+            return 2
+        return 1
+
+    sent = []
+    skipped = []
+
+    for conv_key, last_role, last_content, last_at, lvl, conf, goal in rows:
+        if len(sent) >= limit:
+            break
+
+        last_at_utc = to_utc(last_at)
+        if last_at_utc is None:
+            skipped.append({"conv_key": conv_key, "reason": "no_last_at"})
+            continue
+
+        # 「最後がassistant」＝ユーザー未返信状態
+        if last_role != "assistant":
+            continue
+
+        lvl_int = int(lvl or 5)
+        wait_h = int(threshold_hours(lvl_int))
+
+        age_hours = int((now - last_at_utc).total_seconds() / 3600)
+        if age_hours < wait_h:
+            continue
+
+        # 追客スパム防止
+        state = fu_map.get(conv_key, {"followup_count": 0, "last_followup_at": None})
+        followup_count = int(state.get("followup_count", 0))
+        last_followup_at = state.get("last_followup_at")
+
+        # ユーザーが追客後に返信していたら、回数をリセット扱い
+        user_last_at = user_last_map.get(conv_key)
+        if user_last_at and last_followup_at and user_last_at > last_followup_at:
+            followup_count = 0
+            last_followup_at = None
+
+        if followup_count >= max_count(lvl_int):
+            skipped.append({"conv_key": conv_key, "reason": "max_followup_reached"})
+            continue
+
+        if last_followup_at:
+            since_fu = int((now - last_followup_at).total_seconds() / 3600)
+            if since_fu < FOLLOWUP_MIN_HOURS_BETWEEN:
+                skipped.append({"conv_key": conv_key, "reason": "too_soon_since_last_followup"})
+                continue
+
+        # 直近会話を取って、追客文を作る
+        recent_msgs = await asyncio.to_thread(db_fetch_recent_messages_sync, shop_id, conv_key, 10)
+        follow_text = await generate_followup_text(recent_msgs, lvl_int, age_hours)
+
+        to_id = conv_key_to_to_id(conv_key)
+        reason = f"no_reply_{age_hours}h_lvl{lvl_int}"
+
+        if dry_run:
+            sent.append({"conv_key": conv_key, "to": to_id, "text": follow_text, "dry_run": True, "reason": reason})
+            continue
+
+        try:
+            await push_message(to_id, follow_text)
+            # DBに追客送信も記録（assistantメッセージとして）
+            await asyncio.to_thread(db_insert_assistant_message_sync, shop_id, conv_key, f"[FOLLOWUP] {follow_text}")
+            await asyncio.to_thread(db_upsert_followup_state_sync, shop_id, conv_key, followup_count + 1, reason)
+
+            sent.append({"conv_key": conv_key, "to": to_id, "reason": reason})
+        except Exception as e:
+            skipped.append({"conv_key": conv_key, "reason": f"push_failed: {e}"})
+
+    return {"ok": True, "dry_run": bool(dry_run), "sent": sent, "sent_count": len(sent), "skipped": skipped, "skipped_count": len(skipped)}
+
+
+# =========================
+# HOT API / Dashboard（既存）
+# =========================
 @app.get("/api/hot")
 async def api_hot(
     shop_id: str = SHOP_ID,
@@ -597,10 +883,9 @@ async def dashboard(
     else:
         items = await asyncio.to_thread(db_fetch_hot_events_sync, shop_id, min_level, limit)
 
-    now = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC")
+    now_str = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC")
     legend_html = " ".join([f'<span class="badge badge-lvl-{i}">{i}</span>' for i in range(1, 11)])
 
-    # rows
     rows_html = ""
     for it in items:
         lvl = it.get("temp_level_stable", "")
@@ -612,7 +897,6 @@ async def dashboard(
         row_class = f"lvl-{lvl_int}" if 1 <= lvl_int <= 10 else ""
         badge_class = f"badge badge-lvl-{lvl_int}" if 1 <= lvl_int <= 10 else "badge"
 
-        # JS検索用の検索文字列（小文字）
         search_blob = " ".join([
             str(it.get("updated_at", "")),
             str(it.get("conv_key", "")),
@@ -639,14 +923,12 @@ async def dashboard(
     if refresh > 0:
         meta_refresh = f'<meta http-equiv="refresh" content="{refresh}">'
 
-    # api link（同じフィルタでJSONも見られる）
     api_link = f"/api/hot?shop_id={html_lib.escape(shop_id)}&min_level={min_level}&limit={limit}&view={html_lib.escape(view)}"
     if q_value:
         api_link += f"&q={html_lib.escape(q_value)}"
     if ADMIN_API_KEY and key:
         api_link += f"&key={html_lib.escape(key)}"
 
-    # HTML
     html_page = f"""
     <!doctype html>
     <html lang="ja">
@@ -667,11 +949,6 @@ async def dashboard(
         input, select {{ padding: 8px; border: 1px solid #ddd; border-radius: 10px; }}
         button {{ padding: 8px 12px; border: 1px solid #111; background:#111; color:#fff; border-radius: 10px; cursor:pointer; }}
         a {{ color: #0b5; text-decoration: none; }}
-
-        .rowtools {{ display:flex; gap:8px; flex-wrap:wrap; align-items:center; margin-top:10px; }}
-        .kpi {{ display:flex; gap:10px; flex-wrap:wrap; align-items:center; }}
-        .kpi span {{ font-size:12px; color:#666; }}
-        .kpi b {{ font-size:14px; }}
 
         /* 10段階の行背景色（寒色→暖色） */
         .lvl-1  {{ background: #e3f2fd; }}
@@ -708,6 +985,10 @@ async def dashboard(
         .badge-lvl-9  {{ background:#ffccbc; border-color:#ff8a65; }}
         .badge-lvl-10 {{ background:#ffcdd2; border-color:#e57373; }}
 
+        .rowtools {{ display:flex; gap:8px; flex-wrap:wrap; align-items:center; margin-top:10px; }}
+        .kpi {{ display:flex; gap:10px; flex-wrap:wrap; align-items:center; }}
+        .kpi span {{ font-size:12px; color:#666; }}
+        .kpi b {{ font-size:14px; }}
         .btn-ghost {{
           padding: 8px 12px;
           border: 1px solid #ddd;
@@ -722,7 +1003,7 @@ async def dashboard(
       <div class="top">
         <div class="card">
           <div><span class="pill">HOT顧客</span> <b>{html_lib.escape(shop_id)}</b></div>
-          <div class="muted">view={html_lib.escape(view)} / min_level={min_level} / limit={limit} / refresh={refresh}s / total={len(items)} / {now}</div>
+          <div class="muted">view={html_lib.escape(view)} / min_level={min_level} / limit={limit} / refresh={refresh}s / total={len(items)} / {now_str}</div>
           <div class="muted">温度カラー：{legend_html}（1=低温 → 10=最熱）</div>
           <div class="muted">JSON: <a href="{api_link}">{api_link}</a></div>
 
@@ -752,17 +1033,14 @@ async def dashboard(
             <input name="min_level" value="{min_level}" placeholder="min_level (1-10)">
             <input name="limit" value="{limit}" placeholder="limit (<=200)">
             <input name="refresh" value="{refresh}" placeholder="refresh seconds (0=off)">
-            <input name="q" value="{html_lib.escape(q_value, quote=True)}" placeholder="検索（q）">
+            <input name="q" value="{html_lib.escape(q_value, quote=True)}" placeholder="検索（q理解用）">
             {"<input name='key' value='"+html_lib.escape(key)+"' placeholder='admin key'>" if ADMIN_API_KEY else ""}
             <button type="submit">更新</button>
-          </div>
-          <div class="muted" style="margin-top:8px;">
-            ※ 検索欄は入力した瞬間に絞り込み（URLの q= にも自動保存）
           </div>
         </form>
       </div>
 
-      <table id="dataTable">
+      <table>
         <thead>
           <tr>
             <th>更新</th>
@@ -813,21 +1091,18 @@ async def dashboard(
             updateUrlParam(q);
           }}
 
-          // 自動検索（入力即反映）
           let timer = null;
           searchBox.addEventListener("input", () => {{
             if (timer) clearTimeout(timer);
             timer = setTimeout(applyFilter, 50);
           }});
 
-          // クリア
           clearBtn.addEventListener("click", () => {{
             searchBox.value = "";
             applyFilter();
             searchBox.focus();
           }});
 
-          // 初期適用（q= がある場合も反映）
           applyFilter();
         }})();
       </script>
@@ -837,6 +1112,9 @@ async def dashboard(
     return HTMLResponse(html_page)
 
 
+# =========================
+# Webhook
+# =========================
 @app.post("/line/webhook")
 async def line_webhook(
     request: Request,
@@ -860,7 +1138,7 @@ async def line_webhook(
         user_text = msg.get("text", "")
 
         source = ev.get("source", {})
-        src_type = source.get("type", "unknown")
+        src_type = source.get("type", "unknown")  # user/group/room
         src_id = source.get("userId") or source.get("groupId") or source.get("roomId") or "unknown"
         conv_key = f"{src_type}:{src_id}"
 
