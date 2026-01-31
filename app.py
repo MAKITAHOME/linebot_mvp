@@ -486,7 +486,6 @@ async def analyze_and_generate_reply(
         lvl = coerce_level(result.get("temperature_level", 5), default=5)
         conf = coerce_confidence(result.get("confidence", 0.7), default=0.7)
 
-        # 自信が低いときは安全側
         if conf < 0.6:
             lvl = 5
 
@@ -557,8 +556,8 @@ async def dashboard(
     shop_id: str = SHOP_ID,
     min_level: int = 8,
     limit: int = 50,
-    view: str = "events",        # dashboardは履歴表示がデフォルト
-    key: Optional[str] = None,   # ブラウザ用
+    view: str = "events",        # 履歴がデフォルト
+    key: Optional[str] = None,
     x_admin_key: Optional[str] = Header(None, alias="X-Admin-Key"),
 ):
     check_admin_key(x_admin_key, key)
@@ -577,12 +576,29 @@ async def dashboard(
 
     now = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC")
 
+    # ---- rows with color by level ----
     rows_html = ""
     for it in items:
+        lvl = it.get("temp_level_stable", "")
+        try:
+            lvl_int = int(lvl)
+        except Exception:
+            lvl_int = 0
+
+        row_class = ""
+        if lvl_int >= 10:
+            row_class = "lvl-10"
+        elif lvl_int == 9:
+            row_class = "lvl-9"
+        elif lvl_int == 8:
+            row_class = "lvl-8"
+        elif lvl_int == 7:
+            row_class = "lvl-7"
+
         rows_html += f"""
-        <tr>
+        <tr class="{row_class}">
           <td>{html_lib.escape(str(it.get("updated_at","")))}</td>
-          <td style="text-align:center">{html_lib.escape(str(it.get("temp_level_stable","")))}</td>
+          <td style="text-align:center"><span class="badge">{html_lib.escape(str(it.get("temp_level_stable","")))}</span></td>
           <td style="text-align:center">{html_lib.escape(str(it.get("confidence","")))}</td>
           <td>{html_lib.escape(str(it.get("next_goal","")))}</td>
           <td><code>{html_lib.escape(str(it.get("user_id") or ""))}</code></td>
@@ -613,6 +629,23 @@ async def dashboard(
         input, select {{ padding: 8px; border: 1px solid #ddd; border-radius: 10px; }}
         button {{ padding: 8px 12px; border: 1px solid #111; background:#111; color:#fff; border-radius: 10px; cursor:pointer; }}
         a {{ color: #0b5; text-decoration: none; }}
+
+        /* 温度カラー（控えめ） */
+        .lvl-10 {{ background: #ffebee; }}
+        .lvl-9  {{ background: #fff3e0; }}
+        .lvl-8  {{ background: #fffde7; }}
+        .lvl-7  {{ background: #f1f8e9; }}
+
+        .badge {{
+          display:inline-block;
+          min-width: 28px;
+          text-align:center;
+          font-weight:700;
+          padding: 2px 8px;
+          border-radius: 999px;
+          border: 1px solid #ddd;
+          background: #fff;
+        }}
       </style>
     </head>
     <body>
@@ -687,21 +720,17 @@ async def line_webhook(
         src_id = source.get("userId") or source.get("groupId") or source.get("roomId") or "unknown"
         conv_key = f"{src_type}:{src_id}"
 
-        # memory
         CHAT_HISTORY[conv_key].append({"role": "user", "content": user_text})
 
-        # AI analyze + reply
         last_msgs = list(CHAT_HISTORY[conv_key])[-20:]
         temp_info, reply_text = await analyze_and_generate_reply(last_msgs, user_text)
 
-        # stabilize
         TEMP_HISTORY[conv_key].append(int(temp_info["temperature_level"]))
         stable = median(list(TEMP_HISTORY[conv_key]), default=5)
         temp_info["temperature_level_stable"] = stable
 
         CHAT_HISTORY[conv_key].append({"role": "assistant", "content": reply_text})
 
-        # DB write (best-effort)
         if can_db():
             try:
                 await asyncio.to_thread(
@@ -727,7 +756,6 @@ async def line_webhook(
             f"goal={temp_info['next_goal']}"
         )
 
-        # reply
         try:
             await reply_message(reply_token, reply_text)
         except Exception as e:
