@@ -20,29 +20,30 @@ from fastapi.responses import HTMLResponse
 app = FastAPI()
 
 # =========================
-# Config (ENV)
+# ENV
 # =========================
 LINE_CHANNEL_SECRET = os.getenv("LINE_CHANNEL_SECRET", "")
 LINE_CHANNEL_ACCESS_TOKEN = os.getenv("LINE_CHANNEL_ACCESS_TOKEN", "")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
 
-DATABASE_URL = os.getenv("DATABASE_URL", "")          # Render Environment に入れる
-SHOP_ID = os.getenv("SHOP_ID", "tokyo_01")            # Render Environment に入れる（店舗ID）
+DATABASE_URL = os.getenv("DATABASE_URL", "")
+SHOP_ID = os.getenv("SHOP_ID", "tokyo_01")
 
-# /api/* を保護したいときだけ設定（未設定なら開発用に公開のまま）
+# 設定すると /api/* と /dashboard を保護（未設定なら開発用に公開）
 ADMIN_API_KEY = os.getenv("ADMIN_API_KEY", "")
 
-# DB SSLモード: auto(推奨) / verify / disable
+# DB SSL: auto(推奨) / verify / disable
 DB_SSL_MODE = os.getenv("DB_SSL_MODE", "auto").lower().strip()
 
-# ログを増やしたいときだけ 1
+# デバッグログ増やしたい時だけ 1
 DEBUG = os.getenv("DEBUG", "0") == "1"
+
 
 # =========================
 # In-memory (MVP)
 # =========================
 CHAT_HISTORY = defaultdict(lambda: deque(maxlen=40))  # 最大20往復
-TEMP_HISTORY = defaultdict(lambda: deque(maxlen=3))   # 揺れ止め：中央値
+TEMP_HISTORY = defaultdict(lambda: deque(maxlen=3))   # 揺れ止め（中央値）
 
 
 # =========================
@@ -54,7 +55,6 @@ def log(msg: str) -> None:
 
 
 def verify_signature(body: bytes, signature: str) -> bool:
-    """Verify LINE webhook signature."""
     if not LINE_CHANNEL_SECRET:
         return False
     mac = hmac.new(LINE_CHANNEL_SECRET.encode("utf-8"), body, hashlib.sha256).digest()
@@ -70,7 +70,6 @@ def median(values: List[int], default: int = 5) -> int:
 
 
 def extract_json(text: str) -> Dict[str, Any]:
-    """Extract JSON object from model output (handles extra text/fences)."""
     text = (text or "").strip()
     try:
         return json.loads(text)
@@ -86,7 +85,6 @@ def extract_json(text: str) -> Dict[str, Any]:
 
 
 def coerce_level(raw: Any, default: int = 5) -> int:
-    """1〜10の整数へ強制。"""
     try:
         if isinstance(raw, str):
             s = raw.strip()
@@ -100,16 +98,12 @@ def coerce_level(raw: Any, default: int = 5) -> int:
 
 
 def coerce_confidence(raw: Any, default: float = 0.7) -> float:
-    """
-    OpenAIが confidence を '低い/高い/80%' などで返しても落ちないようにする。
-    戻り値は 0.0〜1.0 にクランプ。
-    """
+    """'低い/高い/80%' などでも落ちない"""
     if isinstance(raw, (int, float)):
         return max(0.0, min(1.0, float(raw)))
 
     if isinstance(raw, str):
         s = raw.strip().lower()
-
         if s in {"高い", "高め", "high"}:
             return 0.85
         if s in {"中", "普通", "ふつう", "medium"}:
@@ -136,10 +130,7 @@ def coerce_confidence(raw: Any, default: float = 0.7) -> float:
 
 
 def check_admin_key(x_admin_key: Optional[str], query_key: Optional[str] = None) -> None:
-    """
-    ADMIN_API_KEY が設定されている時だけ認証を有効にする。
-    ブラウザ用に ?key= も許可（ヘッダー付けにくいので）。
-    """
+    """ADMIN_API_KEYがある時だけ認証"""
     if not ADMIN_API_KEY:
         return
     if x_admin_key == ADMIN_API_KEY:
@@ -165,11 +156,7 @@ def parse_database_url(url: str) -> Dict[str, Any]:
 
 
 def make_ssl_context(mode: str) -> ssl.SSLContext:
-    """
-    mode:
-      - verify:  検証ON（certifi）
-      - disable: 検証OFF
-    """
+    """verify = 検証ON / disable = 検証OFF"""
     if mode == "disable":
         ctx = ssl.create_default_context()
         ctx.check_hostname = False
@@ -183,7 +170,7 @@ def make_ssl_context(mode: str) -> ssl.SSLContext:
 
 
 def db_connect():
-    """Create a DB connection (pg8000). SSLは auto/verify/disable に対応。"""
+    """auto/verify/disable 対応。autoはverify失敗時にdisableへフォールバック"""
     cfg = parse_database_url(DATABASE_URL)
     if not cfg["host"]:
         raise RuntimeError("DATABASE_URL host is empty")
@@ -226,6 +213,8 @@ def ensure_tables_sync():
     conn = db_connect()
     try:
         cur = conn.cursor()
+
+        # 最新状態
         cur.execute("""
         CREATE TABLE IF NOT EXISTS customers (
           id BIGSERIAL PRIMARY KEY,
@@ -240,6 +229,8 @@ def ensure_tables_sync():
           UNIQUE (shop_id, conv_key)
         );
         """)
+
+        # 会話ログ
         cur.execute("""
         CREATE TABLE IF NOT EXISTS messages (
           id BIGSERIAL PRIMARY KEY,
@@ -250,10 +241,32 @@ def ensure_tables_sync():
           created_at TIMESTAMPTZ DEFAULT now()
         );
         """)
+
+        # 履歴（更新しても残る）
+        cur.execute("""
+        CREATE TABLE IF NOT EXISTS customer_events (
+          id BIGSERIAL PRIMARY KEY,
+          shop_id TEXT NOT NULL,
+          conv_key TEXT NOT NULL,
+          user_text TEXT,
+          temp_level_raw INT,
+          temp_level_stable INT,
+          confidence REAL,
+          next_goal TEXT,
+          created_at TIMESTAMPTZ DEFAULT now()
+        );
+        """)
+
+        # インデックス
         cur.execute("""
         CREATE INDEX IF NOT EXISTS idx_customers_shop_level_updated
         ON customers (shop_id, temp_level_stable, updated_at DESC);
         """)
+        cur.execute("""
+        CREATE INDEX IF NOT EXISTS idx_customer_events_shop_created
+        ON customer_events (shop_id, created_at DESC);
+        """)
+
         conn.commit()
         print("[DB] tables ensured")
     finally:
@@ -270,10 +283,12 @@ def db_write_interaction_sync(
     conf: float,
     next_goal: str,
 ):
+    """1接続でまとめて書く（速い・安定）"""
     conn = db_connect()
     try:
         cur = conn.cursor()
 
+        # messages（毎回残る）
         cur.execute(
             "INSERT INTO messages (shop_id, conv_key, role, content) VALUES (%s,%s,%s,%s)",
             (shop_id, conv_key, "user", user_text),
@@ -282,6 +297,19 @@ def db_write_interaction_sync(
             "INSERT INTO messages (shop_id, conv_key, role, content) VALUES (%s,%s,%s,%s)",
             (shop_id, conv_key, "assistant", assistant_text),
         )
+
+        # customer_events（履歴として毎回INSERT）
+        cur.execute(
+            """
+            INSERT INTO customer_events
+              (shop_id, conv_key, user_text, temp_level_raw, temp_level_stable, confidence, next_goal)
+            VALUES
+              (%s,%s,%s,%s,%s,%s,%s)
+            """,
+            (shop_id, conv_key, user_text, raw_level, stable_level, conf, next_goal),
+        )
+
+        # customers（最新状態としてUPSERT）
         cur.execute(
             """
             INSERT INTO customers
@@ -305,7 +333,35 @@ def db_write_interaction_sync(
         conn.close()
 
 
+def _rows_to_items(rows):
+    items = []
+    for conv_key, user_text, raw, stable, conf, goal, ts in rows:
+        try:
+            ts_str = ts.isoformat()
+        except Exception:
+            ts_str = str(ts)
+
+        user_id = None
+        if isinstance(conv_key, str) and conv_key.startswith("user:"):
+            user_id = conv_key.split("user:", 1)[1]
+
+        items.append(
+            {
+                "conv_key": conv_key,
+                "user_id": user_id,
+                "last_user_text": user_text,
+                "temp_level_raw": raw,
+                "temp_level_stable": stable,
+                "confidence": conf,
+                "next_goal": goal,
+                "updated_at": ts_str,
+            }
+        )
+    return items
+
+
 def db_fetch_hot_customers_sync(shop_id: str, min_level: int, limit: int):
+    """最新状態（customers）"""
     conn = db_connect()
     try:
         cur = conn.cursor()
@@ -326,32 +382,34 @@ def db_fetch_hot_customers_sync(shop_id: str, min_level: int, limit: int):
             """,
             (shop_id, min_level, limit),
         )
-        rows = cur.fetchall()
+        return _rows_to_items(cur.fetchall())
+    finally:
+        conn.close()
 
-        items = []
-        for conv_key, last_user_text, raw, stable, conf, goal, updated_at in rows:
-            try:
-                updated_str = updated_at.isoformat()
-            except Exception:
-                updated_str = str(updated_at)
 
-            user_id = None
-            if isinstance(conv_key, str) and conv_key.startswith("user:"):
-                user_id = conv_key.split("user:", 1)[1]
-
-            items.append(
-                {
-                    "conv_key": conv_key,
-                    "user_id": user_id,
-                    "last_user_text": last_user_text,
-                    "temp_level_raw": raw,
-                    "temp_level_stable": stable,
-                    "confidence": conf,
-                    "next_goal": goal,
-                    "updated_at": updated_str,
-                }
-            )
-        return items
+def db_fetch_hot_events_sync(shop_id: str, min_level: int, limit: int):
+    """履歴（customer_events）"""
+    conn = db_connect()
+    try:
+        cur = conn.cursor()
+        cur.execute(
+            """
+            SELECT
+              conv_key,
+              user_text,
+              temp_level_raw,
+              temp_level_stable,
+              confidence,
+              next_goal,
+              created_at
+            FROM customer_events
+            WHERE shop_id = %s AND temp_level_stable >= %s
+            ORDER BY created_at DESC
+            LIMIT %s
+            """,
+            (shop_id, min_level, limit),
+        )
+        return _rows_to_items(cur.fetchall())
     finally:
         conn.close()
 
@@ -428,6 +486,7 @@ async def analyze_and_generate_reply(
         lvl = coerce_level(result.get("temperature_level", 5), default=5)
         conf = coerce_confidence(result.get("confidence", 0.7), default=0.7)
 
+        # 自信が低いときは安全側
         if conf < 0.6:
             lvl = 5
 
@@ -472,16 +531,25 @@ async def api_hot(
     shop_id: str = SHOP_ID,
     min_level: int = 8,
     limit: int = 50,
-    key: Optional[str] = None,  # ブラウザ用
+    view: str = "latest",        # latest / events
+    key: Optional[str] = None,   # ブラウザ用
     x_admin_key: Optional[str] = Header(None, alias="X-Admin-Key"),
 ):
     check_admin_key(x_admin_key, key)
 
     min_level = max(1, min(10, int(min_level)))
     limit = max(1, min(200, int(limit)))
+    view = (view or "latest").lower()
 
-    items = await asyncio.to_thread(db_fetch_hot_customers_sync, shop_id, min_level, limit)
-    return {"shop_id": shop_id, "min_level": min_level, "count": len(items), "items": items}
+    if not can_db():
+        return {"shop_id": shop_id, "min_level": min_level, "count": 0, "items": [], "error": "DB not configured"}
+
+    if view == "events":
+        items = await asyncio.to_thread(db_fetch_hot_events_sync, shop_id, min_level, limit)
+    else:
+        items = await asyncio.to_thread(db_fetch_hot_customers_sync, shop_id, min_level, limit)
+
+    return {"shop_id": shop_id, "min_level": min_level, "view": view, "count": len(items), "items": items}
 
 
 @app.get("/dashboard", response_class=HTMLResponse)
@@ -489,21 +557,24 @@ async def dashboard(
     shop_id: str = SHOP_ID,
     min_level: int = 8,
     limit: int = 50,
-    key: Optional[str] = None,
+    view: str = "events",        # dashboardは履歴表示がデフォルト
+    key: Optional[str] = None,   # ブラウザ用
     x_admin_key: Optional[str] = Header(None, alias="X-Admin-Key"),
 ):
     check_admin_key(x_admin_key, key)
 
     min_level = max(1, min(10, int(min_level)))
     limit = max(1, min(200, int(limit)))
+    view = (view or "events").lower()
 
     if not can_db():
-        return HTMLResponse(
-            "<h2>DBが未設定です</h2><p>DATABASE_URL / SHOP_ID をRenderのEnvironmentに入れてください。</p>",
-            status_code=500,
-        )
+        return HTMLResponse("<h2>DB未設定</h2><p>DATABASE_URL / SHOP_ID を設定してください。</p>", status_code=500)
 
-    items = await asyncio.to_thread(db_fetch_hot_customers_sync, shop_id, min_level, limit)
+    if view == "latest":
+        items = await asyncio.to_thread(db_fetch_hot_customers_sync, shop_id, min_level, limit)
+    else:
+        items = await asyncio.to_thread(db_fetch_hot_events_sync, shop_id, min_level, limit)
+
     now = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC")
 
     rows_html = ""
@@ -518,6 +589,10 @@ async def dashboard(
           <td>{html_lib.escape(str(it.get("last_user_text","")))}</td>
         </tr>
         """
+
+    api_link = f"/api/hot?shop_id={html_lib.escape(shop_id)}&min_level={min_level}&limit={limit}&view={html_lib.escape(view)}"
+    if ADMIN_API_KEY and key:
+        api_link += f"&key={html_lib.escape(key)}"
 
     html_page = f"""
     <!doctype html>
@@ -535,7 +610,7 @@ async def dashboard(
         th {{ text-align: left; background: #fafafa; position: sticky; top: 0; }}
         .muted {{ color: #666; font-size: 12px; }}
         .pill {{ display:inline-block; padding: 2px 8px; border-radius: 999px; background:#111; color:#fff; font-size:12px; }}
-        input {{ padding: 8px; border: 1px solid #ddd; border-radius: 10px; }}
+        input, select {{ padding: 8px; border: 1px solid #ddd; border-radius: 10px; }}
         button {{ padding: 8px 12px; border: 1px solid #111; background:#111; color:#fff; border-radius: 10px; cursor:pointer; }}
         a {{ color: #0b5; text-decoration: none; }}
       </style>
@@ -544,14 +619,18 @@ async def dashboard(
       <div class="top">
         <div class="card">
           <div><span class="pill">HOT顧客</span> <b>{html_lib.escape(shop_id)}</b></div>
-          <div class="muted">min_level={min_level} / limit={limit} / count={len(items)} / {now}</div>
-          <div class="muted">JSON: <a href="/api/hot?shop_id={html_lib.escape(shop_id)}&min_level={min_level}&limit={limit}{'&key='+html_lib.escape(key) if (ADMIN_API_KEY and key) else ''}">/api/hot</a></div>
+          <div class="muted">view={html_lib.escape(view)} / min_level={min_level} / limit={limit} / count={len(items)} / {now}</div>
+          <div class="muted">JSON: <a href="{api_link}">{api_link}</a></div>
         </div>
 
         <form class="card" method="get" action="/dashboard">
           <div class="muted">フィルタ</div>
           <div style="display:flex; gap:8px; flex-wrap:wrap; margin-top:8px;">
             <input name="shop_id" value="{html_lib.escape(shop_id)}" placeholder="shop_id">
+            <select name="view">
+              <option value="events" {"selected" if view=="events" else ""}>events（履歴）</option>
+              <option value="latest" {"selected" if view=="latest" else ""}>latest（最新）</option>
+            </select>
             <input name="min_level" value="{min_level}" placeholder="min_level (1-10)">
             <input name="limit" value="{limit}" placeholder="limit (<=200)">
             {"<input name='key' value='"+html_lib.escape(key)+"' placeholder='admin key'>" if ADMIN_API_KEY else ""}
@@ -572,7 +651,7 @@ async def dashboard(
           </tr>
         </thead>
         <tbody>
-          {rows_html if rows_html else "<tr><td colspan='6' class='muted'>該当なし（HOTがまだいない）</td></tr>"}
+          {rows_html if rows_html else "<tr><td colspan='6' class='muted'>該当なし</td></tr>"}
         </tbody>
       </table>
     </body>
@@ -608,17 +687,21 @@ async def line_webhook(
         src_id = source.get("userId") or source.get("groupId") or source.get("roomId") or "unknown"
         conv_key = f"{src_type}:{src_id}"
 
+        # memory
         CHAT_HISTORY[conv_key].append({"role": "user", "content": user_text})
 
+        # AI analyze + reply
         last_msgs = list(CHAT_HISTORY[conv_key])[-20:]
         temp_info, reply_text = await analyze_and_generate_reply(last_msgs, user_text)
 
+        # stabilize
         TEMP_HISTORY[conv_key].append(int(temp_info["temperature_level"]))
         stable = median(list(TEMP_HISTORY[conv_key]), default=5)
         temp_info["temperature_level_stable"] = stable
 
         CHAT_HISTORY[conv_key].append({"role": "assistant", "content": reply_text})
 
+        # DB write (best-effort)
         if can_db():
             try:
                 await asyncio.to_thread(
@@ -644,6 +727,7 @@ async def line_webhook(
             f"goal={temp_info['next_goal']}"
         )
 
+        # reply
         try:
             await reply_message(reply_token, reply_text)
         except Exception as e:
