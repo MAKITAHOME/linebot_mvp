@@ -576,7 +576,8 @@ async def dashboard(
 
     now = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC")
 
-    # ---- rows with color by level ----
+    legend_html = " ".join([f'<span class="badge badge-lvl-{i}">{i}</span>' for i in range(1, 11)])
+
     rows_html = ""
     for it in items:
         lvl = it.get("temp_level_stable", "")
@@ -585,20 +586,13 @@ async def dashboard(
         except Exception:
             lvl_int = 0
 
-        row_class = ""
-        if lvl_int >= 10:
-            row_class = "lvl-10"
-        elif lvl_int == 9:
-            row_class = "lvl-9"
-        elif lvl_int == 8:
-            row_class = "lvl-8"
-        elif lvl_int == 7:
-            row_class = "lvl-7"
+        row_class = f"lvl-{lvl_int}" if 1 <= lvl_int <= 10 else ""
+        badge_class = f"badge badge-lvl-{lvl_int}" if 1 <= lvl_int <= 10 else "badge"
 
         rows_html += f"""
         <tr class="{row_class}">
           <td>{html_lib.escape(str(it.get("updated_at","")))}</td>
-          <td style="text-align:center"><span class="badge">{html_lib.escape(str(it.get("temp_level_stable","")))}</span></td>
+          <td style="text-align:center"><span class="{badge_class}">{html_lib.escape(str(it.get("temp_level_stable","")))}</span></td>
           <td style="text-align:center">{html_lib.escape(str(it.get("confidence","")))}</td>
           <td>{html_lib.escape(str(it.get("next_goal","")))}</td>
           <td><code>{html_lib.escape(str(it.get("user_id") or ""))}</code></td>
@@ -630,11 +624,17 @@ async def dashboard(
         button {{ padding: 8px 12px; border: 1px solid #111; background:#111; color:#fff; border-radius: 10px; cursor:pointer; }}
         a {{ color: #0b5; text-decoration: none; }}
 
-        /* 温度カラー（控えめ） */
+        /* 10段階の行背景色（寒色→暖色） */
+        .lvl-1  {{ background: #e3f2fd; }}
+        .lvl-2  {{ background: #e1f5fe; }}
+        .lvl-3  {{ background: #e0f7fa; }}
+        .lvl-4  {{ background: #e8f5e9; }}
+        .lvl-5  {{ background: #f1f8e9; }}
+        .lvl-6  {{ background: #fffde7; }}
+        .lvl-7  {{ background: #fff8e1; }}
+        .lvl-8  {{ background: #fff3e0; }}
+        .lvl-9  {{ background: #fbe9e7; }}
         .lvl-10 {{ background: #ffebee; }}
-        .lvl-9  {{ background: #fff3e0; }}
-        .lvl-8  {{ background: #fffde7; }}
-        .lvl-7  {{ background: #f1f8e9; }}
 
         .badge {{
           display:inline-block;
@@ -646,6 +646,18 @@ async def dashboard(
           border: 1px solid #ddd;
           background: #fff;
         }}
+
+        /* 10段階のバッジ色（少し濃いめ） */
+        .badge-lvl-1  {{ background:#bbdefb; border-color:#64b5f6; }}
+        .badge-lvl-2  {{ background:#b3e5fc; border-color:#4fc3f7; }}
+        .badge-lvl-3  {{ background:#b2ebf2; border-color:#4dd0e1; }}
+        .badge-lvl-4  {{ background:#c8e6c9; border-color:#81c784; }}
+        .badge-lvl-5  {{ background:#dcedc8; border-color:#aed581; }}
+        .badge-lvl-6  {{ background:#fff9c4; border-color:#fff176; }}
+        .badge-lvl-7  {{ background:#ffecb3; border-color:#ffd54f; }}
+        .badge-lvl-8  {{ background:#ffe0b2; border-color:#ffb74d; }}
+        .badge-lvl-9  {{ background:#ffccbc; border-color:#ff8a65; }}
+        .badge-lvl-10 {{ background:#ffcdd2; border-color:#e57373; }}
       </style>
     </head>
     <body>
@@ -653,6 +665,7 @@ async def dashboard(
         <div class="card">
           <div><span class="pill">HOT顧客</span> <b>{html_lib.escape(shop_id)}</b></div>
           <div class="muted">view={html_lib.escape(view)} / min_level={min_level} / limit={limit} / count={len(items)} / {now}</div>
+          <div class="muted">温度カラー：{legend_html}（1=低温 → 10=最熱）</div>
           <div class="muted">JSON: <a href="{api_link}">{api_link}</a></div>
         </div>
 
