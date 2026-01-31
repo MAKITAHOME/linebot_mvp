@@ -608,14 +608,70 @@ DashboardView = Literal["customers", "events"]
 
 @app.get("/api/hot")
 async def api_hot(
-    # NOTE: /dashboard からの fetch が通るように
-    # ADMIN_API_KEY だけでなく BasicAuth でも許可する
-    _: None = Depends(require_admin_or_basic),
+    _: str = Depends(require_basic_auth),
     shop_id: str = Query(default=SHOP_ID),
     min_level: int = Query(default=8, ge=1, le=10),
     limit: int = Query(default=50, ge=1, le=200),
-    view: DashboardView = Query(default="customers"),
+    view: str = Query(default="customers", pattern="^(customers|events)$"),
 ):
+    if view == "customers":
+        rows = db_fetchall(
+            """
+            SELECT conv_key,
+                   last_user_text,
+                   temp_level_stable,
+                   confidence,
+                   next_goal,
+                   updated_at
+            FROM customers
+            WHERE shop_id = %s AND temp_level_stable >= %s
+            ORDER BY updated_at DESC
+            LIMIT %s
+            """,
+            (shop_id, min_level, limit),
+        )
+        return JSONResponse([
+            {
+                "user_id": r[0],  # conv_key を user_id 表示に流用
+                "last_user_text": r[1],
+                "temp_level_stable": r[2],
+                "confidence": float(r[3]) if r[3] is not None else None,
+                "next_goal": r[4],
+                "updated_at": r[5].isoformat() if r[5] else None,
+            }
+            for r in rows
+        ])
+
+    # events view（user_id カラムに依存しない）
+    rows = db_fetchall(
+        """
+        SELECT c.conv_key,
+               m.content,
+               m.created_at,
+               c.temp_level_stable,
+               c.confidence,
+               c.next_goal
+        FROM customers c
+        LEFT JOIN messages m
+          ON c.conv_key = m.conv_key AND m.role = 'user'
+        WHERE c.shop_id = %s AND c.temp_level_stable >= %s
+        ORDER BY m.created_at DESC NULLS LAST
+        LIMIT %s
+        """,
+        (shop_id, min_level, limit),
+    )
+
+    return JSONResponse([
+        {
+            "user_id": r[0],  # conv_key
+            "last_user_text": r[1],
+            "message_created_at": r[2].isoformat() if r[2] else None,
+            "temp_level_stable": r[3],
+            "confidence": float(r[4]) if r[4] is not None else None,
+            "next_goal": r[5],
+        }
+        for r in rows
+    ])
     """
     view=customers: latest snapshot from customers table
     view=events: history from messages table (user messages only) joined with latest customer state
