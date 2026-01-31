@@ -6,33 +6,44 @@ import base64
 import asyncio
 import ssl
 from collections import deque, defaultdict
-from typing import Any, Dict, List, Tuple, Optional
+from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import urlparse, unquote
 
 import httpx
+import certifi
 import pg8000
 from fastapi import FastAPI, Request, Header, HTTPException
 
 app = FastAPI()
 
-# ===== ENV =====
+# =========================
+# Config (ENV)
+# =========================
 LINE_CHANNEL_SECRET = os.getenv("LINE_CHANNEL_SECRET", "")
 LINE_CHANNEL_ACCESS_TOKEN = os.getenv("LINE_CHANNEL_ACCESS_TOKEN", "")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
 
-DATABASE_URL = os.getenv("DATABASE_URL", "")          # Render Environment に入れる
-SHOP_ID = os.getenv("SHOP_ID", "tokyo_01")            # Render Environment に入れる
-ADMIN_API_KEY = os.getenv("ADMIN_API_KEY", "")        # 設定すると /api/* を保護できる（任意）
+DATABASE_URL = os.getenv("DATABASE_URL", "")
+SHOP_ID = os.getenv("SHOP_ID", "tokyo_01")
 
-# ===== In-memory history (MVP) =====
-CHAT_HISTORY = defaultdict(lambda: deque(maxlen=40))  # max 20 turns
-TEMP_HISTORY = defaultdict(lambda: deque(maxlen=3))   # median smoothing
+# /api/* を保護したいときだけ設定（未設定なら開発用に公開のまま）
+ADMIN_API_KEY = os.getenv("ADMIN_API_KEY", "")
+
+# DB SSLモード: auto(推奨) / verify / disable
+DB_SSL_MODE = os.getenv("DB_SSL_MODE", "auto").lower().strip()
+
+# =========================
+# In-memory (MVP)
+# =========================
+CHAT_HISTORY = defaultdict(lambda: deque(maxlen=40))  # 最大20往復
+TEMP_HISTORY = defaultdict(lambda: deque(maxlen=3))   # 揺れ止め：中央値
 
 
-# ---------------------------
+# =========================
 # Helpers
-# ---------------------------
+# =========================
 def verify_signature(body: bytes, signature: str) -> bool:
+    """Verify LINE webhook signature."""
     if not LINE_CHANNEL_SECRET:
         return False
     mac = hmac.new(LINE_CHANNEL_SECRET.encode("utf-8"), body, hashlib.sha256).digest()
@@ -48,6 +59,7 @@ def median(values: List[int], default: int = 5) -> int:
 
 
 def extract_json(text: str) -> Dict[str, Any]:
+    """Extract JSON object from model output (handles extra text/fences)."""
     text = (text or "").strip()
     try:
         return json.loads(text)
@@ -56,13 +68,14 @@ def extract_json(text: str) -> Dict[str, Any]:
     start, end = text.find("{"), text.rfind("}")
     if start != -1 and end != -1 and end > start:
         try:
-            return json.loads(text[start:end + 1])
+            return json.loads(text[start : end + 1])
         except Exception:
             pass
     return {}
 
 
 def coerce_level(raw: Any, default: int = 5) -> int:
+    """1〜10の整数へ強制。"""
     try:
         if isinstance(raw, str):
             s = raw.strip()
@@ -77,8 +90,8 @@ def coerce_level(raw: Any, default: int = 5) -> int:
 
 def coerce_confidence(raw: Any, default: float = 0.7) -> float:
     """
-    OpenAIが '低い/高い/80%' などを返しても落ちないように数値化する。
-    返り値は 0.0〜1.0 にクランプ。
+    OpenAIが confidence を '低い/高い/80%' などで返しても落ちないようにする。
+    戻り値は 0.0〜1.0 にクランプ。
     """
     if isinstance(raw, (int, float)):
         return max(0.0, min(1.0, float(raw)))
@@ -86,7 +99,6 @@ def coerce_confidence(raw: Any, default: float = 0.7) -> float:
     if isinstance(raw, str):
         s = raw.strip().lower()
 
-        # 日本語ラベル
         if s in {"高い", "高め", "high"}:
             return 0.85
         if s in {"中", "普通", "ふつう", "medium"}:
@@ -94,7 +106,6 @@ def coerce_confidence(raw: Any, default: float = 0.7) -> float:
         if s in {"低い", "低め", "low"}:
             return 0.40
 
-        # "80%"
         if s.endswith("%"):
             try:
                 v = float(s[:-1]) / 100.0
@@ -102,10 +113,9 @@ def coerce_confidence(raw: Any, default: float = 0.7) -> float:
             except Exception:
                 return default
 
-        # "0.8" / "80"
         try:
             v = float(s)
-            if v > 1.0 and v <= 100.0:
+            if 1.0 < v <= 100.0:
                 v = v / 100.0
             return max(0.0, min(1.0, v))
         except Exception:
@@ -117,7 +127,7 @@ def coerce_confidence(raw: Any, default: float = 0.7) -> float:
 def check_admin_key(x_admin_key: Optional[str]) -> None:
     """
     ADMIN_API_KEY が設定されている時だけ認証を有効にする。
-    未設定なら誰でもアクセス可能（開発用）。
+    未設定なら開発用に公開のまま。
     """
     if not ADMIN_API_KEY:
         return
@@ -140,22 +150,67 @@ def parse_database_url(url: str) -> Dict[str, Any]:
     }
 
 
+def make_ssl_context(mode: str) -> Optional[ssl.SSLContext]:
+    """
+    mode:
+      - verify:  検証ON（certifi）
+      - disable: 検証OFF
+      - auto:    まずverifyで試し、失敗したらdisableにフォールバック
+    """
+    if mode == "disable":
+        ctx = ssl.create_default_context()
+        ctx.check_hostname = False
+        ctx.verify_mode = ssl.CERT_NONE
+        return ctx
+
+    # verify / auto の最初は certifi を使って検証ON
+    ctx = ssl.create_default_context(cafile=certifi.where())
+    ctx.check_hostname = True
+    ctx.verify_mode = ssl.CERT_REQUIRED
+    return ctx
+
+
 def db_connect():
+    """Create a DB connection (pg8000). SSLは auto/verify/disable に対応。"""
     cfg = parse_database_url(DATABASE_URL)
-    ctx = ssl.create_default_context()
+    if not cfg["host"]:
+        raise RuntimeError("DATABASE_URL host is empty")
+
+    if DB_SSL_MODE not in {"auto", "verify", "disable"}:
+        mode = "auto"
+    else:
+        mode = DB_SSL_MODE
+
+    # 1) verify (or auto first try)
+    if mode in {"auto", "verify"}:
+        try:
+            return pg8000.connect(
+                user=cfg["user"],
+                password=cfg["password"],
+                host=cfg["host"],
+                port=cfg["port"],
+                database=cfg["database"],
+                ssl_context=make_ssl_context("verify"),
+            )
+        except ssl.SSLCertVerificationError as e:
+            if mode == "verify":
+                raise
+            print(f"[DB] SSL verify failed, fallback to disable: {e}")
+
+    # 2) disable
     return pg8000.connect(
         user=cfg["user"],
         password=cfg["password"],
         host=cfg["host"],
         port=cfg["port"],
         database=cfg["database"],
-        ssl_context=ctx,
+        ssl_context=make_ssl_context("disable"),
     )
 
 
-# ---------------------------
-# DB (sync) - called via asyncio.to_thread
-# ---------------------------
+# =========================
+# DB (sync) - use via asyncio.to_thread
+# =========================
 def ensure_tables_sync():
     if not can_db():
         print("[DB] skipped ensure_tables (missing DATABASE_URL or SHOP_ID)")
@@ -188,7 +243,7 @@ def ensure_tables_sync():
           created_at TIMESTAMPTZ DEFAULT now()
         );
         """)
-        # HOT一覧用にインデックス（速くなる）
+        # HOT検索用インデックス
         cur.execute("""
         CREATE INDEX IF NOT EXISTS idx_customers_shop_level_updated
         ON customers (shop_id, temp_level_stable, updated_at DESC);
@@ -199,31 +254,29 @@ def ensure_tables_sync():
         conn.close()
 
 
-def db_insert_message_sync(shop_id: str, conv_key: str, role: str, content: str):
-    conn = db_connect()
-    try:
-        cur = conn.cursor()
-        cur.execute(
-            "INSERT INTO messages (shop_id, conv_key, role, content) VALUES (%s,%s,%s,%s)",
-            (shop_id, conv_key, role, content),
-        )
-        conn.commit()
-    finally:
-        conn.close()
-
-
-def db_upsert_customer_sync(
+def db_write_interaction_sync(
     shop_id: str,
     conv_key: str,
-    last_user_text: str,
+    user_text: str,
+    assistant_text: str,
     raw_level: int,
     stable_level: int,
     conf: float,
     next_goal: str,
 ):
+    """1接続でまとめて書く（速く・きれい・失敗が少ない）。"""
     conn = db_connect()
     try:
         cur = conn.cursor()
+
+        cur.execute(
+            "INSERT INTO messages (shop_id, conv_key, role, content) VALUES (%s,%s,%s,%s)",
+            (shop_id, conv_key, "user", user_text),
+        )
+        cur.execute(
+            "INSERT INTO messages (shop_id, conv_key, role, content) VALUES (%s,%s,%s,%s)",
+            (shop_id, conv_key, "assistant", assistant_text),
+        )
         cur.execute(
             """
             INSERT INTO customers
@@ -239,8 +292,9 @@ def db_upsert_customer_sync(
               next_goal=EXCLUDED.next_goal,
               updated_at=now()
             """,
-            (shop_id, conv_key, last_user_text, raw_level, stable_level, conf, next_goal),
+            (shop_id, conv_key, user_text, raw_level, stable_level, conf, next_goal),
         )
+
         conn.commit()
     finally:
         conn.close()
@@ -276,7 +330,6 @@ def db_fetch_hot_customers_sync(shop_id: str, min_level: int, limit: int):
             except Exception:
                 updated_str = str(updated_at)
 
-            # conv_key から userId を抜けるなら抜く
             user_id = None
             if isinstance(conv_key, str) and conv_key.startswith("user:"):
                 user_id = conv_key.split("user:", 1)[1]
@@ -298,9 +351,9 @@ def db_fetch_hot_customers_sync(shop_id: str, min_level: int, limit: int):
         conn.close()
 
 
-# ---------------------------
-# LINE reply
-# ---------------------------
+# =========================
+# LINE Reply
+# =========================
 async def reply_message(reply_token: str, text: str) -> None:
     url = "https://api.line.me/v2/bot/message/reply"
     headers = {
@@ -314,9 +367,9 @@ async def reply_message(reply_token: str, text: str) -> None:
         r.raise_for_status()
 
 
-# ---------------------------
-# OpenAI: temp(10) + reply
-# ---------------------------
+# =========================
+# OpenAI (temp10 + reply)
+# =========================
 async def analyze_and_generate_reply(
     last_messages: List[Dict[str, str]], user_text: str
 ) -> Tuple[Dict[str, Any], str]:
@@ -370,7 +423,7 @@ async def analyze_and_generate_reply(
         lvl = coerce_level(result.get("temperature_level", 5), default=5)
         conf = coerce_confidence(result.get("confidence", 0.7), default=0.7)
 
-        # 安全側（自信低いときは真ん中寄せ）
+        # 自信が低いときは安全側（真ん中寄せ）
         if conf < 0.6:
             lvl = 5
 
@@ -391,9 +444,9 @@ async def analyze_and_generate_reply(
         )
 
 
-# ---------------------------
+# =========================
 # Startup
-# ---------------------------
+# =========================
 @app.on_event("startup")
 async def on_startup():
     try:
@@ -402,9 +455,9 @@ async def on_startup():
         print(f"[DB] ensure tables failed: {e}")
 
 
-# ---------------------------
+# =========================
 # APIs
-# ---------------------------
+# =========================
 @app.get("/")
 async def root():
     return {"ok": True}
@@ -423,12 +476,7 @@ async def api_hot(
     limit = max(1, min(200, int(limit)))
 
     items = await asyncio.to_thread(db_fetch_hot_customers_sync, shop_id, min_level, limit)
-    return {
-        "shop_id": shop_id,
-        "min_level": min_level,
-        "count": len(items),
-        "items": items,
-    }
+    return {"shop_id": shop_id, "min_level": min_level, "count": len(items), "items": items}
 
 
 @app.post("/line/webhook")
@@ -473,14 +521,15 @@ async def line_webhook(
         # memory
         CHAT_HISTORY[conv_key].append({"role": "assistant", "content": reply_text})
 
-        # DB write (best-effort / never block LINE reply)
+        # DB write (best-effort)
         if can_db():
             try:
-                await asyncio.to_thread(db_insert_message_sync, SHOP_ID, conv_key, "user", user_text)
-                await asyncio.to_thread(db_insert_message_sync, SHOP_ID, conv_key, "assistant", reply_text)
                 await asyncio.to_thread(
-                    db_upsert_customer_sync,
-                    SHOP_ID, conv_key, user_text,
+                    db_write_interaction_sync,
+                    SHOP_ID,
+                    conv_key,
+                    user_text,
+                    reply_text,
                     int(temp_info["temperature_level"]),
                     int(temp_info["temperature_level_stable"]),
                     float(temp_info["confidence"]),
@@ -500,4 +549,9 @@ async def line_webhook(
         )
 
         # reply
-        aw
+        try:
+            await reply_message(reply_token, reply_text)
+        except Exception as e:
+            print(f"[LINE] reply failed: {e}")
+
+    return {"ok": True}
