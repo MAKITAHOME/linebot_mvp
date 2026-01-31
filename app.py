@@ -176,7 +176,6 @@ def make_ssl_context(mode: str) -> ssl.SSLContext:
         ctx.verify_mode = ssl.CERT_NONE
         return ctx
 
-    # verify
     ctx = ssl.create_default_context(cafile=certifi.where())
     ctx.check_hostname = True
     ctx.verify_mode = ssl.CERT_REQUIRED
@@ -191,7 +190,6 @@ def db_connect():
 
     mode = DB_SSL_MODE if DB_SSL_MODE in {"auto", "verify", "disable"} else "auto"
 
-    # 1) verify (or auto first try)
     if mode in {"auto", "verify"}:
         try:
             return pg8000.connect(
@@ -207,7 +205,6 @@ def db_connect():
                 raise
             print(f"[DB] SSL verify failed, fallback to disable: {e}")
 
-    # 2) disable
     return pg8000.connect(
         user=cfg["user"],
         password=cfg["password"],
@@ -253,7 +250,6 @@ def ensure_tables_sync():
           created_at TIMESTAMPTZ DEFAULT now()
         );
         """)
-        # HOT検索用インデックス
         cur.execute("""
         CREATE INDEX IF NOT EXISTS idx_customers_shop_level_updated
         ON customers (shop_id, temp_level_stable, updated_at DESC);
@@ -274,7 +270,6 @@ def db_write_interaction_sync(
     conf: float,
     next_goal: str,
 ):
-    """1接続でまとめて書く（速く・安定）。"""
     conn = db_connect()
     try:
         cur = conn.cursor()
@@ -433,7 +428,6 @@ async def analyze_and_generate_reply(
         lvl = coerce_level(result.get("temperature_level", 5), default=5)
         conf = coerce_confidence(result.get("confidence", 0.7), default=0.7)
 
-        # 自信が低いときは安全側（真ん中寄せ）
         if conf < 0.6:
             lvl = 5
 
@@ -495,7 +489,7 @@ async def dashboard(
     shop_id: str = SHOP_ID,
     min_level: int = 8,
     limit: int = 50,
-    key: Optional[str] = None,  # ブラウザ用
+    key: Optional[str] = None,
     x_admin_key: Optional[str] = Header(None, alias="X-Admin-Key"),
 ):
     check_admin_key(x_admin_key, key)
@@ -510,7 +504,6 @@ async def dashboard(
         )
 
     items = await asyncio.to_thread(db_fetch_hot_customers_sync, shop_id, min_level, limit)
-
     now = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC")
 
     rows_html = ""
@@ -564,7 +557,6 @@ async def dashboard(
             {"<input name='key' value='"+html_lib.escape(key)+"' placeholder='admin key'>" if ADMIN_API_KEY else ""}
             <button type="submit">更新</button>
           </div>
-          <div class="muted" style="margin-top:8px;">※ 必要なら次で自動更新も追加できる</div>
         </form>
       </div>
 
@@ -616,22 +608,17 @@ async def line_webhook(
         src_id = source.get("userId") or source.get("groupId") or source.get("roomId") or "unknown"
         conv_key = f"{src_type}:{src_id}"
 
-        # memory
         CHAT_HISTORY[conv_key].append({"role": "user", "content": user_text})
 
-        # AI analyze + reply
         last_msgs = list(CHAT_HISTORY[conv_key])[-20:]
         temp_info, reply_text = await analyze_and_generate_reply(last_msgs, user_text)
 
-        # stabilize
         TEMP_HISTORY[conv_key].append(int(temp_info["temperature_level"]))
         stable = median(list(TEMP_HISTORY[conv_key]), default=5)
         temp_info["temperature_level_stable"] = stable
 
-        # memory
         CHAT_HISTORY[conv_key].append({"role": "assistant", "content": reply_text})
 
-        # DB write (best-effort)
         if can_db():
             try:
                 await asyncio.to_thread(
@@ -651,14 +638,12 @@ async def line_webhook(
         else:
             print("[DB] skipped (missing DATABASE_URL or SHOP_ID)")
 
-        # logs
         print(
             f"[TEMP] key={conv_key} level_raw={temp_info['temperature_level']} "
             f"level_stable={temp_info['temperature_level_stable']} conf={temp_info['confidence']} "
             f"goal={temp_info['next_goal']}"
         )
 
-        # reply
         try:
             await reply_message(reply_token, reply_text)
         except Exception as e:
