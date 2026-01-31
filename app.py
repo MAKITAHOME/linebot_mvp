@@ -38,7 +38,6 @@ DB_SSL_MODE = os.getenv("DB_SSL_MODE", "auto").lower().strip()
 # デバッグログ増やしたい時だけ 1
 DEBUG = os.getenv("DEBUG", "0") == "1"
 
-
 # =========================
 # In-memory (MVP)
 # =========================
@@ -531,6 +530,7 @@ async def api_hot(
     min_level: int = 8,
     limit: int = 50,
     view: str = "latest",        # latest / events
+    q: Optional[str] = None,     # 検索（JSONでも使える）
     key: Optional[str] = None,   # ブラウザ用
     x_admin_key: Optional[str] = Header(None, alias="X-Admin-Key"),
 ):
@@ -539,6 +539,7 @@ async def api_hot(
     min_level = max(1, min(10, int(min_level)))
     limit = max(1, min(200, int(limit)))
     view = (view or "latest").lower()
+    q_norm = (q or "").strip().lower()
 
     if not can_db():
         return {"shop_id": shop_id, "min_level": min_level, "count": 0, "items": [], "error": "DB not configured"}
@@ -548,7 +549,21 @@ async def api_hot(
     else:
         items = await asyncio.to_thread(db_fetch_hot_customers_sync, shop_id, min_level, limit)
 
-    return {"shop_id": shop_id, "min_level": min_level, "view": view, "count": len(items), "items": items}
+    if q_norm:
+        def hit(it: Dict[str, Any]) -> bool:
+            blob = " ".join([
+                str(it.get("updated_at", "")),
+                str(it.get("conv_key", "")),
+                str(it.get("user_id", "")),
+                str(it.get("temp_level_stable", "")),
+                str(it.get("confidence", "")),
+                str(it.get("next_goal", "")),
+                str(it.get("last_user_text", "")),
+            ]).lower()
+            return q_norm in blob
+        items = [it for it in items if hit(it)]
+
+    return {"shop_id": shop_id, "min_level": min_level, "view": view, "q": q or "", "count": len(items), "items": items}
 
 
 @app.get("/dashboard", response_class=HTMLResponse)
@@ -557,6 +572,8 @@ async def dashboard(
     min_level: int = 8,
     limit: int = 50,
     view: str = "events",        # 履歴がデフォルト
+    refresh: int = 30,           # 自動更新秒。0でOFF
+    q: Optional[str] = None,     # 検索ワード
     key: Optional[str] = None,
     x_admin_key: Optional[str] = Header(None, alias="X-Admin-Key"),
 ):
@@ -565,6 +582,12 @@ async def dashboard(
     min_level = max(1, min(10, int(min_level)))
     limit = max(1, min(200, int(limit)))
     view = (view or "events").lower()
+    refresh = int(refresh)
+    if refresh < 0:
+        refresh = 0
+    if refresh > 600:
+        refresh = 600
+    q_value = (q or "").strip()
 
     if not can_db():
         return HTMLResponse("<h2>DB未設定</h2><p>DATABASE_URL / SHOP_ID を設定してください。</p>", status_code=500)
@@ -575,9 +598,9 @@ async def dashboard(
         items = await asyncio.to_thread(db_fetch_hot_events_sync, shop_id, min_level, limit)
 
     now = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC")
-
     legend_html = " ".join([f'<span class="badge badge-lvl-{i}">{i}</span>' for i in range(1, 11)])
 
+    # rows
     rows_html = ""
     for it in items:
         lvl = it.get("temp_level_stable", "")
@@ -589,8 +612,20 @@ async def dashboard(
         row_class = f"lvl-{lvl_int}" if 1 <= lvl_int <= 10 else ""
         badge_class = f"badge badge-lvl-{lvl_int}" if 1 <= lvl_int <= 10 else "badge"
 
+        # JS検索用の検索文字列（小文字）
+        search_blob = " ".join([
+            str(it.get("updated_at", "")),
+            str(it.get("conv_key", "")),
+            str(it.get("user_id", "")),
+            str(it.get("temp_level_stable", "")),
+            str(it.get("confidence", "")),
+            str(it.get("next_goal", "")),
+            str(it.get("last_user_text", "")),
+        ]).lower()
+        search_blob_esc = html_lib.escape(search_blob, quote=True)
+
         rows_html += f"""
-        <tr class="{row_class}">
+        <tr class="{row_class}" data-search="{search_blob_esc}">
           <td>{html_lib.escape(str(it.get("updated_at","")))}</td>
           <td style="text-align:center"><span class="{badge_class}">{html_lib.escape(str(it.get("temp_level_stable","")))}</span></td>
           <td style="text-align:center">{html_lib.escape(str(it.get("confidence","")))}</td>
@@ -600,16 +635,25 @@ async def dashboard(
         </tr>
         """
 
+    meta_refresh = ""
+    if refresh > 0:
+        meta_refresh = f'<meta http-equiv="refresh" content="{refresh}">'
+
+    # api link（同じフィルタでJSONも見られる）
     api_link = f"/api/hot?shop_id={html_lib.escape(shop_id)}&min_level={min_level}&limit={limit}&view={html_lib.escape(view)}"
+    if q_value:
+        api_link += f"&q={html_lib.escape(q_value)}"
     if ADMIN_API_KEY and key:
         api_link += f"&key={html_lib.escape(key)}"
 
+    # HTML
     html_page = f"""
     <!doctype html>
     <html lang="ja">
     <head>
       <meta charset="utf-8">
       <meta name="viewport" content="width=device-width, initial-scale=1">
+      {meta_refresh}
       <title>HOT顧客ダッシュボード</title>
       <style>
         body {{ font-family: system-ui, -apple-system, Segoe UI, Roboto, sans-serif; margin: 24px; }}
@@ -623,6 +667,11 @@ async def dashboard(
         input, select {{ padding: 8px; border: 1px solid #ddd; border-radius: 10px; }}
         button {{ padding: 8px 12px; border: 1px solid #111; background:#111; color:#fff; border-radius: 10px; cursor:pointer; }}
         a {{ color: #0b5; text-decoration: none; }}
+
+        .rowtools {{ display:flex; gap:8px; flex-wrap:wrap; align-items:center; margin-top:10px; }}
+        .kpi {{ display:flex; gap:10px; flex-wrap:wrap; align-items:center; }}
+        .kpi span {{ font-size:12px; color:#666; }}
+        .kpi b {{ font-size:14px; }}
 
         /* 10段階の行背景色（寒色→暖色） */
         .lvl-1  {{ background: #e3f2fd; }}
@@ -658,15 +707,38 @@ async def dashboard(
         .badge-lvl-8  {{ background:#ffe0b2; border-color:#ffb74d; }}
         .badge-lvl-9  {{ background:#ffccbc; border-color:#ff8a65; }}
         .badge-lvl-10 {{ background:#ffcdd2; border-color:#e57373; }}
+
+        .btn-ghost {{
+          padding: 8px 12px;
+          border: 1px solid #ddd;
+          background: #fff;
+          color: #111;
+          border-radius: 10px;
+          cursor: pointer;
+        }}
       </style>
     </head>
     <body>
       <div class="top">
         <div class="card">
           <div><span class="pill">HOT顧客</span> <b>{html_lib.escape(shop_id)}</b></div>
-          <div class="muted">view={html_lib.escape(view)} / min_level={min_level} / limit={limit} / count={len(items)} / {now}</div>
+          <div class="muted">view={html_lib.escape(view)} / min_level={min_level} / limit={limit} / refresh={refresh}s / total={len(items)} / {now}</div>
           <div class="muted">温度カラー：{legend_html}（1=低温 → 10=最熱）</div>
           <div class="muted">JSON: <a href="{api_link}">{api_link}</a></div>
+
+          <div class="rowtools">
+            <div>
+              <div class="muted">検索（自動）</div>
+              <input id="searchBox" value="{html_lib.escape(q_value, quote=True)}" placeholder="user_id / ゴール / メッセージなど" style="min-width:320px;">
+            </div>
+            <div class="kpi">
+              <span>表示</span><b id="visibleCount">{len(items)}</b>
+              <span>/ 全件</span><b id="totalCount">{len(items)}</b>
+            </div>
+            <div>
+              <button class="btn-ghost" type="button" id="clearBtn">クリア</button>
+            </div>
+          </div>
         </div>
 
         <form class="card" method="get" action="/dashboard">
@@ -679,13 +751,18 @@ async def dashboard(
             </select>
             <input name="min_level" value="{min_level}" placeholder="min_level (1-10)">
             <input name="limit" value="{limit}" placeholder="limit (<=200)">
+            <input name="refresh" value="{refresh}" placeholder="refresh seconds (0=off)">
+            <input name="q" value="{html_lib.escape(q_value, quote=True)}" placeholder="検索（q）">
             {"<input name='key' value='"+html_lib.escape(key)+"' placeholder='admin key'>" if ADMIN_API_KEY else ""}
             <button type="submit">更新</button>
+          </div>
+          <div class="muted" style="margin-top:8px;">
+            ※ 検索欄は入力した瞬間に絞り込み（URLの q= にも自動保存）
           </div>
         </form>
       </div>
 
-      <table>
+      <table id="dataTable">
         <thead>
           <tr>
             <th>更新</th>
@@ -696,10 +773,64 @@ async def dashboard(
             <th>直近メッセージ</th>
           </tr>
         </thead>
-        <tbody>
+        <tbody id="tbody">
           {rows_html if rows_html else "<tr><td colspan='6' class='muted'>該当なし</td></tr>"}
         </tbody>
       </table>
+
+      <script>
+        (function() {{
+          const searchBox = document.getElementById("searchBox");
+          const clearBtn = document.getElementById("clearBtn");
+          const tbody = document.getElementById("tbody");
+          const visibleCount = document.getElementById("visibleCount");
+          const totalCount = document.getElementById("totalCount");
+
+          function updateUrlParam(q) {{
+            try {{
+              const url = new URL(window.location.href);
+              if (q && q.trim().length > 0) {{
+                url.searchParams.set("q", q);
+              }} else {{
+                url.searchParams.delete("q");
+              }}
+              window.history.replaceState({{}}, "", url.toString());
+            }} catch (e) {{}}
+          }}
+
+          function applyFilter() {{
+            const q = (searchBox.value || "").trim().toLowerCase();
+            const rows = tbody.querySelectorAll("tr");
+            let shown = 0;
+            rows.forEach((tr) => {{
+              const blob = (tr.getAttribute("data-search") || "");
+              const hit = q === "" ? true : blob.indexOf(q) !== -1;
+              tr.style.display = hit ? "" : "none";
+              if (hit) shown += 1;
+            }});
+            visibleCount.textContent = String(shown);
+            totalCount.textContent = String(rows.length);
+            updateUrlParam(q);
+          }}
+
+          // 自動検索（入力即反映）
+          let timer = null;
+          searchBox.addEventListener("input", () => {{
+            if (timer) clearTimeout(timer);
+            timer = setTimeout(applyFilter, 50);
+          }});
+
+          // クリア
+          clearBtn.addEventListener("click", () => {{
+            searchBox.value = "";
+            applyFilter();
+            searchBox.focus();
+          }});
+
+          // 初期適用（q= がある場合も反映）
+          applyFilter();
+        }})();
+      </script>
     </body>
     </html>
     """
