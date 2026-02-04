@@ -15,6 +15,23 @@
 #   SHOP_ID
 #   DASHBOARD_REFRESH_SEC_DEFAULT
 #   FOLLOWUP_ENABLED / FOLLOWUP_* (jobs)
+#
+# Followup env (recommended):
+#   FOLLOWUP_ENABLED=1
+#   FOLLOWUP_AFTER_MINUTES=60
+#   FOLLOWUP_MIN_LEVEL=8
+#   FOLLOWUP_LIMIT=50
+#   FOLLOWUP_DRYRUN=0
+#   FOLLOWUP_LOCK_TTL_SEC=180
+#   FOLLOWUP_MIN_HOURS_BETWEEN=24
+#   FOLLOWUP_JST_FROM=10
+#   FOLLOWUP_JST_TO=20
+#   FOLLOWUP_USE_OPENAI=0   (optional)
+#
+# Notes:
+# - customers.user_id stores LINE userId
+# - customers.conv_key is "user:<userId>" (stable identifier)
+# - followup_logs prevents duplicate sending
 
 import os
 import json
@@ -55,13 +72,17 @@ ADMIN_API_KEY = os.getenv("ADMIN_API_KEY", "").strip()
 # Dashboard refresh
 DASHBOARD_REFRESH_SEC_DEFAULT = int(os.getenv("DASHBOARD_REFRESH_SEC_DEFAULT", "30"))
 
-# Followup config (optional)
+# Followup config
 FOLLOWUP_ENABLED = os.getenv("FOLLOWUP_ENABLED", "0").strip() == "1"
 FOLLOWUP_AFTER_MINUTES = int(os.getenv("FOLLOWUP_AFTER_MINUTES", "60"))
 FOLLOWUP_MIN_LEVEL = int(os.getenv("FOLLOWUP_MIN_LEVEL", "8"))
 FOLLOWUP_LIMIT = int(os.getenv("FOLLOWUP_LIMIT", "50"))
 FOLLOWUP_DRYRUN = os.getenv("FOLLOWUP_DRYRUN", "0").strip() == "1"
 FOLLOWUP_LOCK_TTL_SEC = int(os.getenv("FOLLOWUP_LOCK_TTL_SEC", "180"))
+FOLLOWUP_MIN_HOURS_BETWEEN = int(os.getenv("FOLLOWUP_MIN_HOURS_BETWEEN", "24"))
+FOLLOWUP_JST_FROM = int(os.getenv("FOLLOWUP_JST_FROM", "10"))
+FOLLOWUP_JST_TO = int(os.getenv("FOLLOWUP_JST_TO", "20"))
+FOLLOWUP_USE_OPENAI = os.getenv("FOLLOWUP_USE_OPENAI", "0").strip() == "1"
 
 # In-memory short history (MVP)
 CHAT_HISTORY: Dict[str, deque] = defaultdict(lambda: deque(maxlen=40))
@@ -69,7 +90,7 @@ TEMP_HISTORY: Dict[str, deque] = defaultdict(lambda: deque(maxlen=3))
 
 JST = timezone(timedelta(hours=9))
 
-app = FastAPI(title="linebot_mvp", version="0.2.0")
+app = FastAPI(title="linebot_mvp", version="0.3.0")
 
 
 # ============================================================
@@ -81,7 +102,7 @@ def require_dashboard_key(
     key: Optional[str] = Query(default=None),
 ) -> None:
     """
-    Human UI protection for /dashboard and /api/hot (no BasicAuth).
+    Human UI protection for /dashboard and /api/hot.
     Accepts:
       - Header: X-Dashboard-Key: <DASHBOARD_KEY>
       - Query : ?key=<DASHBOARD_KEY>
@@ -200,7 +221,6 @@ def ensure_tables_and_columns() -> None:
     conn = _connect_db_with_fallback()
     cur = conn.cursor()
 
-    # Base tables (minimal)
     cur.execute(
         """
         CREATE TABLE IF NOT EXISTS customers (
@@ -213,8 +233,6 @@ def ensure_tables_and_columns() -> None:
         """
     )
 
-    # Add missing columns safely
-    # (Postgres supports ADD COLUMN IF NOT EXISTS)
     cur.execute("""ALTER TABLE customers ADD COLUMN IF NOT EXISTS user_id TEXT;""")
     cur.execute("""ALTER TABLE customers ADD COLUMN IF NOT EXISTS last_user_text TEXT;""")
     cur.execute("""ALTER TABLE customers ADD COLUMN IF NOT EXISTS temp_level_raw INT;""")
@@ -244,10 +262,29 @@ def ensure_tables_and_columns() -> None:
         """
     )
 
-    # Indexes (optional)
+    # 追客ログ（追加）
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS followup_logs (
+          id BIGSERIAL PRIMARY KEY,
+          shop_id TEXT NOT NULL,
+          conv_key TEXT NOT NULL,
+          user_id TEXT NOT NULL,
+          message TEXT NOT NULL,
+          mode TEXT NOT NULL,              -- template|openai
+          status TEXT NOT NULL,            -- sent|skipped|failed
+          error TEXT,
+          created_at TIMESTAMPTZ DEFAULT now()
+        );
+        """
+    )
+
+    # Indexes
     cur.execute("""CREATE INDEX IF NOT EXISTS idx_customers_shop_updated ON customers(shop_id, updated_at DESC);""")
     cur.execute("""CREATE INDEX IF NOT EXISTS idx_messages_shop_created ON messages(shop_id, created_at DESC);""")
     cur.execute("""CREATE INDEX IF NOT EXISTS idx_messages_conv_role_created ON messages(conv_key, role, created_at DESC);""")
+    cur.execute("""CREATE INDEX IF NOT EXISTS idx_followup_shop_conv_created ON followup_logs(shop_id, conv_key, created_at DESC);""")
+    cur.execute("""CREATE INDEX IF NOT EXISTS idx_followup_user_created ON followup_logs(user_id, created_at DESC);""")
 
     cur.close()
     conn.close()
@@ -394,6 +431,16 @@ SYSTEM_PROMPT_ASSISTANT = """
 ユーザーに対して丁寧で簡潔、次の行動につながる返信を日本語で作ってください。
 """
 
+SYSTEM_PROMPT_FOLLOWUP = """
+あなたは不動産仲介の追客メッセージ作成AIです。
+以下の情報をもとに、押し売り感ゼロで、返信しやすい一通を日本語で作ってください。
+
+ルール：
+- 2〜4行、短め
+- 質問は最大2つ
+- 「内見」「申込」など強い言葉は乱用しない
+- 絵文字は最大1つ
+"""
 
 def coerce_level(v: Any) -> int:
     try:
@@ -547,6 +594,201 @@ def upsert_customer(
     )
 
 
+def save_followup_log(
+    shop_id: str,
+    conv_key: str,
+    user_id: str,
+    message: str,
+    mode: str,
+    status: str,
+    error: Optional[str] = None,
+) -> None:
+    if not DATABASE_URL:
+        return
+    db_execute(
+        """
+        INSERT INTO followup_logs (shop_id, conv_key, user_id, message, mode, status, error)
+        VALUES (%s, %s, %s, %s, %s, %s, %s)
+        """,
+        (shop_id, conv_key, user_id, message, mode, status, (error or None)),
+    )
+
+
+# ============================================================
+# Followup Logic
+# ============================================================
+
+def utcnow() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+def now_jst() -> datetime:
+    return datetime.now(JST)
+
+
+def is_within_jst_window(dt: Optional[datetime] = None) -> bool:
+    d = dt or now_jst()
+    h = d.hour
+    start = max(0, min(23, int(FOLLOWUP_JST_FROM)))
+    end = max(0, min(23, int(FOLLOWUP_JST_TO)))
+
+    # start < end: 10-20 など
+    if start < end:
+        return start <= h < end
+    # start > end: 22-6 など（深夜跨ぎ）
+    if start > end:
+        return (h >= start) or (h < end)
+    # start == end: 送らない
+    return False
+
+
+def acquire_job_lock(key: str, ttl_sec: int) -> bool:
+    now = utcnow()
+    until = now + timedelta(seconds=ttl_sec)
+
+    rows = db_fetchall("SELECT locked_until FROM job_locks WHERE key=%s", (key,))
+    if rows:
+        locked_until = rows[0][0]
+        if locked_until and locked_until > now:
+            return False
+
+    db_execute(
+        """
+        INSERT INTO job_locks (key, locked_until)
+        VALUES (%s, %s)
+        ON CONFLICT (key)
+        DO UPDATE SET locked_until = EXCLUDED.locked_until
+        """,
+        (key, until),
+    )
+    return True
+
+
+def build_followup_template(next_goal: str, last_user_text: str, level: int) -> str:
+    goal = (next_goal or "").strip()
+    last = (last_user_text or "").strip()
+
+    # ゴール別の自然な質問に寄せる（押し売り回避）
+    if "予算" in goal:
+        q = "ご予算の目安（上限）だけ教えていただけますか？"
+    elif "入居" in goal or "時期" in goal:
+        q = "ご入居希望の時期はいつ頃を想定されていますか？"
+    elif "エリア" in goal or "沿線" in goal:
+        q = "希望エリア（沿線/駅）はどのあたりが良いですか？"
+    elif "内見" in goal or "候補日" in goal:
+        q = "もしご都合よければ、今週 or 来週で空いている時間帯はありますか？"
+    elif "申込" in goal:
+        q = "ご不安点があれば、先に解消して進められます。気になる点はありますか？"
+    else:
+        q = "条件を少し整理したいので、希望があれば教えてください。"
+
+    # 温度が高いほど「具体化」寄り、低いほど「軽い確認」寄り
+    if level >= 9:
+        lead = "念のため確認です。"
+    elif level >= 8:
+        lead = "その後いかがでしょうか？"
+    else:
+        lead = "以前の件、その後の状況だけ伺ってもいいですか？"
+
+    last_hint = ""
+    if last:
+        # 末尾に軽く触れる（長文は避ける）
+        trimmed = last[:40] + ("…" if len(last) > 40 else "")
+        last_hint = f"（直近：{trimmed}）\n"
+
+    msg = f"{lead}\n{last_hint}{q}\n必要なら条件に合う候補をすぐまとめます😊"
+    return msg.strip()
+
+
+async def build_followup_message_openai(next_goal: str, last_user_text: str, level: int) -> str:
+    prompt = (
+        f"温度レベル: {level}\n"
+        f"next_goal: {next_goal}\n"
+        f"直近メッセージ: {last_user_text}\n"
+    )
+    msgs = [
+        {"role": "system", "content": SYSTEM_PROMPT_FOLLOWUP},
+        {"role": "user", "content": prompt},
+    ]
+    try:
+        out = await openai_chat(msgs, temperature=0.5)
+        out = (out or "").strip()
+        if out.startswith("```"):
+            parts = out.split("```")
+            out = parts[1] if len(parts) > 1 else out
+        # 念のため短く
+        return out[:600].strip() or build_followup_template(next_goal, last_user_text, level)
+    except Exception as e:
+        print("[OPENAI] followup gen failed:", repr(e))
+        return build_followup_template(next_goal, last_user_text, level)
+
+
+def get_followup_candidates() -> List[Dict[str, Any]]:
+    """
+    - 温度 >= min
+    - updated_at が threshold より古い（一定時間返信がない）
+    - 直近 FOLLOWUP_MIN_HOURS_BETWEEN 以内に followup 送っていない
+    - user_id がある
+    """
+    if not DATABASE_URL:
+        return []
+
+    threshold = utcnow() - timedelta(minutes=FOLLOWUP_AFTER_MINUTES)
+    since = utcnow() - timedelta(hours=FOLLOWUP_MIN_HOURS_BETWEEN)
+
+    rows = db_fetchall(
+        """
+        SELECT
+          c.shop_id,
+          c.conv_key,
+          c.user_id,
+          COALESCE(c.temp_level_stable, 0) as lvl,
+          COALESCE(c.confidence, 0) as conf,
+          COALESCE(c.next_goal, '') as goal,
+          c.updated_at,
+          COALESCE(c.last_user_text, '') as last_text,
+          (
+            SELECT MAX(fl.created_at)
+            FROM followup_logs fl
+            WHERE fl.shop_id = c.shop_id
+              AND fl.conv_key = c.conv_key
+              AND fl.status = 'sent'
+          ) AS last_followup_at
+        FROM customers c
+        WHERE c.shop_id = %s
+          AND COALESCE(c.temp_level_stable, 0) >= %s
+          AND c.updated_at < %s
+          AND COALESCE(c.user_id, '') <> ''
+        ORDER BY c.updated_at ASC
+        LIMIT %s
+        """,
+        (SHOP_ID, FOLLOWUP_MIN_LEVEL, threshold, FOLLOWUP_LIMIT),
+    )
+
+    candidates: List[Dict[str, Any]] = []
+    for r in rows:
+        last_followup_at = r[8]
+        # 直近送信が min_hours 以内なら除外
+        if last_followup_at and last_followup_at > since:
+            continue
+
+        candidates.append(
+            {
+                "shop_id": r[0],
+                "conv_key": r[1],
+                "user_id": r[2],
+                "temp_level_stable": int(r[3] or 0),
+                "confidence": float(r[4] or 0.0),
+                "next_goal": r[5],
+                "updated_at": r[6].isoformat() if r[6] else None,
+                "last_user_text": r[7],
+                "last_followup_at": last_followup_at.isoformat() if last_followup_at else None,
+            }
+        )
+
+    return candidates
+
+
 # ============================================================
 # Routes
 # ============================================================
@@ -592,7 +834,6 @@ async def process_ai_and_push(shop_id: str, user_id: str, conv_key: str, user_te
         except Exception as db_e2:
             print("[DB] save assistant message failed:", repr(db_e2))
 
-        # debug
         if reasons:
             print(f"[TEMP] {conv_key} raw={raw_level} stable={stable_level} conf={conf:.2f} goal={next_goal} reasons={reasons}")
         else:
@@ -631,6 +872,8 @@ async def line_webhook(
         user_id = (ev.get("source") or {}).get("userId", "unknown")
         reply_token = ev.get("replyToken", "")
         user_text = (message.get("text") or "").strip()
+        if not user_text:
+            continue
 
         conv_key = f"user:{user_id}"
 
@@ -667,7 +910,7 @@ async def api_hot(
     if view == "customers":
         rows = db_fetchall(
             """
-            SELECT conv_key, last_user_text, temp_level_stable, confidence, next_goal, updated_at
+            SELECT conv_key, user_id, last_user_text, temp_level_stable, confidence, next_goal, updated_at
             FROM customers
             WHERE shop_id = %s AND COALESCE(temp_level_stable, 0) >= %s
             ORDER BY updated_at DESC
@@ -677,12 +920,13 @@ async def api_hot(
         )
         return JSONResponse([
             {
-                "user_id": r[0],  # conv_key
-                "last_user_text": r[1],
-                "temp_level_stable": r[2],
-                "confidence": float(r[3]) if r[3] is not None else None,
-                "next_goal": r[4],
-                "updated_at": r[5].isoformat() if r[5] else None,
+                "conv_key": r[0],
+                "user_id": r[1],
+                "last_user_text": r[2],
+                "temp_level_stable": r[3],
+                "confidence": float(r[4]) if r[4] is not None else None,
+                "next_goal": r[5],
+                "updated_at": r[6].isoformat() if r[6] else None,
             }
             for r in rows
         ])
@@ -690,6 +934,7 @@ async def api_hot(
     rows = db_fetchall(
         """
         SELECT c.conv_key,
+               c.user_id,
                m.content,
                m.created_at,
                c.temp_level_stable,
@@ -707,12 +952,13 @@ async def api_hot(
 
     return JSONResponse([
         {
-            "user_id": r[0],
-            "last_user_text": r[1],
-            "message_created_at": r[2].isoformat() if r[2] else None,
-            "temp_level_stable": r[3],
-            "confidence": float(r[4]) if r[4] is not None else None,
-            "next_goal": r[5],
+            "conv_key": r[0],
+            "user_id": r[1],
+            "last_user_text": r[2],
+            "message_created_at": r[3].isoformat() if r[3] else None,
+            "temp_level_stable": r[4],
+            "confidence": float(r[5]) if r[5] is not None else None,
+            "next_goal": r[6],
         }
         for r in rows
     ])
@@ -746,7 +992,6 @@ async def dashboard(
     refresh: int = Query(default=DASHBOARD_REFRESH_SEC_DEFAULT, ge=0, le=300),
     key: Optional[str] = Query(default=None),  # pass-through for JS fetch
 ):
-    # key は require_dashboard_key が検証済み。JS fetchでも同じkeyを付ける。
     key_q = (key or "").strip()
     api_url = f"/api/hot?shop_id={shop_id}&min_level={min_level}&limit={limit}&view={view}&key={key_q}"
 
@@ -1024,72 +1269,68 @@ async def dashboard(
 # Followup job (ADMIN_API_KEY)
 # ------------------------------------------------------------
 
-def utcnow() -> datetime:
-    return datetime.now(timezone.utc)
-
-
-def acquire_job_lock(key: str, ttl_sec: int) -> bool:
-    now = utcnow()
-    until = now + timedelta(seconds=ttl_sec)
-
-    rows = db_fetchall("SELECT locked_until FROM job_locks WHERE key=%s", (key,))
-    if rows:
-        locked_until = rows[0][0]
-        if locked_until and locked_until > now:
-            return False
-
-    db_execute(
-        """
-        INSERT INTO job_locks (key, locked_until)
-        VALUES (%s, %s)
-        ON CONFLICT (key)
-        DO UPDATE SET locked_until = EXCLUDED.locked_until
-        """,
-        (key, until),
-    )
-    return True
-
-
 @app.post("/jobs/followup")
 async def job_followup(_: None = Depends(require_admin_key)):
     if not FOLLOWUP_ENABLED:
         return {"ok": True, "enabled": False, "reason": "FOLLOWUP_ENABLED!=1"}
 
+    if not is_within_jst_window():
+        return {
+            "ok": True,
+            "enabled": True,
+            "skipped": True,
+            "reason": f"out_of_time_window (JST {FOLLOWUP_JST_FROM}-{FOLLOWUP_JST_TO})",
+            "now_jst": now_jst().isoformat(),
+        }
+
     if not acquire_job_lock("followup", FOLLOWUP_LOCK_TTL_SEC):
         return {"ok": True, "enabled": True, "skipped": True, "reason": "locked"}
 
-    threshold = utcnow() - timedelta(minutes=FOLLOWUP_AFTER_MINUTES)
-
-    rows = db_fetchall(
-        """
-        SELECT shop_id, conv_key, temp_level_stable, confidence, next_goal, updated_at, last_user_text
-        FROM customers
-        WHERE shop_id=%s
-          AND COALESCE(temp_level_stable, 0) >= %s
-          AND updated_at < %s
-        ORDER BY updated_at ASC
-        LIMIT %s
-        """,
-        (SHOP_ID, FOLLOWUP_MIN_LEVEL, threshold, FOLLOWUP_LIMIT),
-    )
-
-    candidates = []
-    for r in rows:
-        candidates.append(
-            {
-                "shop_id": r[0],
-                "conv_key": r[1],
-                "temp_level_stable": r[2],
-                "confidence": float(r[3]) if r[3] is not None else None,
-                "next_goal": r[4],
-                "updated_at": r[5].isoformat() if r[5] else None,
-                "last_user_text": r[6],
-            }
-        )
+    candidates = get_followup_candidates()
 
     if FOLLOWUP_DRYRUN:
         print("[FOLLOWUP] DRYRUN candidates:", len(candidates))
         return {"ok": True, "enabled": True, "dryrun": True, "candidates": candidates}
 
-    print("[FOLLOWUP] candidates:", len(candidates))
-    return {"ok": True, "enabled": True, "candidates": candidates}
+    sent = 0
+    failed = 0
+    details: List[Dict[str, Any]] = []
+
+    for c in candidates:
+        user_id = c["user_id"]
+        conv_key = c["conv_key"]
+        level = int(c["temp_level_stable"] or 0)
+        goal = c.get("next_goal") or ""
+        last_text = c.get("last_user_text") or ""
+
+        # 文面生成
+        mode = "template"
+        if FOLLOWUP_USE_OPENAI and OPENAI_API_KEY:
+            mode = "openai"
+            msg = await build_followup_message_openai(goal, last_text, level)
+        else:
+            msg = build_followup_template(goal, last_text, level)
+
+        # 送信（push）
+        try:
+            await push_message(user_id, msg)
+            save_followup_log(SHOP_ID, conv_key, user_id, msg, mode, "sent", None)
+            sent += 1
+            details.append({"conv_key": conv_key, "user_id": user_id, "status": "sent", "mode": mode})
+        except Exception as e:
+            err = str(e)[:200]
+            print("[FOLLOWUP] send failed:", conv_key, repr(e))
+            save_followup_log(SHOP_ID, conv_key, user_id, msg, mode, "failed", err)
+            failed += 1
+            details.append({"conv_key": conv_key, "user_id": user_id, "status": "failed", "mode": mode, "error": err})
+
+    print(f"[FOLLOWUP] done sent={sent} failed={failed} candidates={len(candidates)}")
+    return {
+        "ok": True,
+        "enabled": True,
+        "dryrun": False,
+        "candidates": len(candidates),
+        "sent": sent,
+        "failed": failed,
+        "details": details[:50],
+    }
