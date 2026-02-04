@@ -1,8 +1,9 @@
 # app.py (FULL REWRITE)
 # FastAPI + Render + Postgres(pg8000)
+#
 # LINE webhook:
-#   - Try FAST AI reply within short timeout (no "確認中" message)
-#   - If AI is slow/failing: send fallback "確認中" ONLY then, and do background AI + push
+#  - Try FAST AI reply within short timeout (no "確認中" message)
+#  - If AI is slow/failing: send fallback "確認中" ONLY then, and do background AI + push
 #
 # Dashboard auth: DASHBOARD_KEY (query ?key=... or header X-Dashboard-Key)
 # Jobs auth: ADMIN_API_KEY (header x-admin-key)
@@ -18,16 +19,20 @@
 # Optional:
 #   SHOP_ID
 #   DASHBOARD_REFRESH_SEC_DEFAULT
-#   FOLLOWUP_ENABLED / FOLLOWUP_* (jobs)
 #   FAST_REPLY_TIMEOUT_SEC (default 3.0)
-#   ANALYZE_HISTORY_LIMIT (default 10)  # 温度判定に使う履歴数
+#   ANALYZE_HISTORY_LIMIT (default 10)
 #
-# Improvements for temp accuracy:
-# - Restore strict rubric prompt for analysis
-# - Include recent conversation (DB messages) in analysis prompt
-# - Extract simple slots (budget/area/move-in/layout) and pass to analysis
-# - HARD RULE: cancel/reject phrases force low temp (prevents Lv8 on "やっぱりなし")
-# - HARD RULE: very short text caps low temp
+# Followup env (recommended):
+#   FOLLOWUP_ENABLED=1
+#   FOLLOWUP_AFTER_MINUTES=180
+#   FOLLOWUP_MIN_LEVEL=8
+#   FOLLOWUP_LIMIT=50
+#   FOLLOWUP_DRYRUN=1
+#   FOLLOWUP_LOCK_TTL_SEC=180
+#   FOLLOWUP_MIN_HOURS_BETWEEN=24
+#   FOLLOWUP_JST_FROM=10
+#   FOLLOWUP_JST_TO=20
+#   FOLLOWUP_USE_OPENAI=0
 
 import os
 import json
@@ -66,6 +71,10 @@ ADMIN_API_KEY = os.getenv("ADMIN_API_KEY", "").strip()
 
 DASHBOARD_REFRESH_SEC_DEFAULT = int(os.getenv("DASHBOARD_REFRESH_SEC_DEFAULT", "30"))
 
+FAST_REPLY_TIMEOUT_SEC = float(os.getenv("FAST_REPLY_TIMEOUT_SEC", "3.0"))
+ANALYZE_HISTORY_LIMIT = int(os.getenv("ANALYZE_HISTORY_LIMIT", "10"))
+SHORT_TEXT_MAX_LEN = int(os.getenv("SHORT_TEXT_MAX_LEN", "2"))
+
 FOLLOWUP_ENABLED = os.getenv("FOLLOWUP_ENABLED", "0").strip() == "1"
 FOLLOWUP_AFTER_MINUTES = int(os.getenv("FOLLOWUP_AFTER_MINUTES", "60"))
 FOLLOWUP_MIN_LEVEL = int(os.getenv("FOLLOWUP_MIN_LEVEL", "8"))
@@ -77,26 +86,18 @@ FOLLOWUP_JST_FROM = int(os.getenv("FOLLOWUP_JST_FROM", "10"))
 FOLLOWUP_JST_TO = int(os.getenv("FOLLOWUP_JST_TO", "20"))
 FOLLOWUP_USE_OPENAI = os.getenv("FOLLOWUP_USE_OPENAI", "0").strip() == "1"
 
-FAST_REPLY_TIMEOUT_SEC = float(os.getenv("FAST_REPLY_TIMEOUT_SEC", "3.0"))
-ANALYZE_HISTORY_LIMIT = int(os.getenv("ANALYZE_HISTORY_LIMIT", "10"))
-
-# 短文扱い（これ以下は情報不足として低温度に固定）
-SHORT_TEXT_MAX_LEN = int(os.getenv("SHORT_TEXT_MAX_LEN", "2"))
-
-# In-memory short history (MVP)
 CHAT_HISTORY: Dict[str, deque] = defaultdict(lambda: deque(maxlen=40))
-TEMP_HISTORY: Dict[str, deque] = defaultdict(lambda: deque(maxlen=5))  # 安定化を少し強める
+TEMP_HISTORY: Dict[str, deque] = defaultdict(lambda: deque(maxlen=5))
 
 JST = timezone(timedelta(hours=9))
 
-app = FastAPI(title="linebot_mvp", version="0.4.3")
+app = FastAPI(title="linebot_mvp", version="0.5.0")
 
 
 # ============================================================
-# HARD RULE patterns (temp scoring accuracy boost)
+# HARD RULE patterns
 # ============================================================
 
-# キャンセル/拒否ワードは温度を強制的に下げる（誤爆防止）
 CANCEL_PATTERNS = [
     r"やっぱ(り)?(なし|やめ|辞め|やめます)",
     r"(今回は|今は).*(いい|結構|不要)",
@@ -106,7 +107,13 @@ CANCEL_PATTERNS = [
     r"キャンセル|取り消し|中止",
     r"また今度|またの機会",
     r"検討(やめます|しません)|やめときます",
-    r"終わり|終了|もういい",
+]
+
+# opt-out（今後連絡しない）判定：より強い
+OPTOUT_PATTERNS = [
+    r"連絡(不要|いらない)|もう連絡(しないで|いりません)",
+    r"配信停止|停止して|ブロックする",
+    r"\bstop\b|\bunsubscribe\b",
 ]
 
 
@@ -216,6 +223,24 @@ def _connect_db_with_fallback():
         return connect_db(verify_ssl=False)
 
 
+def db_execute(sql: str, args: Tuple[Any, ...] = ()) -> None:
+    conn = _connect_db_with_fallback()
+    cur = conn.cursor()
+    cur.execute(sql, args)
+    cur.close()
+    conn.close()
+
+
+def db_fetchall(sql: str, args: Tuple[Any, ...] = ()) -> List[Tuple[Any, ...]]:
+    conn = _connect_db_with_fallback()
+    cur = conn.cursor()
+    cur.execute(sql, args)
+    rows = cur.fetchall()
+    cur.close()
+    conn.close()
+    return rows
+
+
 def ensure_tables_and_columns() -> None:
     if not DATABASE_URL:
         return
@@ -223,6 +248,7 @@ def ensure_tables_and_columns() -> None:
     conn = _connect_db_with_fallback()
     cur = conn.cursor()
 
+    # customers
     cur.execute(
         """
         CREATE TABLE IF NOT EXISTS customers (
@@ -240,7 +266,11 @@ def ensure_tables_and_columns() -> None:
     cur.execute("""ALTER TABLE customers ADD COLUMN IF NOT EXISTS temp_level_stable INT;""")
     cur.execute("""ALTER TABLE customers ADD COLUMN IF NOT EXISTS confidence REAL;""")
     cur.execute("""ALTER TABLE customers ADD COLUMN IF NOT EXISTS next_goal TEXT;""")
+    # ★opt-out
+    cur.execute("""ALTER TABLE customers ADD COLUMN IF NOT EXISTS opt_out BOOLEAN;""")
+    cur.execute("""ALTER TABLE customers ADD COLUMN IF NOT EXISTS opt_out_at TIMESTAMPTZ;""")
 
+    # messages
     cur.execute(
         """
         CREATE TABLE IF NOT EXISTS messages (
@@ -258,6 +288,7 @@ def ensure_tables_and_columns() -> None:
     cur.execute("""ALTER TABLE messages ADD COLUMN IF NOT EXISTS confidence REAL;""")
     cur.execute("""ALTER TABLE messages ADD COLUMN IF NOT EXISTS next_goal TEXT;""")
 
+    # job locks
     cur.execute(
         """
         CREATE TABLE IF NOT EXISTS job_locks (
@@ -267,6 +298,7 @@ def ensure_tables_and_columns() -> None:
         """
     )
 
+    # followup logs
     cur.execute(
         """
         CREATE TABLE IF NOT EXISTS followup_logs (
@@ -283,31 +315,13 @@ def ensure_tables_and_columns() -> None:
         """
     )
 
+    # Indexes
     cur.execute("""CREATE INDEX IF NOT EXISTS idx_customers_shop_updated ON customers(shop_id, updated_at DESC);""")
-    cur.execute("""CREATE INDEX IF NOT EXISTS idx_messages_shop_created ON messages(shop_id, created_at DESC);""")
     cur.execute("""CREATE INDEX IF NOT EXISTS idx_messages_conv_created ON messages(conv_key, created_at DESC);""")
     cur.execute("""CREATE INDEX IF NOT EXISTS idx_followup_shop_conv_created ON followup_logs(shop_id, conv_key, created_at DESC);""")
 
     cur.close()
     conn.close()
-
-
-def db_execute(sql: str, args: Tuple[Any, ...] = ()) -> None:
-    conn = _connect_db_with_fallback()
-    cur = conn.cursor()
-    cur.execute(sql, args)
-    cur.close()
-    conn.close()
-
-
-def db_fetchall(sql: str, args: Tuple[Any, ...] = ()) -> List[Tuple[Any, ...]]:
-    conn = _connect_db_with_fallback()
-    cur = conn.cursor()
-    cur.execute(sql, args)
-    rows = cur.fetchall()
-    cur.close()
-    conn.close()
-    return rows
 
 
 @app.on_event("startup")
@@ -333,17 +347,11 @@ def verify_signature(body: bytes, signature: str) -> bool:
 # ============================================================
 
 async def reply_message(reply_token: str, text: str) -> None:
-    if not LINE_CHANNEL_ACCESS_TOKEN:
-        print("[LINE] Missing LINE_CHANNEL_ACCESS_TOKEN")
-        return
-    if not reply_token:
+    if not LINE_CHANNEL_ACCESS_TOKEN or not reply_token:
         return
 
     url = "https://api.line.me/v2/bot/message/reply"
-    headers = {
-        "Authorization": f"Bearer {LINE_CHANNEL_ACCESS_TOKEN}",
-        "Content-Type": "application/json",
-    }
+    headers = {"Authorization": f"Bearer {LINE_CHANNEL_ACCESS_TOKEN}", "Content-Type": "application/json"}
     payload = {"replyToken": reply_token, "messages": [{"type": "text", "text": (text or "")[:4900]}]}
 
     try:
@@ -357,17 +365,12 @@ async def reply_message(reply_token: str, text: str) -> None:
 
 async def push_message(user_id: str, text: str) -> None:
     if not LINE_CHANNEL_ACCESS_TOKEN:
-        print("[LINE] Missing LINE_CHANNEL_ACCESS_TOKEN")
         return
     if not user_id or user_id == "unknown":
-        print("[LINE] push skipped: invalid user_id")
         return
 
     url = "https://api.line.me/v2/bot/message/push"
-    headers = {
-        "Authorization": f"Bearer {LINE_CHANNEL_ACCESS_TOKEN}",
-        "Content-Type": "application/json",
-    }
+    headers = {"Authorization": f"Bearer {LINE_CHANNEL_ACCESS_TOKEN}", "Content-Type": "application/json"}
     payload = {"to": user_id, "messages": [{"type": "text", "text": (text or "")[:4900]}]}
 
     try:
@@ -444,6 +447,20 @@ SYSTEM_PROMPT_FOLLOWUP = """
 """
 
 
+async def openai_chat(messages: List[Dict[str, str]], temperature: float = 0.2, timeout_sec: float = 25.0) -> str:
+    if not OPENAI_API_KEY:
+        raise RuntimeError("OPENAI_API_KEY is missing")
+
+    headers = {"Authorization": f"Bearer {OPENAI_API_KEY}", "Content-Type": "application/json"}
+    payload = {"model": "gpt-4o-mini", "messages": messages, "temperature": temperature}
+
+    async with httpx.AsyncClient(timeout=timeout_sec, verify=certifi.where()) as client:
+        r = await client.post(OPENAI_API_URL, headers=headers, json=payload)
+        r.raise_for_status()
+        data = r.json()
+        return data["choices"][0]["message"]["content"]
+
+
 def coerce_level(v: Any) -> int:
     try:
         iv = int(float(str(v).strip()))
@@ -473,20 +490,6 @@ def coerce_confidence(v: Any) -> float:
         return max(0.0, min(1.0, fv))
     except Exception:
         return 0.6
-
-
-async def openai_chat(messages: List[Dict[str, str]], temperature: float = 0.2, timeout_sec: float = 25.0) -> str:
-    if not OPENAI_API_KEY:
-        raise RuntimeError("OPENAI_API_KEY is missing")
-
-    headers = {"Authorization": f"Bearer {OPENAI_API_KEY}", "Content-Type": "application/json"}
-    payload = {"model": "gpt-4o-mini", "messages": messages, "temperature": temperature}
-
-    async with httpx.AsyncClient(timeout=timeout_sec, verify=certifi.where()) as client:
-        r = await client.post(OPENAI_API_URL, headers=headers, json=payload)
-        r.raise_for_status()
-        data = r.json()
-        return data["choices"][0]["message"]["content"]
 
 
 def extract_slots(text: str) -> Dict[str, str]:
@@ -531,84 +534,7 @@ def get_recent_conversation(shop_id: str, conv_key: str, limit: int) -> List[Dic
         (shop_id, conv_key, max(1, min(30, int(limit)))),
     )
     rows = list(reversed(rows))
-    conv: List[Dict[str, str]] = []
-    for role, content in rows:
-        conv.append({"role": role, "content": (content or "")[:1200]})
-    return conv
-
-
-async def analyze_only(shop_id: str, conv_key: str, user_text: str) -> Tuple[int, float, str, List[str]]:
-    """
-    温度判定を会話履歴込みで行う（精度改善 + HARD RULE）
-    """
-    t = (user_text or "").strip()
-
-    # --- HARD RULE 1: cancel/reject -> force low temp ---
-    for pat in CANCEL_PATTERNS:
-        if re.search(pat, t):
-            # ここが今回「入れて」って言われた修正
-            return 2, 0.90, "関係終了確認", ["キャンセル/拒否の明確表現"]
-
-    # --- HARD RULE 2: too short -> cap low ---
-    if len(t) <= SHORT_TEXT_MAX_LEN:
-        return 3, 0.75, "要件確認", ["短文で情報不足"]
-
-    slots = extract_slots(user_text)
-
-    history_msgs = get_recent_conversation(shop_id, conv_key, ANALYZE_HISTORY_LIMIT)
-    if not history_msgs or history_msgs[-1].get("content") != user_text:
-        history_msgs.append({"role": "user", "content": user_text})
-
-    analysis_messages: List[Dict[str, str]] = [{"role": "system", "content": SYSTEM_PROMPT_ANALYZE}]
-    if slots:
-        analysis_messages.append({"role": "user", "content": f"抽出スロット(参考): {json.dumps(slots, ensure_ascii=False)}"})
-    analysis_messages.extend(history_msgs[-max(2, ANALYZE_HISTORY_LIMIT):])
-
-    raw_level = 5
-    conf = 0.5
-    next_goal = "情報収集を続ける"
-    reasons: List[str] = []
-
-    try:
-        raw_json_text = await openai_chat(analysis_messages, temperature=0.0, timeout_sec=18.0)
-        raw = raw_json_text.strip()
-        if raw.startswith("```"):
-            parts = raw.split("```")
-            raw = parts[1] if len(parts) > 1 else raw
-        try:
-            j = json.loads(raw)
-        except Exception:
-            start = raw.find("{")
-            end = raw.rfind("}")
-            j = json.loads(raw[start:end + 1])
-
-        raw_level = coerce_level(j.get("temp_level_raw", 5))
-        conf = coerce_confidence(j.get("confidence", 0.6))
-        next_goal = str(j.get("next_goal", "情報収集を続ける")).strip()[:80]
-        rs = j.get("reasons", [])
-        if isinstance(rs, list):
-            reasons = [str(x).strip()[:60] for x in rs if str(x).strip()][:3]
-    except Exception as e:
-        print("[OPENAI] analyze_only failed:", repr(e))
-
-    return raw_level, conf, next_goal, reasons
-
-
-async def generate_reply_only(user_id: str, user_text: str) -> str:
-    history = CHAT_HISTORY[user_id]
-    context_msgs = [{"role": "system", "content": SYSTEM_PROMPT_ASSISTANT}]
-    for role, content in list(history)[-10:]:
-        context_msgs.append({"role": role, "content": content})
-    context_msgs.append({"role": "user", "content": user_text})
-
-    reply_text = await openai_chat(context_msgs, temperature=0.35, timeout_sec=FAST_REPLY_TIMEOUT_SEC)
-    reply_text = (reply_text or "").strip()
-    if not reply_text:
-        reply_text = "ありがとうございます。条件をもう少し教えてください（エリア/家賃/間取り/入居時期など）。"
-
-    history.append(("user", user_text))
-    history.append(("assistant", reply_text))
-    return reply_text
+    return [{"role": r[0], "content": (r[1] or "")[:1200]} for r in rows]
 
 
 def stable_from_history(conv_key: str, raw_level: int) -> int:
@@ -684,6 +610,20 @@ def upsert_customer(
     )
 
 
+def mark_opt_out(shop_id: str, conv_key: str, user_id: str) -> None:
+    if not DATABASE_URL:
+        return
+    db_execute(
+        """
+        INSERT INTO customers (shop_id, conv_key, user_id, updated_at, opt_out, opt_out_at)
+        VALUES (%s, %s, %s, now(), TRUE, now())
+        ON CONFLICT (shop_id, conv_key)
+        DO UPDATE SET opt_out = TRUE, opt_out_at = now(), user_id = EXCLUDED.user_id, updated_at = now()
+        """,
+        (shop_id, conv_key, user_id),
+    )
+
+
 def save_followup_log(
     shop_id: str,
     conv_key: str,
@@ -704,8 +644,99 @@ def save_followup_log(
     )
 
 
+def is_opted_out(shop_id: str, conv_key: str) -> bool:
+    if not DATABASE_URL:
+        return False
+    rows = db_fetchall(
+        "SELECT COALESCE(opt_out, FALSE) FROM customers WHERE shop_id=%s AND conv_key=%s",
+        (shop_id, conv_key),
+    )
+    if not rows:
+        return False
+    return bool(rows[0][0])
+
+
 # ============================================================
-# Followup Logic
+# Scoring + Reply
+# ============================================================
+
+async def analyze_only(shop_id: str, conv_key: str, user_text: str) -> Tuple[int, float, str, List[str]]:
+    t = (user_text or "").strip()
+
+    # opt-out 語が来たら即 opt_out（温度も低く）
+    for pat in OPTOUT_PATTERNS:
+        if re.search(pat, t, flags=re.IGNORECASE):
+            return 1, 0.95, "関係終了確認", ["配信停止/連絡不要の意思"]
+
+    # キャンセル/拒否は強制低温度
+    for pat in CANCEL_PATTERNS:
+        if re.search(pat, t):
+            return 2, 0.90, "関係終了確認", ["キャンセル/拒否の明確表現"]
+
+    # 短文は上がらない
+    if len(t) <= SHORT_TEXT_MAX_LEN:
+        return 3, 0.75, "要件確認", ["短文で情報不足"]
+
+    slots = extract_slots(user_text)
+
+    history_msgs = get_recent_conversation(shop_id, conv_key, ANALYZE_HISTORY_LIMIT)
+    if not history_msgs or history_msgs[-1].get("content") != user_text:
+        history_msgs.append({"role": "user", "content": user_text})
+
+    messages: List[Dict[str, str]] = [{"role": "system", "content": SYSTEM_PROMPT_ANALYZE}]
+    if slots:
+        messages.append({"role": "user", "content": f"抽出スロット(参考): {json.dumps(slots, ensure_ascii=False)}"})
+    messages.extend(history_msgs[-max(2, ANALYZE_HISTORY_LIMIT):])
+
+    raw_level = 5
+    conf = 0.5
+    next_goal = "情報収集を続ける"
+    reasons: List[str] = []
+
+    try:
+        raw_json_text = await openai_chat(messages, temperature=0.0, timeout_sec=18.0)
+        raw = raw_json_text.strip()
+        if raw.startswith("```"):
+            parts = raw.split("```")
+            raw = parts[1] if len(parts) > 1 else raw
+        try:
+            j = json.loads(raw)
+        except Exception:
+            start = raw.find("{")
+            end = raw.rfind("}")
+            j = json.loads(raw[start:end + 1])
+
+        raw_level = coerce_level(j.get("temp_level_raw", 5))
+        conf = coerce_confidence(j.get("confidence", 0.6))
+        next_goal = str(j.get("next_goal", "情報収集を続ける")).strip()[:80]
+        rs = j.get("reasons", [])
+        if isinstance(rs, list):
+            reasons = [str(x).strip()[:60] for x in rs if str(x).strip()][:3]
+    except Exception as e:
+        print("[OPENAI] analyze_only failed:", repr(e))
+
+    return raw_level, conf, next_goal, reasons
+
+
+async def generate_reply_only(user_id: str, user_text: str) -> str:
+    history = CHAT_HISTORY[user_id]
+    context_msgs = [{"role": "system", "content": SYSTEM_PROMPT_ASSISTANT}]
+    for role, content in list(history)[-10:]:
+        context_msgs.append({"role": role, "content": content})
+    context_msgs.append({"role": "user", "content": user_text})
+
+    reply_text = await openai_chat(context_msgs, temperature=0.35, timeout_sec=FAST_REPLY_TIMEOUT_SEC)
+    reply_text = (reply_text or "").strip()
+    if not reply_text:
+        reply_text = "ありがとうございます。条件をもう少し教えてください（エリア/予算/間取り/入居時期など）。"
+
+    history.append(("user", user_text))
+    history.append(("assistant", reply_text))
+    return reply_text
+
+
+# ============================================================
+# Followup helpers
 # ============================================================
 
 def utcnow() -> datetime:
@@ -721,7 +752,6 @@ def is_within_jst_window(dt: Optional[datetime] = None) -> bool:
     h = d.hour
     start = max(0, min(23, int(FOLLOWUP_JST_FROM)))
     end = max(0, min(23, int(FOLLOWUP_JST_TO)))
-
     if start < end:
         return start <= h < end
     if start > end:
@@ -816,6 +846,7 @@ def get_followup_candidates() -> List[Dict[str, Any]]:
           COALESCE(c.next_goal, '') as goal,
           c.updated_at,
           COALESCE(c.last_user_text, '') as last_text,
+          COALESCE(c.opt_out, FALSE) as opt_out,
           (
             SELECT MAX(fl.created_at)
             FROM followup_logs fl
@@ -836,9 +867,14 @@ def get_followup_candidates() -> List[Dict[str, Any]]:
 
     candidates: List[Dict[str, Any]] = []
     for r in rows:
-        last_followup_at = r[8]
+        opt_out = bool(r[8])
+        if opt_out:
+            continue
+
+        last_followup_at = r[9]
         if last_followup_at and last_followup_at > since:
             continue
+
         candidates.append(
             {
                 "shop_id": r[0],
@@ -852,7 +888,89 @@ def get_followup_candidates() -> List[Dict[str, Any]]:
                 "last_followup_at": last_followup_at.isoformat() if last_followup_at else None,
             }
         )
+
     return candidates
+
+
+# ============================================================
+# Background tasks
+# ============================================================
+
+async def process_analysis_only_store(shop_id: str, user_id: str, conv_key: str, user_text: str, reply_text: str) -> None:
+    try:
+        raw_level, conf, next_goal, reasons = await analyze_only(shop_id, conv_key, user_text)
+        stable_level = stable_from_history(conv_key, raw_level)
+
+        # opt-out 判定が返ったら、DBに反映
+        if raw_level == 1 and any("配信停止" in r or "連絡不要" in r for r in reasons):
+            try:
+                mark_opt_out(shop_id, conv_key, user_id)
+            except Exception as e:
+                print("[DB] mark_opt_out failed:", repr(e))
+
+        try:
+            upsert_customer(shop_id, conv_key, user_id, user_text, raw_level, stable_level, conf, next_goal)
+        except Exception as e:
+            print("[DB] upsert_customer failed:", repr(e))
+
+        try:
+            save_message(shop_id, conv_key, "assistant", reply_text,
+                         temp_level_raw=raw_level, temp_level_stable=stable_level, confidence=conf, next_goal=next_goal)
+        except Exception as e:
+            print("[DB] save assistant failed:", repr(e))
+
+        if reasons:
+            print(f"[TEMP] {conv_key} raw={raw_level} stable={stable_level} conf={conf:.2f} goal={next_goal} reasons={reasons}")
+    except Exception as e:
+        print("[BG] process_analysis_only_store exception:", repr(e))
+
+
+async def process_ai_and_push_full(shop_id: str, user_id: str, conv_key: str, user_text: str) -> None:
+    try:
+        raw_level, conf, next_goal, reasons = await analyze_only(shop_id, conv_key, user_text)
+        stable_level = stable_from_history(conv_key, raw_level)
+
+        # opt-out
+        if raw_level == 1 and any("配信停止" in r or "連絡不要" in r for r in reasons):
+            try:
+                mark_opt_out(shop_id, conv_key, user_id)
+            except Exception as e:
+                print("[DB] mark_opt_out failed:", repr(e))
+
+        # 通常返信（bg）
+        try:
+            reply_text = await openai_chat(
+                [{"role": "system", "content": SYSTEM_PROMPT_ASSISTANT}, {"role": "user", "content": user_text}],
+                temperature=0.35,
+                timeout_sec=20.0,
+            )
+            reply_text = (reply_text or "").strip() or "ありがとうございます。条件をもう少し教えてください（エリア/予算/間取り/入居時期など）。"
+        except Exception as e:
+            print("[OPENAI] reply(bg) failed:", repr(e))
+            reply_text = "ありがとうございます。条件をもう少し教えてください（エリア/予算/間取り/入居時期など）。"
+
+        try:
+            upsert_customer(shop_id, conv_key, user_id, user_text, raw_level, stable_level, conf, next_goal)
+        except Exception as e:
+            print("[DB] upsert_customer failed:", repr(e))
+
+        try:
+            save_message(shop_id, conv_key, "assistant", reply_text,
+                         temp_level_raw=raw_level, temp_level_stable=stable_level, confidence=conf, next_goal=next_goal)
+        except Exception as e:
+            print("[DB] save assistant failed:", repr(e))
+
+        if reasons:
+            print(f"[TEMP] {conv_key} raw={raw_level} stable={stable_level} conf={conf:.2f} goal={next_goal} reasons={reasons}")
+
+        # opt-out 直後は push しない（希望なら送ってもいいが安全側で止める）
+        if is_opted_out(shop_id, conv_key):
+            return
+
+        await push_message(user_id, reply_text)
+
+    except Exception as e:
+        print("[BG] process_ai_and_push_full exception:", repr(e))
 
 
 # ============================================================
@@ -868,83 +986,6 @@ async def root():
 async def healthz():
     return {"ok": True, "ts": int(time.time())}
 
-
-# ------------------------------------------------------------
-# Background tasks
-# ------------------------------------------------------------
-
-async def process_ai_and_push_full(shop_id: str, user_id: str, conv_key: str, user_text: str) -> None:
-    """
-    Used when fast-reply failed: do full analyze + push.
-    """
-    try:
-        raw_level, conf, next_goal, reasons = await analyze_only(shop_id, conv_key, user_text)
-        stable_level = stable_from_history(conv_key, raw_level)
-
-        try:
-            reply_text = await openai_chat(
-                [{"role": "system", "content": SYSTEM_PROMPT_ASSISTANT}, {"role": "user", "content": user_text}],
-                temperature=0.35,
-                timeout_sec=20.0,
-            )
-            reply_text = (reply_text or "").strip() or "ありがとうございます。条件をもう少し教えてください（エリア/家賃/間取り/入居時期など）。"
-        except Exception as e:
-            print("[OPENAI] reply (bg) failed:", repr(e))
-            reply_text = "ありがとうございます。条件をもう少し教えてください（エリア/家賃/間取り/入居時期など）。"
-
-        try:
-            upsert_customer(shop_id, conv_key, user_id, user_text, raw_level, stable_level, conf, next_goal)
-        except Exception as db_e:
-            print("[DB] upsert_customer failed:", repr(db_e))
-
-        try:
-            save_message(
-                shop_id, conv_key, "assistant", reply_text,
-                temp_level_raw=raw_level, temp_level_stable=stable_level, confidence=conf, next_goal=next_goal
-            )
-        except Exception as db_e2:
-            print("[DB] save assistant message failed:", repr(db_e2))
-
-        if reasons:
-            print(f"[TEMP] {conv_key} raw={raw_level} stable={stable_level} conf={conf:.2f} goal={next_goal} reasons={reasons}")
-
-        await push_message(user_id, reply_text)
-
-    except Exception as e:
-        print("[BG] process_ai_and_push_full exception:", repr(e))
-
-
-async def process_analysis_only_store(shop_id: str, user_id: str, conv_key: str, user_text: str, reply_text: str) -> None:
-    """
-    Used when fast-reply succeeded: store scoring + same reply text, NO push.
-    """
-    try:
-        raw_level, conf, next_goal, reasons = await analyze_only(shop_id, conv_key, user_text)
-        stable_level = stable_from_history(conv_key, raw_level)
-
-        try:
-            upsert_customer(shop_id, conv_key, user_id, user_text, raw_level, stable_level, conf, next_goal)
-        except Exception as db_e:
-            print("[DB] upsert_customer failed:", repr(db_e))
-
-        try:
-            save_message(
-                shop_id, conv_key, "assistant", reply_text,
-                temp_level_raw=raw_level, temp_level_stable=stable_level, confidence=conf, next_goal=next_goal
-            )
-        except Exception as db_e2:
-            print("[DB] save assistant message failed:", repr(db_e2))
-
-        if reasons:
-            print(f"[TEMP] {conv_key} raw={raw_level} stable={stable_level} conf={conf:.2f} goal={next_goal} reasons={reasons}")
-
-    except Exception as e:
-        print("[BG] process_analysis_only_store exception:", repr(e))
-
-
-# ------------------------------------------------------------
-# LINE webhook
-# ------------------------------------------------------------
 
 @app.post("/line/webhook")
 async def line_webhook(
@@ -978,11 +1019,23 @@ async def line_webhook(
 
         conv_key = f"user:{user_id}"
 
+        # user message save
         try:
             save_message(SHOP_ID, conv_key, "user", user_text)
         except Exception as e:
             print("[DB] save user message failed:", repr(e))
 
+        # 即opt-out（ユーザー体験優先）
+        for pat in OPTOUT_PATTERNS:
+            if re.search(pat, user_text, flags=re.IGNORECASE):
+                try:
+                    mark_opt_out(SHOP_ID, conv_key, user_id)
+                except Exception as e:
+                    print("[DB] mark_opt_out failed:", repr(e))
+                await reply_message(reply_token, "承知しました。今後こちらからのご連絡は停止します。")
+                return {"ok": True}
+
+        # Try FAST AI reply (no "確認中"). If it fails -> fallback.
         fast_reply_text: Optional[str] = None
         try:
             fast_reply_text = await asyncio.wait_for(
@@ -1003,17 +1056,17 @@ async def line_webhook(
     return {"ok": True}
 
 
-# ------------------------------------------------------------
-# API for dashboard (protected by DASHBOARD_KEY)
-# ------------------------------------------------------------
+# ============================================================
+# API for dashboard
+# ============================================================
 
 @app.get("/api/hot")
 async def api_hot(
     _: None = Depends(require_dashboard_key),
     shop_id: str = Query(default=SHOP_ID),
-    min_level: int = Query(default=8, ge=1, le=10),
+    min_level: int = Query(default=1, ge=1, le=10),
     limit: int = Query(default=50, ge=1, le=200),
-    view: str = Query(default="customers", pattern="^(customers|events)$"),
+    view: str = Query(default="events", pattern="^(customers|events|followups)$"),
 ):
     if not DATABASE_URL:
         return JSONResponse([], status_code=200)
@@ -1021,7 +1074,8 @@ async def api_hot(
     if view == "customers":
         rows = db_fetchall(
             """
-            SELECT conv_key, user_id, last_user_text, temp_level_stable, confidence, next_goal, updated_at
+            SELECT conv_key, user_id, last_user_text, temp_level_stable, confidence, next_goal, updated_at,
+                   COALESCE(opt_out, FALSE) as opt_out
             FROM customers
             WHERE shop_id = %s AND COALESCE(temp_level_stable, 0) >= %s
             ORDER BY updated_at DESC
@@ -1040,10 +1094,37 @@ async def api_hot(
                 "confidence": float(r[4]) if r[4] is not None else None,
                 "next_goal": r[5],
                 "ts": r[6].isoformat() if r[6] else None,
+                "opt_out": bool(r[7]),
             }
             for r in rows
         ])
 
+    if view == "followups":
+        rows = db_fetchall(
+            """
+            SELECT user_id, conv_key, mode, status, message, error, created_at
+            FROM followup_logs
+            WHERE shop_id = %s
+            ORDER BY created_at DESC
+            LIMIT %s
+            """,
+            (shop_id, limit),
+        )
+        return JSONResponse([
+            {
+                "view": "followups",
+                "user_id": r[0],
+                "conv_key": r[1],
+                "mode": r[2],
+                "status": r[3],
+                "message": r[4],
+                "error": r[5],
+                "ts": r[6].isoformat() if r[6] else None,
+            }
+            for r in rows
+        ])
+
+    # events
     rows = db_fetchall(
         """
         SELECT
@@ -1063,7 +1144,6 @@ async def api_hot(
         """,
         (shop_id, limit),
     )
-
     return JSONResponse([
         {
             "view": "events",
@@ -1079,9 +1159,9 @@ async def api_hot(
     ])
 
 
-# ------------------------------------------------------------
-# Dashboard (protected by DASHBOARD_KEY)
-# ------------------------------------------------------------
+# ============================================================
+# Dashboard
+# ============================================================
 
 LEVEL_COLORS = {
     1: "#9aa0a6",
@@ -1101,8 +1181,8 @@ LEVEL_COLORS = {
 async def dashboard(
     _: None = Depends(require_dashboard_key),
     shop_id: str = Query(default=SHOP_ID),
-    view: str = Query(default="events", pattern="^(customers|events)$"),
-    min_level: int = Query(default=8, ge=1, le=10),
+    view: str = Query(default="events", pattern="^(customers|events|followups)$"),
+    min_level: int = Query(default=1, ge=1, le=10),
     limit: int = Query(default=50, ge=1, le=200),
     refresh: int = Query(default=DASHBOARD_REFRESH_SEC_DEFAULT, ge=0, le=300),
     key: Optional[str] = Query(default=None),
@@ -1125,7 +1205,7 @@ async def dashboard(
     padding: 16px;
     color: #111;
   }}
-  .wrap {{ max-width: 1180px; margin: 0 auto; }}
+  .wrap {{ max-width: 1240px; margin: 0 auto; }}
   .card {{
     background: #fff;
     border-radius: 14px;
@@ -1134,21 +1214,18 @@ async def dashboard(
     margin-bottom: 14px;
   }}
   .title {{
-    display: flex;
-    justify-content: space-between;
-    align-items: center;
-    gap: 12px;
-    flex-wrap: wrap;
+    display: flex; justify-content: space-between; align-items: center;
+    gap: 12px; flex-wrap: wrap;
   }}
   .title h1 {{ font-size: 18px; margin: 0; }}
   .meta {{ font-size: 12px; color: #555; }}
   .filters {{
     display: grid;
-    grid-template-columns: 1fr 170px 120px 120px 140px;
+    grid-template-columns: 1fr 220px 120px 120px 140px;
     gap: 10px;
     align-items: end;
   }}
-  @media (max-width: 860px) {{ .filters {{ grid-template-columns: 1fr 1fr; }} }}
+  @media (max-width: 920px) {{ .filters {{ grid-template-columns: 1fr 1fr; }} }}
   label {{ font-size: 12px; color: #444; display: block; margin-bottom: 4px; }}
   input, select {{
     width: 100%;
@@ -1171,41 +1248,28 @@ async def dashboard(
   th, td {{ padding: 10px 8px; border-bottom: 1px solid #eee; vertical-align: top; }}
   th {{ text-align: left; font-size: 12px; color: #666; font-weight: 600; }}
   .pill {{
-    display: inline-flex;
-    align-items: center;
-    gap: 6px;
-    padding: 4px 10px;
-    border-radius: 999px;
-    font-size: 12px;
-    color: #fff;
-    font-weight: 700;
-    white-space: nowrap;
+    display: inline-flex; align-items: center; gap: 6px;
+    padding: 4px 10px; border-radius: 999px;
+    font-size: 12px; color: #fff; font-weight: 700; white-space: nowrap;
   }}
   .badge {{
-    display: inline-flex;
-    align-items: center;
-    padding: 3px 10px;
-    border-radius: 999px;
-    font-size: 12px;
-    font-weight: 700;
-    white-space: nowrap;
-    border: 1px solid #e6e6e6;
-    background: #f7f7f7;
-    color: #333;
+    display: inline-flex; align-items: center;
+    padding: 3px 10px; border-radius: 999px;
+    font-size: 12px; font-weight: 700; white-space: nowrap;
+    border: 1px solid #e6e6e6; background: #f7f7f7; color: #333;
   }}
-  .badge.assistant {{
-    background: #111;
-    color: #fff;
-    border-color: #111;
-  }}
+  .badge.assistant {{ background: #111; color: #fff; border-color: #111; }}
+  .badge.ok {{ background:#0b8043; color:#fff; border-color:#0b8043; }}
+  .badge.ng {{ background:#b00020; color:#fff; border-color:#b00020; }}
   .mono {{ font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas; font-size: 12px; }}
   .muted {{ color: #777; font-size: 12px; }}
-  .rowmsg {{ max-width: 620px; word-break: break-word; white-space: pre-wrap; }}
+  .rowmsg {{ max-width: 720px; word-break: break-word; white-space: pre-wrap; }}
   .link {{ color: #0b57d0; text-decoration: none; }}
   .link:hover {{ text-decoration: underline; }}
   .search {{ display:flex; gap:10px; align-items: center; margin-top: 10px; }}
   .search input {{ flex: 1; }}
   .hint {{ font-size: 12px; color: #666; margin-top: 6px; }}
+  .optout {{ color:#b00020; font-weight:700; }}
 </style>
 </head>
 <body>
@@ -1234,8 +1298,9 @@ async def dashboard(
       <div>
         <label>view</label>
         <select id="viewSelect">
-          <option value="customers" {"selected" if view=="customers" else ""}>customers（最新状態）</option>
           <option value="events" {"selected" if view=="events" else ""}>events（履歴：user/assistant）</option>
+          <option value="customers" {"selected" if view=="customers" else ""}>customers（最新状態）</option>
+          <option value="followups" {"selected" if view=="followups" else ""}>followups（追客ログ）</option>
         </select>
       </div>
       <div>
@@ -1254,8 +1319,8 @@ async def dashboard(
 
     <div class="search">
       <div style="flex:1">
-        <label>検索（自動） user_id / next_goal / message</label>
-        <input id="searchBox" placeholder="例: 渋谷 / 3LDK / 内見 / Uxxxxxxxx" />
+        <label>検索（自動） user_id / next_goal / message / status</label>
+        <input id="searchBox" placeholder="例: 渋谷 / 3LDK / 内見 / Uxxxxxxxx / failed" />
         <div class="hint">入力すると即フィルタ（サーバー再読込なし）</div>
       </div>
       <div>
@@ -1267,19 +1332,9 @@ async def dashboard(
 
   <div class="card">
     <table>
-      <thead>
-        <tr>
-          <th>更新</th>
-          <th>種別</th>
-          <th>温度</th>
-          <th>確度</th>
-          <th>次のゴール</th>
-          <th class="mono">user_id</th>
-          <th>メッセージ</th>
-        </tr>
-      </thead>
+      <thead id="thead"></thead>
       <tbody id="tbody">
-        <tr><td colspan="7" class="muted">Loading...</td></tr>
+        <tr><td class="muted">Loading...</td></tr>
       </tbody>
     </table>
   </div>
@@ -1291,12 +1346,7 @@ async def dashboard(
 
   function fmtTime(iso) {{
     if (!iso) return "-";
-    try {{
-      const d = new Date(iso);
-      return d.toLocaleString();
-    }} catch (e) {{
-      return iso;
-    }}
+    try {{ return new Date(iso).toLocaleString(); }} catch (e) {{ return iso; }}
   }}
 
   function pill(level) {{
@@ -1311,20 +1361,70 @@ async def dashboard(
     return `<span class="badge">${{escapeHtml(role || "-")}}</span>`;
   }}
 
+  function badgeStatus(s) {{
+    const v = (s || "").toLowerCase();
+    if (v === "sent") return `<span class="badge ok">sent</span>`;
+    if (v === "failed") return `<span class="badge ng">failed</span>`;
+    return `<span class="badge">${{escapeHtml(s || "-")}}</span>`;
+  }}
+
   function escapeHtml(s) {{
     return (s || "").replace(/[&<>"]/g, c => ({{"&":"&amp;","<":"&lt;",">":"&gt;","\\"":"&quot;"}}[c]));
   }}
 
   let cache = [];
-
   function matchesSearch(row, q) {{
     if (!q) return true;
     q = q.toLowerCase();
-    const fields = [row.user_id, row.next_goal, row.message, row.role].map(x => (x || "").toLowerCase());
+    const fields = [
+      row.user_id, row.next_goal, row.message, row.role, row.status, row.mode, row.error
+    ].map(x => (x || "").toLowerCase());
     return fields.some(f => f.includes(q));
   }}
 
+  function setHeader(view) {{
+    const thead = document.getElementById("thead");
+    if (view === "followups") {{
+      thead.innerHTML = `
+        <tr>
+          <th>更新</th>
+          <th>status</th>
+          <th>mode</th>
+          <th class="mono">user_id</th>
+          <th>本文</th>
+          <th>error</th>
+        </tr>`;
+      return;
+    }}
+    if (view === "customers") {{
+      thead.innerHTML = `
+        <tr>
+          <th>更新</th>
+          <th>温度</th>
+          <th>確度</th>
+          <th>次のゴール</th>
+          <th class="mono">user_id</th>
+          <th>直近メッセージ</th>
+          <th>optout</th>
+        </tr>`;
+      return;
+    }}
+    thead.innerHTML = `
+      <tr>
+        <th>更新</th>
+        <th>種別</th>
+        <th>温度</th>
+        <th>確度</th>
+        <th>次のゴール</th>
+        <th class="mono">user_id</th>
+        <th>メッセージ</th>
+      </tr>`;
+  }}
+
   function render() {{
+    const view = document.getElementById("viewSelect").value;
+    setHeader(view);
+
     const q = document.getElementById("searchBox").value.trim().toLowerCase();
     const rows = cache.filter(r => matchesSearch(r, q));
     document.getElementById("count").textContent = rows.length;
@@ -1335,23 +1435,56 @@ async def dashboard(
       return;
     }}
 
+    if (view === "followups") {{
+      tbody.innerHTML = rows.map(r => {{
+        return `
+          <tr>
+            <td class="mono">${{escapeHtml(fmtTime(r.ts))}}</td>
+            <td>${{badgeStatus(r.status)}}</td>
+            <td class="mono">${{escapeHtml(r.mode || "-")}}</td>
+            <td class="mono">${{escapeHtml(r.user_id || "")}}</td>
+            <td class="rowmsg">${{escapeHtml(r.message || "")}}</td>
+            <td class="rowmsg mono">${{escapeHtml(r.error || "-")}}</td>
+          </tr>`;
+      }}).join("");
+      return;
+    }}
+
+    if (view === "customers") {{
+      tbody.innerHTML = rows.map(r => {{
+        const levelHtml = (r.temp_level_stable == null) ? "-" : pill(r.temp_level_stable);
+        const confHtml  = (r.confidence == null) ? "-" : (Number(r.confidence).toFixed(2));
+        const goalHtml  = (r.next_goal == null || r.next_goal === "") ? "-" : escapeHtml(r.next_goal);
+        const opt = r.opt_out ? `<span class="optout">STOP</span>` : "-";
+        return `
+          <tr>
+            <td class="mono">${{escapeHtml(fmtTime(r.ts))}}</td>
+            <td>${{levelHtml}}</td>
+            <td class="mono">${{confHtml}}</td>
+            <td>${{goalHtml}}</td>
+            <td class="mono">${{escapeHtml(r.user_id || "")}}</td>
+            <td class="rowmsg">${{escapeHtml(r.message || "")}}</td>
+            <td>${{opt}}</td>
+          </tr>`;
+      }}).join("");
+      return;
+    }}
+
+    // events
     tbody.innerHTML = rows.map(r => {{
-      const ts = r.ts;
       const levelHtml = (r.temp_level_stable == null) ? "-" : pill(r.temp_level_stable);
       const confHtml  = (r.confidence == null) ? "-" : (Number(r.confidence).toFixed(2));
       const goalHtml  = (r.next_goal == null || r.next_goal === "") ? "-" : escapeHtml(r.next_goal);
-      const msgHtml   = escapeHtml(r.message || "");
       return `
         <tr>
-          <td class="mono">${{escapeHtml(fmtTime(ts))}}</td>
+          <td class="mono">${{escapeHtml(fmtTime(r.ts))}}</td>
           <td>${{badge(r.role)}}</td>
           <td>${{levelHtml}}</td>
           <td class="mono">${{confHtml}}</td>
           <td>${{goalHtml}}</td>
           <td class="mono">${{escapeHtml(r.user_id || "")}}</td>
-          <td class="rowmsg">${{msgHtml}}</td>
-        </tr>
-      `;
+          <td class="rowmsg">${{escapeHtml(r.message || "")}}</td>
+        </tr>`;
     }}).join("");
   }}
 
@@ -1400,7 +1533,7 @@ async def dashboard(
 
   fetchData().then(setupAutoRefresh).catch(e => {{
     console.error(e);
-    document.getElementById("tbody").innerHTML = `<tr><td colspan="7" class="muted">Error loading</td></tr>`;
+    document.getElementById("tbody").innerHTML = `<tr><td class="muted">Error loading</td></tr>`;
   }});
 </script>
 
@@ -1410,9 +1543,9 @@ async def dashboard(
     return HTMLResponse(html)
 
 
-# ------------------------------------------------------------
-# Followup job (ADMIN_API_KEY)
-# ------------------------------------------------------------
+# ============================================================
+# Jobs
+# ============================================================
 
 @app.post("/jobs/followup")
 async def job_followup(_: None = Depends(require_admin_key)):
@@ -1434,19 +1567,21 @@ async def job_followup(_: None = Depends(require_admin_key)):
     candidates = get_followup_candidates()
 
     if FOLLOWUP_DRYRUN:
-        print("[FOLLOWUP] DRYRUN candidates:", len(candidates))
         return {"ok": True, "enabled": True, "dryrun": True, "candidates": candidates}
 
     sent = 0
     failed = 0
-    details: List[Dict[str, Any]] = []
-
     for c in candidates:
         user_id = c["user_id"]
         conv_key = c["conv_key"]
         level = int(c["temp_level_stable"] or 0)
         goal = c.get("next_goal") or ""
         last_text = c.get("last_user_text") or ""
+
+        # opt-out safety
+        if is_opted_out(SHOP_ID, conv_key):
+            save_followup_log(SHOP_ID, conv_key, user_id, "(skipped opt_out)", "template", "skipped", "opt_out")
+            continue
 
         mode = "template"
         if FOLLOWUP_USE_OPENAI and OPENAI_API_KEY:
@@ -1459,21 +1594,19 @@ async def job_followup(_: None = Depends(require_admin_key)):
             await push_message(user_id, msg)
             save_followup_log(SHOP_ID, conv_key, user_id, msg, mode, "sent", None)
             sent += 1
-            details.append({"conv_key": conv_key, "user_id": user_id, "status": "sent", "mode": mode})
         except Exception as e:
             err = str(e)[:200]
-            print("[FOLLOWUP] send failed:", conv_key, repr(e))
             save_followup_log(SHOP_ID, conv_key, user_id, msg, mode, "failed", err)
             failed += 1
-            details.append({"conv_key": conv_key, "user_id": user_id, "status": "failed", "mode": mode, "error": err})
 
-    print(f"[FOLLOWUP] done sent={sent} failed={failed} candidates={len(candidates)}")
-    return {
-        "ok": True,
-        "enabled": True,
-        "dryrun": False,
-        "candidates": len(candidates),
-        "sent": sent,
-        "failed": failed,
-        "details": details[:50],
-    }
+    return {"ok": True, "enabled": True, "dryrun": False, "candidates": len(candidates), "sent": sent, "failed": failed}
+
+
+@app.post("/jobs/push_test")
+async def job_push_test(
+    _: None = Depends(require_admin_key),
+    user_id: str = Query(..., description="LINE userId"),
+    text: str = Query(..., description="message text"),
+):
+    await push_message(user_id, text)
+    return {"ok": True}
