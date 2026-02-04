@@ -26,6 +26,8 @@
 # - Restore strict rubric prompt for analysis
 # - Include recent conversation (DB messages) in analysis prompt
 # - Extract simple slots (budget/area/move-in/layout) and pass to analysis
+# - HARD RULE: cancel/reject phrases force low temp (prevents Lv8 on "やっぱりなし")
+# - HARD RULE: very short text caps low temp
 
 import os
 import json
@@ -78,12 +80,34 @@ FOLLOWUP_USE_OPENAI = os.getenv("FOLLOWUP_USE_OPENAI", "0").strip() == "1"
 FAST_REPLY_TIMEOUT_SEC = float(os.getenv("FAST_REPLY_TIMEOUT_SEC", "3.0"))
 ANALYZE_HISTORY_LIMIT = int(os.getenv("ANALYZE_HISTORY_LIMIT", "10"))
 
+# 短文扱い（これ以下は情報不足として低温度に固定）
+SHORT_TEXT_MAX_LEN = int(os.getenv("SHORT_TEXT_MAX_LEN", "2"))
+
+# In-memory short history (MVP)
 CHAT_HISTORY: Dict[str, deque] = defaultdict(lambda: deque(maxlen=40))
 TEMP_HISTORY: Dict[str, deque] = defaultdict(lambda: deque(maxlen=5))  # 安定化を少し強める
 
 JST = timezone(timedelta(hours=9))
 
-app = FastAPI(title="linebot_mvp", version="0.4.2")
+app = FastAPI(title="linebot_mvp", version="0.4.3")
+
+
+# ============================================================
+# HARD RULE patterns (temp scoring accuracy boost)
+# ============================================================
+
+# キャンセル/拒否ワードは温度を強制的に下げる（誤爆防止）
+CANCEL_PATTERNS = [
+    r"やっぱ(り)?(なし|やめ|辞め|やめます)",
+    r"(今回は|今は).*(いい|結構|不要)",
+    r"不要です|いりません|連絡(不要|いらない)",
+    r"興味(ない|ありません)",
+    r"他(で|の).*(決(めた|まりました)|決まりました)|決まりました",
+    r"キャンセル|取り消し|中止",
+    r"また今度|またの機会",
+    r"検討(やめます|しません)|やめときます",
+    r"終わり|終了|もういい",
+]
 
 
 # ============================================================
@@ -361,7 +385,6 @@ async def push_message(user_id: str, text: str) -> None:
 
 OPENAI_API_URL = "https://api.openai.com/v1/chat/completions"
 
-# ★精度改善：ルーブリックを強化（過大評価防止を明示）
 SYSTEM_PROMPT_ANALYZE = """
 あなたは不動産仲介SaaSの「顧客温度判定AI」です。
 会話履歴と最新発言から、成約に近い順に 1〜10 で温度を判定します。
@@ -470,17 +493,14 @@ def extract_slots(text: str) -> Dict[str, str]:
     t = text or ""
     slots: Dict[str, str] = {}
 
-    # budget (rough)
     m = re.search(r"(\d{1,3})(?:\.(\d))?\s*(?:万円|万)", t)
     if m:
         slots["budget"] = m.group(0)
 
-    # layout
     m = re.search(r"(\d)\s*(?:LDK|DK|K)|ワンルーム|1R", t, re.IGNORECASE)
     if m:
         slots["layout"] = m.group(0)
 
-    # move-in timing keywords
     for kw in ["今月", "来月", "再来月", "すぐ", "早め", "急ぎ", "春", "夏", "秋", "冬"]:
         if kw in t:
             slots["move_in"] = kw
@@ -489,7 +509,6 @@ def extract_slots(text: str) -> Dict[str, str]:
     if m:
         slots.setdefault("move_in", m.group(0))
 
-    # area (simple)
     for kw in ["渋谷", "新宿", "品川", "池袋", "目黒", "中目黒", "恵比寿", "吉祥寺", "横浜", "川崎", "浦和"]:
         if kw in t:
             slots["area"] = kw
@@ -499,9 +518,6 @@ def extract_slots(text: str) -> Dict[str, str]:
 
 
 def get_recent_conversation(shop_id: str, conv_key: str, limit: int) -> List[Dict[str, str]]:
-    """
-    DBから直近の user/assistant を取り出して分析に使う。
-    """
     if not DATABASE_URL:
         return []
     rows = db_fetchall(
@@ -514,7 +530,6 @@ def get_recent_conversation(shop_id: str, conv_key: str, limit: int) -> List[Dic
         """,
         (shop_id, conv_key, max(1, min(30, int(limit)))),
     )
-    # 最新→古い で取れるので逆順にして時系列に
     rows = list(reversed(rows))
     conv: List[Dict[str, str]] = []
     for role, content in rows:
@@ -524,16 +539,26 @@ def get_recent_conversation(shop_id: str, conv_key: str, limit: int) -> List[Dic
 
 async def analyze_only(shop_id: str, conv_key: str, user_text: str) -> Tuple[int, float, str, List[str]]:
     """
-    温度判定を会話履歴込みで行う（精度改善）
+    温度判定を会話履歴込みで行う（精度改善 + HARD RULE）
     """
+    t = (user_text or "").strip()
+
+    # --- HARD RULE 1: cancel/reject -> force low temp ---
+    for pat in CANCEL_PATTERNS:
+        if re.search(pat, t):
+            # ここが今回「入れて」って言われた修正
+            return 2, 0.90, "関係終了確認", ["キャンセル/拒否の明確表現"]
+
+    # --- HARD RULE 2: too short -> cap low ---
+    if len(t) <= SHORT_TEXT_MAX_LEN:
+        return 3, 0.75, "要件確認", ["短文で情報不足"]
+
     slots = extract_slots(user_text)
 
     history_msgs = get_recent_conversation(shop_id, conv_key, ANALYZE_HISTORY_LIMIT)
-    # history_msgs に最新user_textがまだ入ってない可能性があるので最後に追記
     if not history_msgs or history_msgs[-1].get("content") != user_text:
         history_msgs.append({"role": "user", "content": user_text})
 
-    # 分析用メッセージ
     analysis_messages: List[Dict[str, str]] = [{"role": "system", "content": SYSTEM_PROMPT_ANALYZE}]
     if slots:
         analysis_messages.append({"role": "user", "content": f"抽出スロット(参考): {json.dumps(slots, ensure_ascii=False)}"})
@@ -587,9 +612,6 @@ async def generate_reply_only(user_id: str, user_text: str) -> str:
 
 
 def stable_from_history(conv_key: str, raw_level: int) -> int:
-    """
-    安定化：直近5件の中央値（ブレを抑える）
-    """
     hist = TEMP_HISTORY[conv_key]
     hist.append(raw_level)
     s = sorted(hist)
@@ -859,7 +881,6 @@ async def process_ai_and_push_full(shop_id: str, user_id: str, conv_key: str, us
         raw_level, conf, next_goal, reasons = await analyze_only(shop_id, conv_key, user_text)
         stable_level = stable_from_history(conv_key, raw_level)
 
-        # reply generation (normal timeout)
         try:
             reply_text = await openai_chat(
                 [{"role": "system", "content": SYSTEM_PROMPT_ASSISTANT}, {"role": "user", "content": user_text}],
@@ -957,13 +978,11 @@ async def line_webhook(
 
         conv_key = f"user:{user_id}"
 
-        # Save user message quickly
         try:
             save_message(SHOP_ID, conv_key, "user", user_text)
         except Exception as e:
             print("[DB] save user message failed:", repr(e))
 
-        # Try FAST AI reply. If it fails/slow, fallback message is used.
         fast_reply_text: Optional[str] = None
         try:
             fast_reply_text = await asyncio.wait_for(
