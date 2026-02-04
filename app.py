@@ -27,11 +27,6 @@
 #   FOLLOWUP_JST_FROM=10
 #   FOLLOWUP_JST_TO=20
 #   FOLLOWUP_USE_OPENAI=0   (optional)
-#
-# Notes:
-# - customers.user_id stores LINE userId
-# - customers.conv_key is "user:<userId>" (stable identifier)
-# - followup_logs prevents duplicate sending
 
 import os
 import json
@@ -90,7 +85,7 @@ TEMP_HISTORY: Dict[str, deque] = defaultdict(lambda: deque(maxlen=3))
 
 JST = timezone(timedelta(hours=9))
 
-app = FastAPI(title="linebot_mvp", version="0.3.0")
+app = FastAPI(title="linebot_mvp", version="0.3.1")
 
 
 # ============================================================
@@ -183,7 +178,7 @@ def create_db_ssl_context(verify: bool = True) -> ssl.SSLContext:
 
 def connect_db(verify_ssl: bool = True):
     cfg = parse_database_url(DATABASE_URL)
-    sslmode = cfg["params"].get("sslmode", "").lower()
+    sslmode = (cfg["params"].get("sslmode", "") or "").lower()
 
     # Render: SSL前提、verify失敗時フォールバック
     use_ssl = sslmode in ("require", "verify-full", "verify-ca") or True
@@ -221,6 +216,7 @@ def ensure_tables_and_columns() -> None:
     conn = _connect_db_with_fallback()
     cur = conn.cursor()
 
+    # customers
     cur.execute(
         """
         CREATE TABLE IF NOT EXISTS customers (
@@ -240,6 +236,7 @@ def ensure_tables_and_columns() -> None:
     cur.execute("""ALTER TABLE customers ADD COLUMN IF NOT EXISTS confidence REAL;""")
     cur.execute("""ALTER TABLE customers ADD COLUMN IF NOT EXISTS next_goal TEXT;""")
 
+    # messages
     cur.execute(
         """
         CREATE TABLE IF NOT EXISTS messages (
@@ -253,6 +250,7 @@ def ensure_tables_and_columns() -> None:
         """
     )
 
+    # job locks
     cur.execute(
         """
         CREATE TABLE IF NOT EXISTS job_locks (
@@ -262,7 +260,7 @@ def ensure_tables_and_columns() -> None:
         """
     )
 
-    # 追客ログ（追加）
+    # followup logs
     cur.execute(
         """
         CREATE TABLE IF NOT EXISTS followup_logs (
@@ -441,6 +439,7 @@ SYSTEM_PROMPT_FOLLOWUP = """
 - 「内見」「申込」など強い言葉は乱用しない
 - 絵文字は最大1つ
 """
+
 
 def coerce_level(v: Any) -> int:
     try:
@@ -668,7 +667,6 @@ def build_followup_template(next_goal: str, last_user_text: str, level: int) -> 
     goal = (next_goal or "").strip()
     last = (last_user_text or "").strip()
 
-    # ゴール別の自然な質問に寄せる（押し売り回避）
     if "予算" in goal:
         q = "ご予算の目安（上限）だけ教えていただけますか？"
     elif "入居" in goal or "時期" in goal:
@@ -678,11 +676,10 @@ def build_followup_template(next_goal: str, last_user_text: str, level: int) -> 
     elif "内見" in goal or "候補日" in goal:
         q = "もしご都合よければ、今週 or 来週で空いている時間帯はありますか？"
     elif "申込" in goal:
-        q = "ご不安点があれば、先に解消して進められます。気になる点はありますか？"
+        q = "ご不安点があれば先に解消できます。気になる点はありますか？"
     else:
         q = "条件を少し整理したいので、希望があれば教えてください。"
 
-    # 温度が高いほど「具体化」寄り、低いほど「軽い確認」寄り
     if level >= 9:
         lead = "念のため確認です。"
     elif level >= 8:
@@ -692,7 +689,6 @@ def build_followup_template(next_goal: str, last_user_text: str, level: int) -> 
 
     last_hint = ""
     if last:
-        # 末尾に軽く触れる（長文は避ける）
         trimmed = last[:40] + ("…" if len(last) > 40 else "")
         last_hint = f"（直近：{trimmed}）\n"
 
@@ -716,7 +712,6 @@ async def build_followup_message_openai(next_goal: str, last_user_text: str, lev
         if out.startswith("```"):
             parts = out.split("```")
             out = parts[1] if len(parts) > 1 else out
-        # 念のため短く
         return out[:600].strip() or build_followup_template(next_goal, last_user_text, level)
     except Exception as e:
         print("[OPENAI] followup gen failed:", repr(e))
@@ -724,12 +719,6 @@ async def build_followup_message_openai(next_goal: str, last_user_text: str, lev
 
 
 def get_followup_candidates() -> List[Dict[str, Any]]:
-    """
-    - 温度 >= min
-    - updated_at が threshold より古い（一定時間返信がない）
-    - 直近 FOLLOWUP_MIN_HOURS_BETWEEN 以内に followup 送っていない
-    - user_id がある
-    """
     if not DATABASE_URL:
         return []
 
@@ -768,7 +757,6 @@ def get_followup_candidates() -> List[Dict[str, Any]]:
     candidates: List[Dict[str, Any]] = []
     for r in rows:
         last_followup_at = r[8]
-        # 直近送信が min_hours 以内なら除外
         if last_followup_at and last_followup_at > since:
             continue
 
@@ -877,16 +865,12 @@ async def line_webhook(
 
         conv_key = f"user:{user_id}"
 
-        # Light DB write first
         try:
             save_message(SHOP_ID, conv_key, "user", user_text)
         except Exception as e:
             print("[DB] save user message failed:", repr(e))
 
-        # Immediate reply to avoid reply_token expiry
         await reply_message(reply_token, "ありがとうございます！内容を確認しています。少々お待ちください😊")
-
-        # Background AI + push
         background.add_task(process_ai_and_push, SHOP_ID, user_id, conv_key, user_text)
 
     return {"ok": True}
@@ -931,7 +915,7 @@ async def api_hot(
             for r in rows
         ])
 
-     # events view（履歴）
+    # events view（履歴）
     rows = db_fetchall(
         """
         SELECT
@@ -951,8 +935,6 @@ async def api_hot(
         """,
         (shop_id, limit),
     )
-
-
 
     return JSONResponse([
         {
@@ -1198,15 +1180,21 @@ async def dashboard(
       tbody.innerHTML = `<tr><td colspan="6" class="muted">No data</td></tr>`;
       return;
     }}
+
     tbody.innerHTML = rows.map(r => {{
       const updated = r.message_created_at || r.updated_at;
-      const conf = (r.confidence ?? 0).toFixed(2);
+
+      // ★ここが今回の修正ポイント（NULLを 0 にしない）
+      const levelHtml = (r.temp_level_stable == null) ? "-" : pill(r.temp_level_stable);
+      const confHtml  = (r.confidence == null) ? "-" : (Number(r.confidence).toFixed(2));
+      const goalHtml  = (r.next_goal == null || r.next_goal === "") ? "-" : escapeHtml(r.next_goal);
+
       return `
         <tr>
           <td class="mono">${{escapeHtml(fmtTime(updated))}}</td>
-          <td>${{pill(r.temp_level_stable || 0)}}</td>
-          <td class="mono">${{escapeHtml(conf)}}</td>
-          <td>${{escapeHtml(r.next_goal || "")}}</td>
+          <td>${{levelHtml}}</td>
+          <td class="mono">${{confHtml}}</td>
+          <td>${{goalHtml}}</td>
           <td class="mono">${{escapeHtml(r.user_id || "")}}</td>
           <td class="rowmsg">${{escapeHtml(r.last_user_text || "")}}</td>
         </tr>
@@ -1307,7 +1295,6 @@ async def job_followup(_: None = Depends(require_admin_key)):
         goal = c.get("next_goal") or ""
         last_text = c.get("last_user_text") or ""
 
-        # 文面生成
         mode = "template"
         if FOLLOWUP_USE_OPENAI and OPENAI_API_KEY:
             mode = "openai"
@@ -1315,7 +1302,6 @@ async def job_followup(_: None = Depends(require_admin_key)):
         else:
             msg = build_followup_template(goal, last_text, level)
 
-        # 送信（push）
         try:
             await push_message(user_id, msg)
             save_followup_log(SHOP_ID, conv_key, user_id, msg, mode, "sent", None)
