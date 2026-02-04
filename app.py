@@ -931,25 +931,27 @@ async def api_hot(
             for r in rows
         ])
 
-  rows = db_fetchall(
-    """
-    SELECT
-      c.conv_key,
-      c.user_id,
-      m.content,
-      m.created_at,
-      NULL AS temp_level_stable,
-      NULL AS confidence,
-      NULL AS next_goal
-    FROM customers c
-    LEFT JOIN messages m
-      ON c.conv_key = m.conv_key AND m.role = 'user'
-    WHERE c.shop_id = %s AND COALESCE(c.temp_level_stable, 0) >= %s
-    ORDER BY m.created_at DESC NULLS LAST
-    LIMIT %s
-    """,
-    (shop_id, min_level, limit),
-)
+     # events view（履歴）
+    rows = db_fetchall(
+        """
+        SELECT
+          c.conv_key,
+          c.user_id,
+          m.content,
+          m.created_at,
+          NULL AS temp_level_stable,
+          NULL AS confidence,
+          NULL AS next_goal
+        FROM customers c
+        LEFT JOIN messages m
+          ON c.conv_key = m.conv_key AND m.role = 'user'
+        WHERE c.shop_id = %s
+        ORDER BY m.created_at DESC NULLS LAST
+        LIMIT %s
+        """,
+        (shop_id, limit),
+    )
+
 
 
     return JSONResponse([
