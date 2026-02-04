@@ -1,4 +1,20 @@
-# app.py (FULL) - LINE webhook: immediate reply + async AI + push
+# app.py (FULL REWRITE)
+# FastAPI + Render + Postgres(pg8000)
+# LINE webhook: immediate reply + background AI + push
+# Dashboard auth: DASHBOARD_KEY (query ?key=... or header X-Dashboard-Key)
+# Jobs auth: ADMIN_API_KEY (header x-admin-key)
+#
+# Required env:
+#   LINE_CHANNEL_SECRET
+#   LINE_CHANNEL_ACCESS_TOKEN
+#   DATABASE_URL
+#   OPENAI_API_KEY
+#   DASHBOARD_KEY
+#   ADMIN_API_KEY  (for /jobs/* only)
+# Optional:
+#   SHOP_ID
+#   DASHBOARD_REFRESH_SEC_DEFAULT
+#   FOLLOWUP_ENABLED / FOLLOWUP_* (jobs)
 
 import os
 import json
@@ -18,7 +34,6 @@ import pg8000
 
 from fastapi import FastAPI, Request, Header, HTTPException, Query, Depends, status, BackgroundTasks
 from fastapi.responses import JSONResponse, HTMLResponse
-from fastapi.security import HTTPBasic, HTTPBasicCredentials
 
 
 # ============================================================
@@ -31,10 +46,16 @@ OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
 DATABASE_URL = os.getenv("DATABASE_URL", "")
 SHOP_ID = os.getenv("SHOP_ID", "tokyo_01")
 
-# Protect machine endpoints
+# Dashboard/Auth
+DASHBOARD_KEY = os.getenv("DASHBOARD_KEY", "").strip()
+
+# Jobs/Auth (machine)
 ADMIN_API_KEY = os.getenv("ADMIN_API_KEY", "").strip()
 
-# Auto followup job config
+# Dashboard refresh
+DASHBOARD_REFRESH_SEC_DEFAULT = int(os.getenv("DASHBOARD_REFRESH_SEC_DEFAULT", "30"))
+
+# Followup config (optional)
 FOLLOWUP_ENABLED = os.getenv("FOLLOWUP_ENABLED", "0").strip() == "1"
 FOLLOWUP_AFTER_MINUTES = int(os.getenv("FOLLOWUP_AFTER_MINUTES", "60"))
 FOLLOWUP_MIN_LEVEL = int(os.getenv("FOLLOWUP_MIN_LEVEL", "8"))
@@ -42,70 +63,55 @@ FOLLOWUP_LIMIT = int(os.getenv("FOLLOWUP_LIMIT", "50"))
 FOLLOWUP_DRYRUN = os.getenv("FOLLOWUP_DRYRUN", "0").strip() == "1"
 FOLLOWUP_LOCK_TTL_SEC = int(os.getenv("FOLLOWUP_LOCK_TTL_SEC", "180"))
 
-# Dashboard refresh
-DASHBOARD_REFRESH_SEC_DEFAULT = int(os.getenv("DASHBOARD_REFRESH_SEC_DEFAULT", "30"))
-
-# ===== Chat history in-memory (MVP)
+# In-memory short history (MVP)
 CHAT_HISTORY: Dict[str, deque] = defaultdict(lambda: deque(maxlen=40))
 TEMP_HISTORY: Dict[str, deque] = defaultdict(lambda: deque(maxlen=3))
 
-app = FastAPI(title="linebot_mvp", version="0.1.0")
+JST = timezone(timedelta(hours=9))
+
+app = FastAPI(title="linebot_mvp", version="0.2.0")
 
 
 # ============================================================
-# Security: Basic Auth (for /dashboard and /api/hot)
+# Auth
 # ============================================================
 
-security = HTTPBasic(auto_error=False)
-
-
-def require_basic_auth(credentials: HTTPBasicCredentials = Depends(security)) -> str:
-    user = os.getenv("BASIC_AUTH_USER", "")
-    pw = os.getenv("BASIC_AUTH_PASS", "")
-
-    if not user or not pw:
+def require_dashboard_key(
+    x_dashboard_key: Optional[str] = Header(default=None, alias="X-Dashboard-Key"),
+    key: Optional[str] = Query(default=None),
+) -> None:
+    """
+    Human UI protection for /dashboard and /api/hot (no BasicAuth).
+    Accepts:
+      - Header: X-Dashboard-Key: <DASHBOARD_KEY>
+      - Query : ?key=<DASHBOARD_KEY>
+    """
+    expected = (DASHBOARD_KEY or "").strip()
+    if not expected:
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="Basic auth is not configured (BASIC_AUTH_USER/BASIC_AUTH_PASS)",
+            detail="DASHBOARD_KEY is not configured",
         )
-
-    if credentials is None:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Unauthorized",
-            headers={"WWW-Authenticate": "Basic"},
-        )
-
-    ok_user = secrets.compare_digest(credentials.username or "", user)
-    ok_pw = secrets.compare_digest(credentials.password or "", pw)
-    if not (ok_user and ok_pw):
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Unauthorized",
-            headers={"WWW-Authenticate": "Basic"},
-        )
-
-    return credentials.username
+    provided = (x_dashboard_key or key or "").strip()
+    if not provided or not secrets.compare_digest(provided, expected):
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Unauthorized")
 
 
-# ============================================================
-# Security: Admin key (for /jobs/*)
-# ============================================================
-
-def require_admin_key(x_admin_key: Optional[str] = Header(default=None)) -> None:
+def require_admin_key(x_admin_key: Optional[str] = Header(default=None, alias="x-admin-key")) -> None:
+    """
+    Protect /jobs/* endpoints for machine calls.
+    """
     if not ADMIN_API_KEY:
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail="ADMIN_API_KEY is not configured",
         )
-    if not x_admin_key:
-        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Unauthorized")
-    if not secrets.compare_digest(x_admin_key.strip(), ADMIN_API_KEY):
+    if not x_admin_key or not secrets.compare_digest(x_admin_key.strip(), ADMIN_API_KEY):
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Unauthorized")
 
 
 # ============================================================
-# Utilities: DB (pg8000)
+# DB (pg8000)
 # ============================================================
 
 def parse_database_url(url: str) -> Dict[str, Any]:
@@ -158,7 +164,7 @@ def connect_db(verify_ssl: bool = True):
     cfg = parse_database_url(DATABASE_URL)
     sslmode = cfg["params"].get("sslmode", "").lower()
 
-    # Render: SSL前提、verify失敗時はフォールバック
+    # Render: SSL前提、verify失敗時フォールバック
     use_ssl = sslmode in ("require", "verify-full", "verify-ca") or True
     ssl_context = create_db_ssl_context(verify=verify_ssl) if use_ssl else None
 
@@ -175,34 +181,46 @@ def connect_db(verify_ssl: bool = True):
     return conn
 
 
-def ensure_tables() -> None:
-    conn = None
+def _connect_db_with_fallback():
     try:
-        conn = connect_db(verify_ssl=True)
+        return connect_db(verify_ssl=True)
     except ssl.SSLError as e:
         print("[DB] SSL verify failed, fallback to disable:", repr(e))
-        conn = connect_db(verify_ssl=False)
+        return connect_db(verify_ssl=False)
 
+
+def ensure_tables_and_columns() -> None:
+    """
+    Create tables (if missing) and add columns (if missing).
+    This avoids 'column does not exist' in older DB schemas.
+    """
+    if not DATABASE_URL:
+        return
+
+    conn = _connect_db_with_fallback()
     cur = conn.cursor()
 
-    # NOTE: 既存DBが古い場合でも壊さない（IF NOT EXISTS）
+    # Base tables (minimal)
     cur.execute(
         """
         CREATE TABLE IF NOT EXISTS customers (
           id BIGSERIAL PRIMARY KEY,
           shop_id TEXT NOT NULL,
           conv_key TEXT NOT NULL,
-          user_id TEXT,
-          last_user_text TEXT,
-          temp_level_raw INT,
-          temp_level_stable INT,
-          confidence REAL,
-          next_goal TEXT,
           updated_at TIMESTAMPTZ DEFAULT now(),
           UNIQUE (shop_id, conv_key)
         );
         """
     )
+
+    # Add missing columns safely
+    # (Postgres supports ADD COLUMN IF NOT EXISTS)
+    cur.execute("""ALTER TABLE customers ADD COLUMN IF NOT EXISTS user_id TEXT;""")
+    cur.execute("""ALTER TABLE customers ADD COLUMN IF NOT EXISTS last_user_text TEXT;""")
+    cur.execute("""ALTER TABLE customers ADD COLUMN IF NOT EXISTS temp_level_raw INT;""")
+    cur.execute("""ALTER TABLE customers ADD COLUMN IF NOT EXISTS temp_level_stable INT;""")
+    cur.execute("""ALTER TABLE customers ADD COLUMN IF NOT EXISTS confidence REAL;""")
+    cur.execute("""ALTER TABLE customers ADD COLUMN IF NOT EXISTS next_goal TEXT;""")
 
     cur.execute(
         """
@@ -210,7 +228,7 @@ def ensure_tables() -> None:
           id BIGSERIAL PRIMARY KEY,
           shop_id TEXT NOT NULL,
           conv_key TEXT NOT NULL,
-          role TEXT NOT NULL,
+          role TEXT NOT NULL,          -- user|assistant|system
           content TEXT NOT NULL,
           created_at TIMESTAMPTZ DEFAULT now()
         );
@@ -226,27 +244,17 @@ def ensure_tables() -> None:
         """
     )
 
+    # Indexes (optional)
+    cur.execute("""CREATE INDEX IF NOT EXISTS idx_customers_shop_updated ON customers(shop_id, updated_at DESC);""")
+    cur.execute("""CREATE INDEX IF NOT EXISTS idx_messages_shop_created ON messages(shop_id, created_at DESC);""")
+    cur.execute("""CREATE INDEX IF NOT EXISTS idx_messages_conv_role_created ON messages(conv_key, role, created_at DESC);""")
+
     cur.close()
     conn.close()
 
 
-@app.on_event("startup")
-async def on_startup():
-    if DATABASE_URL:
-        ensure_tables()
-        print("[BOOT] tables ensured")
-    else:
-        print("[BOOT] DATABASE_URL missing")
-
-
 def db_execute(sql: str, args: Tuple[Any, ...] = ()) -> None:
-    conn = None
-    try:
-        conn = connect_db(verify_ssl=True)
-    except ssl.SSLError as e:
-        print("[DB] SSL verify failed, fallback to disable:", repr(e))
-        conn = connect_db(verify_ssl=False)
-
+    conn = _connect_db_with_fallback()
     cur = conn.cursor()
     cur.execute(sql, args)
     cur.close()
@@ -254,13 +262,7 @@ def db_execute(sql: str, args: Tuple[Any, ...] = ()) -> None:
 
 
 def db_fetchall(sql: str, args: Tuple[Any, ...] = ()) -> List[Tuple[Any, ...]]:
-    conn = None
-    try:
-        conn = connect_db(verify_ssl=True)
-    except ssl.SSLError as e:
-        print("[DB] SSL verify failed, fallback to disable:", repr(e))
-        conn = connect_db(verify_ssl=False)
-
+    conn = _connect_db_with_fallback()
     cur = conn.cursor()
     cur.execute(sql, args)
     rows = cur.fetchall()
@@ -269,8 +271,14 @@ def db_fetchall(sql: str, args: Tuple[Any, ...] = ()) -> List[Tuple[Any, ...]]:
     return rows
 
 
+@app.on_event("startup")
+async def on_startup():
+    ensure_tables_and_columns()
+    print("[BOOT] tables/columns ensured")
+
+
 # ============================================================
-# Utilities: LINE signature verify
+# LINE signature verify
 # ============================================================
 
 def verify_signature(body: bytes, signature: str) -> bool:
@@ -278,16 +286,18 @@ def verify_signature(body: bytes, signature: str) -> bool:
         return False
     mac = hmac.new(LINE_CHANNEL_SECRET.encode("utf-8"), body, hashlib.sha256).digest()
     expected = base64.b64encode(mac).decode("utf-8")
-    return hmac.compare_digest(expected, signature)
+    return hmac.compare_digest(expected, signature or "")
 
 
 # ============================================================
-# Utilities: LINE reply / push
+# LINE reply / push
 # ============================================================
 
 async def reply_message(reply_token: str, text: str) -> None:
     if not LINE_CHANNEL_ACCESS_TOKEN:
         print("[LINE] Missing LINE_CHANNEL_ACCESS_TOKEN")
+        return
+    if not reply_token:
         return
 
     url = "https://api.line.me/v2/bot/message/reply"
@@ -295,10 +305,7 @@ async def reply_message(reply_token: str, text: str) -> None:
         "Authorization": f"Bearer {LINE_CHANNEL_ACCESS_TOKEN}",
         "Content-Type": "application/json",
     }
-    payload = {
-        "replyToken": reply_token,
-        "messages": [{"type": "text", "text": text[:4900]}],
-    }
+    payload = {"replyToken": reply_token, "messages": [{"type": "text", "text": text[:4900]}]}
 
     try:
         async with httpx.AsyncClient(timeout=10, verify=certifi.where()) as client:
@@ -310,13 +317,9 @@ async def reply_message(reply_token: str, text: str) -> None:
 
 
 async def push_message(user_id: str, text: str) -> None:
-    """
-    AIの本返信をpushで送る（reply_token期限問題を回避）
-    """
     if not LINE_CHANNEL_ACCESS_TOKEN:
         print("[LINE] Missing LINE_CHANNEL_ACCESS_TOKEN")
         return
-
     if not user_id or user_id == "unknown":
         print("[LINE] push skipped: invalid user_id")
         return
@@ -326,10 +329,7 @@ async def push_message(user_id: str, text: str) -> None:
         "Authorization": f"Bearer {LINE_CHANNEL_ACCESS_TOKEN}",
         "Content-Type": "application/json",
     }
-    payload = {
-        "to": user_id,
-        "messages": [{"type": "text", "text": text[:4900]}],
-    }
+    payload = {"to": user_id, "messages": [{"type": "text", "text": text[:4900]}]}
 
     try:
         async with httpx.AsyncClient(timeout=10, verify=certifi.where()) as client:
@@ -341,7 +341,7 @@ async def push_message(user_id: str, text: str) -> None:
 
 
 # ============================================================
-# Utilities: OpenAI
+# OpenAI
 # ============================================================
 
 OPENAI_API_URL = "https://api.openai.com/v1/chat/completions"
@@ -362,7 +362,7 @@ SYSTEM_PROMPT_ANALYZE = """
 Lv10: 申込/審査/契約の話が明確、または内見日程が具体的に確定
 Lv9 : 内見したい＋日程調整に入っている（候補日が出ている等）
 Lv8 : 条件がほぼ確定（エリア/予算/入居時期が揃う）＋内見意思が強い
-Lv7 : 条件がかなり具体的（エリアor沿線、予算、入居時期のうち2つ以上）＋前向きな質問
+Lv7 : 条件がかなり具体（エリアor沿線、予算、入居時期のうち2つ以上）＋前向きな質問
 Lv6 : 条件が一部具体（上のうち1つ）＋検討継続が明確
 Lv5 : 一般質問中心、条件が曖昧、温度不明
 Lv4 : 情報収集段階が明確（比較中/とりあえず）で条件未確定
@@ -381,13 +381,19 @@ Lv1 : 明確に不要、拒否、ブロック示唆
 - どちらとも取れる/情報不足 → 0.40〜0.65
 - ほぼ推測 → 0.30〜0.45
 
-【next_goal の書き方】
+【next_goal】
 次に営業が達成すべき「1ステップ」を短く書く。
 例：予算確認 / 入居時期確認 / 希望エリア確認 / 内見候補日提示 / 申込意思確認
 
 【reasons】
-判定根拠を短い箇条書き3つまで（例：予算提示あり、入居時期が今月、内見希望あり）
+判定根拠を短い箇条書き3つまで
 """
+
+SYSTEM_PROMPT_ASSISTANT = """
+あなたは不動産仲介の優秀な営業アシスタントです。
+ユーザーに対して丁寧で簡潔、次の行動につながる返信を日本語で作ってください。
+"""
+
 
 def coerce_level(v: Any) -> int:
     try:
@@ -400,29 +406,17 @@ def coerce_level(v: Any) -> int:
 def coerce_confidence(v: Any) -> float:
     if v is None:
         return 0.6
-
     if isinstance(v, (int, float)):
         fv = float(v)
         if 1.0 < fv <= 100.0:
             fv = fv / 100.0
         return max(0.0, min(1.0, fv))
-
     s = str(v).strip().lower()
-
-    if s in ("高い", "たかい", "high"):
-        return 0.85
-    if s in ("中", "普通", "ふつう", "medium"):
-        return 0.6
-    if s in ("低い", "ひくい", "low"):
-        return 0.35
-
     if s.endswith("%"):
         try:
-            fv = float(s[:-1]) / 100.0
-            return max(0.0, min(1.0, fv))
+            return max(0.0, min(1.0, float(s[:-1]) / 100.0))
         except Exception:
             return 0.6
-
     try:
         fv = float(s)
         if 1.0 < fv <= 100.0:
@@ -436,15 +430,8 @@ async def openai_chat(messages: List[Dict[str, str]], temperature: float = 0.2) 
     if not OPENAI_API_KEY:
         raise RuntimeError("OPENAI_API_KEY is missing")
 
-    headers = {
-        "Authorization": f"Bearer {OPENAI_API_KEY}",
-        "Content-Type": "application/json",
-    }
-    payload = {
-        "model": "gpt-4o-mini",
-        "messages": messages,
-        "temperature": temperature,
-    }
+    headers = {"Authorization": f"Bearer {OPENAI_API_KEY}", "Content-Type": "application/json"}
+    payload = {"model": "gpt-4o-mini", "messages": messages, "temperature": temperature}
 
     async with httpx.AsyncClient(timeout=25, verify=certifi.where()) as client:
         r = await client.post(OPENAI_API_URL, headers=headers, json=payload)
@@ -453,47 +440,47 @@ async def openai_chat(messages: List[Dict[str, str]], temperature: float = 0.2) 
         return data["choices"][0]["message"]["content"]
 
 
-async def analyze_and_generate_reply(user_text: str, user_id: str, conv_key: str) -> Tuple[int, int, float, str, str]:
+async def analyze_and_generate_reply(user_text: str, user_id: str, conv_key: str) -> Tuple[int, int, float, str, List[str], str]:
+    # 1) analyze
     analysis_messages = [
         {"role": "system", "content": SYSTEM_PROMPT_ANALYZE},
         {"role": "user", "content": user_text},
     ]
 
-    raw_json_text = ""
+    raw_level = 5
+    conf = 0.5
+    next_goal = "情報収集を続ける"
+    reasons: List[str] = []
+
     try:
         raw_json_text = await openai_chat(analysis_messages, temperature=0.0)
-    except Exception as e:
-        print("[OPENAI] analyze exception:", repr(e))
-        raw_level = 5
-        conf = 0.5
-        next_goal = "情報収集を続ける"
-    else:
+        raw = raw_json_text.strip()
+        if raw.startswith("```"):
+            parts = raw.split("```")
+            raw = parts[1] if len(parts) > 1 else raw
         try:
-            raw = raw_json_text.strip()
-            if raw.startswith("```"):
-                parts = raw.split("```")
-                raw = parts[1] if len(parts) > 1 else raw
             j = json.loads(raw)
         except Exception:
-            try:
-                start = raw_json_text.find("{")
-                end = raw_json_text.rfind("}")
-                j = json.loads(raw_json_text[start:end + 1])
-            except Exception as e2:
-                print("[OPENAI] analyze parse failed:", repr(e2), "raw=", raw_json_text[:200])
-                j = {"temp_level_raw": 5, "confidence": 0.5, "next_goal": "情報収集を続ける"}
+            start = raw.find("{")
+            end = raw.rfind("}")
+            j = json.loads(raw[start:end + 1])
 
         raw_level = coerce_level(j.get("temp_level_raw", 5))
         conf = coerce_confidence(j.get("confidence", 0.6))
         next_goal = str(j.get("next_goal", "情報収集を続ける")).strip()[:80]
+        rs = j.get("reasons", [])
+        if isinstance(rs, list):
+            reasons = [str(x).strip()[:60] for x in rs if str(x).strip()][:3]
+    except Exception as e:
+        print("[OPENAI] analyze failed:", repr(e))
 
-    # stable median of last 3 raw levels
+    # stable median (last 3)
     hist = TEMP_HISTORY[conv_key]
     hist.append(raw_level)
     sorted_hist = sorted(hist)
     stable_level = sorted_hist[len(sorted_hist) // 2]
 
-    # Build assistant reply with short memory
+    # 2) assistant reply
     history = CHAT_HISTORY[user_id]
     context_msgs = [{"role": "system", "content": SYSTEM_PROMPT_ASSISTANT}]
     for role, content in list(history)[-10:]:
@@ -503,17 +490,17 @@ async def analyze_and_generate_reply(user_text: str, user_id: str, conv_key: str
     try:
         reply_text = await openai_chat(context_msgs, temperature=0.4)
     except Exception as e:
-        print("[OPENAI] reply exception:", repr(e))
+        print("[OPENAI] reply failed:", repr(e))
         reply_text = "ありがとうございます。条件をもう少し教えてください（エリア/家賃/間取り/入居時期など）。"
 
     history.append(("user", user_text))
     history.append(("assistant", reply_text))
 
-    return raw_level, stable_level, conf, next_goal, reply_text
+    return raw_level, stable_level, conf, next_goal, reasons, reply_text
 
 
 # ============================================================
-# DB write helpers
+# DB helpers
 # ============================================================
 
 def save_message(shop_id: str, conv_key: str, role: str, content: str) -> None:
@@ -540,12 +527,6 @@ def upsert_customer(
 ) -> None:
     if not DATABASE_URL:
         return
-
-    # NOTE: 既存テーブルに user_id が無い場合もあるため、
-    # INSERT/UPDATE では user_id を使わず conv_key を主キーにする設計で運用可能。
-    # ただし、あなたの環境では customers に user_id を入れる設計なので、そのまま書く。
-    # もしDBが古くて user_id カラムが無い場合は、ここでエラーになる。
-    # → その場合は ALTER TABLE するか、このSQLから user_id を外す。
     db_execute(
         """
         INSERT INTO customers
@@ -581,21 +562,17 @@ async def healthz():
 
 
 # ------------------------------------------------------------
-# LINE webhook (immediate reply + background AI + push)
+# LINE webhook: immediate reply + background AI + push
 # ------------------------------------------------------------
 
 async def process_ai_and_push(shop_id: str, user_id: str, conv_key: str, user_text: str) -> None:
-    """
-    バックグラウンドでAI処理→DB更新→push送信
-    """
     try:
-        raw_level, stable_level, conf, next_goal, ai_reply = await analyze_and_generate_reply(
+        raw_level, stable_level, conf, next_goal, reasons, ai_reply = await analyze_and_generate_reply(
             user_text=user_text,
             user_id=user_id,
             conv_key=conv_key,
         )
 
-        # DB更新（できる範囲で）
         try:
             upsert_customer(
                 shop_id=shop_id,
@@ -615,9 +592,12 @@ async def process_ai_and_push(shop_id: str, user_id: str, conv_key: str, user_te
         except Exception as db_e2:
             print("[DB] save assistant message failed:", repr(db_e2))
 
-        print(f"[TEMP] key={conv_key} raw={raw_level} stable={stable_level} conf={conf:.2f} goal={next_goal}")
+        # debug
+        if reasons:
+            print(f"[TEMP] {conv_key} raw={raw_level} stable={stable_level} conf={conf:.2f} goal={next_goal} reasons={reasons}")
+        else:
+            print(f"[TEMP] {conv_key} raw={raw_level} stable={stable_level} conf={conf:.2f} goal={next_goal}")
 
-        # AI返信をpush
         await push_message(user_id, ai_reply)
 
     except Exception as e:
@@ -628,7 +608,7 @@ async def process_ai_and_push(shop_id: str, user_id: str, conv_key: str, user_te
 async def line_webhook(
     request: Request,
     background: BackgroundTasks,
-    x_line_signature: str = Header(default=""),
+    x_line_signature: str = Header(default="", alias="X-Line-Signature"),
 ):
     body = await request.body()
 
@@ -640,12 +620,11 @@ async def line_webhook(
     except Exception:
         raise HTTPException(status_code=400, detail="invalid json")
 
-    events = payload.get("events", [])
+    events = payload.get("events", []) or []
     for ev in events:
         if ev.get("type") != "message":
             continue
-
-        message = ev.get("message", {})
+        message = ev.get("message", {}) or {}
         if message.get("type") != "text":
             continue
 
@@ -655,37 +634,32 @@ async def line_webhook(
 
         conv_key = f"user:{user_id}"
 
-        # 1) DB: ユーザー発言ログ（軽い）
+        # Light DB write first
         try:
             save_message(SHOP_ID, conv_key, "user", user_text)
-        except Exception as db_e:
-            print("[DB] save user message failed:", repr(db_e))
+        except Exception as e:
+            print("[DB] save user message failed:", repr(e))
 
-        # 2) まず即レス（reply_token期限問題を回避）
-        if reply_token:
-            # ここは超短く、確実に返す
-            await reply_message(reply_token, "ありがとうございます！内容を確認しています。少々お待ちください😊")
-        else:
-            print("[LINE] missing reply_token")
+        # Immediate reply to avoid reply_token expiry
+        await reply_message(reply_token, "ありがとうございます！内容を確認しています。少々お待ちください😊")
 
-        # 3) AI処理はバックグラウンド → push
+        # Background AI + push
         background.add_task(process_ai_and_push, SHOP_ID, user_id, conv_key, user_text)
 
     return {"ok": True}
 
 
-# ============================================================
-# Admin API: HOT customers (Basic Auth)
-#   ※ DBの user_id カラム差異に依存しない安全版
-# ============================================================
+# ------------------------------------------------------------
+# API for dashboard (protected by DASHBOARD_KEY)
+# ------------------------------------------------------------
 
 @app.get("/api/hot")
 async def api_hot(
-    _: str = Depends(require_basic_auth),
+    _: None = Depends(require_dashboard_key),
     shop_id: str = Query(default=SHOP_ID),
     min_level: int = Query(default=8, ge=1, le=10),
     limit: int = Query(default=50, ge=1, le=200),
-    view: str = Query(default="customers", regex="^(customers|events)$"),
+    view: str = Query(default="customers", pattern="^(customers|events)$"),
 ):
     if not DATABASE_URL:
         return JSONResponse([], status_code=200)
@@ -693,14 +667,9 @@ async def api_hot(
     if view == "customers":
         rows = db_fetchall(
             """
-            SELECT conv_key,
-                   last_user_text,
-                   temp_level_stable,
-                   confidence,
-                   next_goal,
-                   updated_at
+            SELECT conv_key, last_user_text, temp_level_stable, confidence, next_goal, updated_at
             FROM customers
-            WHERE shop_id = %s AND temp_level_stable >= %s
+            WHERE shop_id = %s AND COALESCE(temp_level_stable, 0) >= %s
             ORDER BY updated_at DESC
             LIMIT %s
             """,
@@ -708,7 +677,7 @@ async def api_hot(
         )
         return JSONResponse([
             {
-                "user_id": r[0],  # conv_key を表示に流用
+                "user_id": r[0],  # conv_key
                 "last_user_text": r[1],
                 "temp_level_stable": r[2],
                 "confidence": float(r[3]) if r[3] is not None else None,
@@ -729,7 +698,7 @@ async def api_hot(
         FROM customers c
         LEFT JOIN messages m
           ON c.conv_key = m.conv_key AND m.role = 'user'
-        WHERE c.shop_id = %s AND c.temp_level_stable >= %s
+        WHERE c.shop_id = %s AND COALESCE(c.temp_level_stable, 0) >= %s
         ORDER BY m.created_at DESC NULLS LAST
         LIMIT %s
         """,
@@ -738,7 +707,7 @@ async def api_hot(
 
     return JSONResponse([
         {
-            "user_id": r[0],  # conv_key
+            "user_id": r[0],
             "last_user_text": r[1],
             "message_created_at": r[2].isoformat() if r[2] else None,
             "temp_level_stable": r[3],
@@ -749,9 +718,9 @@ async def api_hot(
     ])
 
 
-# ============================================================
-# Dashboard (HTML) - Basic Auth
-# ============================================================
+# ------------------------------------------------------------
+# Dashboard (protected by DASHBOARD_KEY)
+# ------------------------------------------------------------
 
 LEVEL_COLORS = {
     1: "#9aa0a6",
@@ -769,14 +738,17 @@ LEVEL_COLORS = {
 
 @app.get("/dashboard", response_class=HTMLResponse)
 async def dashboard(
-    _: str = Depends(require_basic_auth),
+    _: None = Depends(require_dashboard_key),
     shop_id: str = Query(default=SHOP_ID),
-    view: str = Query(default="events", regex="^(customers|events)$"),
+    view: str = Query(default="events", pattern="^(customers|events)$"),
     min_level: int = Query(default=8, ge=1, le=10),
     limit: int = Query(default=50, ge=1, le=200),
     refresh: int = Query(default=DASHBOARD_REFRESH_SEC_DEFAULT, ge=0, le=300),
+    key: Optional[str] = Query(default=None),  # pass-through for JS fetch
 ):
-    api_url = f"/api/hot?shop_id={shop_id}&min_level={min_level}&limit={limit}&view={view}"
+    # key は require_dashboard_key が検証済み。JS fetchでも同じkeyを付ける。
+    key_q = (key or "").strip()
+    api_url = f"/api/hot?shop_id={shop_id}&min_level={min_level}&limit={limit}&view={view}&key={key_q}"
 
     html = f"""
 <!doctype html>
@@ -937,6 +909,7 @@ async def dashboard(
 
 <script>
   const LEVEL_COLORS = {json.dumps(LEVEL_COLORS)};
+  const DASH_KEY = {json.dumps(key_q)};
 
   function fmtTime(iso) {{
     if (!iso) return "-";
@@ -998,7 +971,7 @@ async def dashboard(
     const minLevel = document.getElementById("minLevel").value;
     const limit = document.getElementById("limit").value;
 
-    const url = `/api/hot?shop_id=${{encodeURIComponent(shopId)}}&min_level=${{encodeURIComponent(minLevel)}}&limit=${{encodeURIComponent(limit)}}&view=${{encodeURIComponent(view)}}`;
+    const url = `/api/hot?shop_id=${{encodeURIComponent(shopId)}}&min_level=${{encodeURIComponent(minLevel)}}&limit=${{encodeURIComponent(limit)}}&view=${{encodeURIComponent(view)}}&key=${{encodeURIComponent(DASH_KEY)}}`;
     const res = await fetch(url, {{ credentials: "same-origin" }});
     const data = await res.json();
     cache = Array.isArray(data) ? data : [];
@@ -1018,7 +991,8 @@ async def dashboard(
       view: view,
       min_level: minLevel,
       limit: limit,
-      refresh: refreshSec
+      refresh: refreshSec,
+      key: DASH_KEY
     }});
     window.location.href = `/dashboard?${{qs.toString()}}`;
   }});
@@ -1046,9 +1020,9 @@ async def dashboard(
     return HTMLResponse(html)
 
 
-# ============================================================
-# Followup job (ADMIN_API_KEY only)
-# ============================================================
+# ------------------------------------------------------------
+# Followup job (ADMIN_API_KEY)
+# ------------------------------------------------------------
 
 def utcnow() -> datetime:
     return datetime.now(timezone.utc)
@@ -1091,7 +1065,7 @@ async def job_followup(_: None = Depends(require_admin_key)):
         SELECT shop_id, conv_key, temp_level_stable, confidence, next_goal, updated_at, last_user_text
         FROM customers
         WHERE shop_id=%s
-          AND temp_level_stable >= %s
+          AND COALESCE(temp_level_stable, 0) >= %s
           AND updated_at < %s
         ORDER BY updated_at ASC
         LIMIT %s
