@@ -19,7 +19,13 @@
 #   SHOP_ID
 #   DASHBOARD_REFRESH_SEC_DEFAULT
 #   FOLLOWUP_ENABLED / FOLLOWUP_* (jobs)
-#   FAST_REPLY_TIMEOUT_SEC (default 3.0)  # AI即返信のタイムアウト
+#   FAST_REPLY_TIMEOUT_SEC (default 3.0)
+#   ANALYZE_HISTORY_LIMIT (default 10)  # 温度判定に使う履歴数
+#
+# Improvements for temp accuracy:
+# - Restore strict rubric prompt for analysis
+# - Include recent conversation (DB messages) in analysis prompt
+# - Extract simple slots (budget/area/move-in/layout) and pass to analysis
 
 import os
 import json
@@ -30,6 +36,7 @@ import time
 import ssl
 import secrets
 import asyncio
+import re
 from datetime import datetime, timedelta, timezone
 from collections import deque, defaultdict
 from typing import Any, Dict, List, Optional, Tuple
@@ -52,16 +59,11 @@ OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
 DATABASE_URL = os.getenv("DATABASE_URL", "")
 SHOP_ID = os.getenv("SHOP_ID", "tokyo_01")
 
-# Dashboard/Auth
 DASHBOARD_KEY = os.getenv("DASHBOARD_KEY", "").strip()
-
-# Jobs/Auth (machine)
 ADMIN_API_KEY = os.getenv("ADMIN_API_KEY", "").strip()
 
-# Dashboard refresh
 DASHBOARD_REFRESH_SEC_DEFAULT = int(os.getenv("DASHBOARD_REFRESH_SEC_DEFAULT", "30"))
 
-# Followup config
 FOLLOWUP_ENABLED = os.getenv("FOLLOWUP_ENABLED", "0").strip() == "1"
 FOLLOWUP_AFTER_MINUTES = int(os.getenv("FOLLOWUP_AFTER_MINUTES", "60"))
 FOLLOWUP_MIN_LEVEL = int(os.getenv("FOLLOWUP_MIN_LEVEL", "8"))
@@ -73,16 +75,15 @@ FOLLOWUP_JST_FROM = int(os.getenv("FOLLOWUP_JST_FROM", "10"))
 FOLLOWUP_JST_TO = int(os.getenv("FOLLOWUP_JST_TO", "20"))
 FOLLOWUP_USE_OPENAI = os.getenv("FOLLOWUP_USE_OPENAI", "0").strip() == "1"
 
-# ★AIの即返信を試す時間（短いほど「確認中」が出やすい/長いほどLINE reply が遅延しやすい）
 FAST_REPLY_TIMEOUT_SEC = float(os.getenv("FAST_REPLY_TIMEOUT_SEC", "3.0"))
+ANALYZE_HISTORY_LIMIT = int(os.getenv("ANALYZE_HISTORY_LIMIT", "10"))
 
-# In-memory short history (MVP)
 CHAT_HISTORY: Dict[str, deque] = defaultdict(lambda: deque(maxlen=40))
-TEMP_HISTORY: Dict[str, deque] = defaultdict(lambda: deque(maxlen=3))
+TEMP_HISTORY: Dict[str, deque] = defaultdict(lambda: deque(maxlen=5))  # 安定化を少し強める
 
 JST = timezone(timedelta(hours=9))
 
-app = FastAPI(title="linebot_mvp", version="0.4.1")
+app = FastAPI(title="linebot_mvp", version="0.4.2")
 
 
 # ============================================================
@@ -209,7 +210,6 @@ def ensure_tables_and_columns() -> None:
         );
         """
     )
-
     cur.execute("""ALTER TABLE customers ADD COLUMN IF NOT EXISTS user_id TEXT;""")
     cur.execute("""ALTER TABLE customers ADD COLUMN IF NOT EXISTS last_user_text TEXT;""")
     cur.execute("""ALTER TABLE customers ADD COLUMN IF NOT EXISTS temp_level_raw INT;""")
@@ -229,7 +229,6 @@ def ensure_tables_and_columns() -> None:
         );
         """
     )
-    # 履歴にスコアを残す（assistant行に保存）
     cur.execute("""ALTER TABLE messages ADD COLUMN IF NOT EXISTS temp_level_raw INT;""")
     cur.execute("""ALTER TABLE messages ADD COLUMN IF NOT EXISTS temp_level_stable INT;""")
     cur.execute("""ALTER TABLE messages ADD COLUMN IF NOT EXISTS confidence REAL;""")
@@ -262,7 +261,7 @@ def ensure_tables_and_columns() -> None:
 
     cur.execute("""CREATE INDEX IF NOT EXISTS idx_customers_shop_updated ON customers(shop_id, updated_at DESC);""")
     cur.execute("""CREATE INDEX IF NOT EXISTS idx_messages_shop_created ON messages(shop_id, created_at DESC);""")
-    cur.execute("""CREATE INDEX IF NOT EXISTS idx_messages_conv_role_created ON messages(conv_key, role, created_at DESC);""")
+    cur.execute("""CREATE INDEX IF NOT EXISTS idx_messages_conv_created ON messages(conv_key, created_at DESC);""")
     cur.execute("""CREATE INDEX IF NOT EXISTS idx_followup_shop_conv_created ON followup_logs(shop_id, conv_key, created_at DESC);""")
 
     cur.close()
@@ -321,7 +320,7 @@ async def reply_message(reply_token: str, text: str) -> None:
         "Authorization": f"Bearer {LINE_CHANNEL_ACCESS_TOKEN}",
         "Content-Type": "application/json",
     }
-    payload = {"replyToken": reply_token, "messages": [{"type": "text", "text": text[:4900]}]}
+    payload = {"replyToken": reply_token, "messages": [{"type": "text", "text": (text or "")[:4900]}]}
 
     try:
         async with httpx.AsyncClient(timeout=10, verify=certifi.where()) as client:
@@ -345,7 +344,7 @@ async def push_message(user_id: str, text: str) -> None:
         "Authorization": f"Bearer {LINE_CHANNEL_ACCESS_TOKEN}",
         "Content-Type": "application/json",
     }
-    payload = {"to": user_id, "messages": [{"type": "text", "text": text[:4900]}]}
+    payload = {"to": user_id, "messages": [{"type": "text", "text": (text or "")[:4900]}]}
 
     try:
         async with httpx.AsyncClient(timeout=10, verify=certifi.where()) as client:
@@ -362,32 +361,62 @@ async def push_message(user_id: str, text: str) -> None:
 
 OPENAI_API_URL = "https://api.openai.com/v1/chat/completions"
 
+# ★精度改善：ルーブリックを強化（過大評価防止を明示）
 SYSTEM_PROMPT_ANALYZE = """
 あなたは不動産仲介SaaSの「顧客温度判定AI」です。
-ユーザーの最新発言から、成約に近い順に 1〜10 で温度を判定します。
+会話履歴と最新発言から、成約に近い順に 1〜10 で温度を判定します。
 
-【出力はJSONのみ】
+【出力はJSONのみ（それ以外禁止）】
 {
   "temp_level_raw": 1,
   "confidence": 0.50,
   "next_goal": "短い日本語",
   "reasons": ["根拠1","根拠2","根拠3"]
 }
+
+【重要：レベル基準（厳守）】
+Lv10: 申込/審査/契約の話が明確、または内見日程が具体的に確定
+Lv9 : 内見したい＋日程調整に入っている（候補日が出ている等）
+Lv8 : 条件がほぼ確定（エリア/予算/入居時期が揃う）＋内見意思が強い
+Lv7 : 条件がかなり具体（エリアor沿線、予算、入居時期のうち2つ以上）＋前向きな質問
+Lv6 : 条件が一部具体（上のうち1つ）＋検討継続が明確
+Lv5 : 一般質問中心、条件が曖昧、温度不明
+Lv4 : 情報収集段階が明確（比較中/とりあえず）で条件未確定
+Lv3 : 反応が薄い/曖昧/先すぎる（半年以上先など）/冷めている
+Lv2 : 冷やかし/雑談/要件なし/関係ない
+Lv1 : 明確に不要、拒否、ブロック示唆
+
+【過大評価防止（最重要）】
+- 「内見」「良さそう」等があっても、予算・入居時期・エリアが不明なら Lv8以上にしない
+- 入居時期が半年以上先なら最大でも Lv6
+- 条件が全く出ていない場合は最大でも Lv5
+- 返信が短い/曖昧な場合はLvを上げすぎない
+
+【confidence】
+- 根拠が2つ以上揃う → 0.70〜0.90
+- 情報不足/どちらとも取れる → 0.40〜0.65
+- ほぼ推測 → 0.30〜0.45
+
+【next_goal】
+次に営業が達成すべき「1ステップ」を短く。
+例：予算確認 / 入居時期確認 / 希望エリア確認 / 内見候補日提示 / 申込意思確認
+
+【reasons】
+短い根拠を最大3つ
 """
 
 SYSTEM_PROMPT_ASSISTANT = """
 あなたは不動産仲介の優秀な営業アシスタントです。
 ユーザーに対して丁寧で簡潔、次の行動につながる返信を日本語で作ってください。
+・質問は最大2つ
+・押し売り感を出さない
 """
 
 SYSTEM_PROMPT_FOLLOWUP = """
 あなたは不動産仲介の追客メッセージ作成AIです。
 以下の情報をもとに、押し売り感ゼロで、返信しやすい一通を日本語で作ってください。
-
-ルール：
 - 2〜4行、短め
 - 質問は最大2つ
-- 「内見」「申込」など強い言葉は乱用しない
 - 絵文字は最大1つ
 """
 
@@ -437,11 +466,78 @@ async def openai_chat(messages: List[Dict[str, str]], temperature: float = 0.2, 
         return data["choices"][0]["message"]["content"]
 
 
-async def analyze_only(user_text: str) -> Tuple[int, int, float, str, List[str]]:
-    analysis_messages = [
-        {"role": "system", "content": SYSTEM_PROMPT_ANALYZE},
-        {"role": "user", "content": user_text},
-    ]
+def extract_slots(text: str) -> Dict[str, str]:
+    t = text or ""
+    slots: Dict[str, str] = {}
+
+    # budget (rough)
+    m = re.search(r"(\d{1,3})(?:\.(\d))?\s*(?:万円|万)", t)
+    if m:
+        slots["budget"] = m.group(0)
+
+    # layout
+    m = re.search(r"(\d)\s*(?:LDK|DK|K)|ワンルーム|1R", t, re.IGNORECASE)
+    if m:
+        slots["layout"] = m.group(0)
+
+    # move-in timing keywords
+    for kw in ["今月", "来月", "再来月", "すぐ", "早め", "急ぎ", "春", "夏", "秋", "冬"]:
+        if kw in t:
+            slots["move_in"] = kw
+            break
+    m = re.search(r"(\d{1,2})\s*月", t)
+    if m:
+        slots.setdefault("move_in", m.group(0))
+
+    # area (simple)
+    for kw in ["渋谷", "新宿", "品川", "池袋", "目黒", "中目黒", "恵比寿", "吉祥寺", "横浜", "川崎", "浦和"]:
+        if kw in t:
+            slots["area"] = kw
+            break
+
+    return slots
+
+
+def get_recent_conversation(shop_id: str, conv_key: str, limit: int) -> List[Dict[str, str]]:
+    """
+    DBから直近の user/assistant を取り出して分析に使う。
+    """
+    if not DATABASE_URL:
+        return []
+    rows = db_fetchall(
+        """
+        SELECT role, content
+        FROM messages
+        WHERE shop_id=%s AND conv_key=%s AND role IN ('user','assistant')
+        ORDER BY created_at DESC
+        LIMIT %s
+        """,
+        (shop_id, conv_key, max(1, min(30, int(limit)))),
+    )
+    # 最新→古い で取れるので逆順にして時系列に
+    rows = list(reversed(rows))
+    conv: List[Dict[str, str]] = []
+    for role, content in rows:
+        conv.append({"role": role, "content": (content or "")[:1200]})
+    return conv
+
+
+async def analyze_only(shop_id: str, conv_key: str, user_text: str) -> Tuple[int, float, str, List[str]]:
+    """
+    温度判定を会話履歴込みで行う（精度改善）
+    """
+    slots = extract_slots(user_text)
+
+    history_msgs = get_recent_conversation(shop_id, conv_key, ANALYZE_HISTORY_LIMIT)
+    # history_msgs に最新user_textがまだ入ってない可能性があるので最後に追記
+    if not history_msgs or history_msgs[-1].get("content") != user_text:
+        history_msgs.append({"role": "user", "content": user_text})
+
+    # 分析用メッセージ
+    analysis_messages: List[Dict[str, str]] = [{"role": "system", "content": SYSTEM_PROMPT_ANALYZE}]
+    if slots:
+        analysis_messages.append({"role": "user", "content": f"抽出スロット(参考): {json.dumps(slots, ensure_ascii=False)}"})
+    analysis_messages.extend(history_msgs[-max(2, ANALYZE_HISTORY_LIMIT):])
 
     raw_level = 5
     conf = 0.5
@@ -449,7 +545,7 @@ async def analyze_only(user_text: str) -> Tuple[int, int, float, str, List[str]]
     reasons: List[str] = []
 
     try:
-        raw_json_text = await openai_chat(analysis_messages, temperature=0.0, timeout_sec=15.0)
+        raw_json_text = await openai_chat(analysis_messages, temperature=0.0, timeout_sec=18.0)
         raw = raw_json_text.strip()
         if raw.startswith("```"):
             parts = raw.split("```")
@@ -470,7 +566,7 @@ async def analyze_only(user_text: str) -> Tuple[int, int, float, str, List[str]]
     except Exception as e:
         print("[OPENAI] analyze_only failed:", repr(e))
 
-    return raw_level, raw_level, conf, next_goal, reasons
+    return raw_level, conf, next_goal, reasons
 
 
 async def generate_reply_only(user_id: str, user_text: str) -> str:
@@ -480,7 +576,7 @@ async def generate_reply_only(user_id: str, user_text: str) -> str:
         context_msgs.append({"role": role, "content": content})
     context_msgs.append({"role": "user", "content": user_text})
 
-    reply_text = await openai_chat(context_msgs, temperature=0.4, timeout_sec=FAST_REPLY_TIMEOUT_SEC)
+    reply_text = await openai_chat(context_msgs, temperature=0.35, timeout_sec=FAST_REPLY_TIMEOUT_SEC)
     reply_text = (reply_text or "").strip()
     if not reply_text:
         reply_text = "ありがとうございます。条件をもう少し教えてください（エリア/家賃/間取り/入居時期など）。"
@@ -490,22 +586,14 @@ async def generate_reply_only(user_id: str, user_text: str) -> str:
     return reply_text
 
 
-async def analyze_and_generate_reply(user_text: str, user_id: str, conv_key: str) -> Tuple[int, int, float, str, List[str], str]:
-    raw_level, _, conf, next_goal, reasons = await analyze_only(user_text)
-
-    # stable median (last 3)
+def stable_from_history(conv_key: str, raw_level: int) -> int:
+    """
+    安定化：直近5件の中央値（ブレを抑える）
+    """
     hist = TEMP_HISTORY[conv_key]
     hist.append(raw_level)
-    sorted_hist = sorted(hist)
-    stable_level = sorted_hist[len(sorted_hist) // 2]
-
-    try:
-        reply_text = await generate_reply_only(user_id, user_text)
-    except Exception as e:
-        print("[OPENAI] reply failed:", repr(e))
-        reply_text = "ありがとうございます。条件をもう少し教えてください（エリア/家賃/間取り/入居時期など）。"
-
-    return raw_level, stable_level, conf, next_goal, reasons, reply_text
+    s = sorted(hist)
+    return s[len(s) // 2]
 
 
 # ============================================================
@@ -653,8 +741,6 @@ def build_followup_template(next_goal: str, last_user_text: str, level: int) -> 
         q = "希望エリア（沿線/駅）はどのあたりが良いですか？"
     elif "内見" in goal or "候補日" in goal:
         q = "もしご都合よければ、今週 or 来週で空いている時間帯はありますか？"
-    elif "申込" in goal:
-        q = "ご不安点があれば先に解消できます。気になる点はありますか？"
     else:
         q = "条件を少し整理したいので、希望があれば教えてください。"
 
@@ -731,7 +817,6 @@ def get_followup_candidates() -> List[Dict[str, Any]]:
         last_followup_at = r[8]
         if last_followup_at and last_followup_at > since:
             continue
-
         candidates.append(
             {
                 "shop_id": r[0],
@@ -745,7 +830,6 @@ def get_followup_candidates() -> List[Dict[str, Any]]:
                 "last_followup_at": last_followup_at.isoformat() if last_followup_at else None,
             }
         )
-
     return candidates
 
 
@@ -769,14 +853,23 @@ async def healthz():
 
 async def process_ai_and_push_full(shop_id: str, user_id: str, conv_key: str, user_text: str) -> None:
     """
-    Used when fast-reply failed: do full AI and push the result.
+    Used when fast-reply failed: do full analyze + push.
     """
     try:
-        raw_level, stable_level, conf, next_goal, reasons, ai_reply = await analyze_and_generate_reply(
-            user_text=user_text,
-            user_id=user_id,
-            conv_key=conv_key,
-        )
+        raw_level, conf, next_goal, reasons = await analyze_only(shop_id, conv_key, user_text)
+        stable_level = stable_from_history(conv_key, raw_level)
+
+        # reply generation (normal timeout)
+        try:
+            reply_text = await openai_chat(
+                [{"role": "system", "content": SYSTEM_PROMPT_ASSISTANT}, {"role": "user", "content": user_text}],
+                temperature=0.35,
+                timeout_sec=20.0,
+            )
+            reply_text = (reply_text or "").strip() or "ありがとうございます。条件をもう少し教えてください（エリア/家賃/間取り/入居時期など）。"
+        except Exception as e:
+            print("[OPENAI] reply (bg) failed:", repr(e))
+            reply_text = "ありがとうございます。条件をもう少し教えてください（エリア/家賃/間取り/入居時期など）。"
 
         try:
             upsert_customer(shop_id, conv_key, user_id, user_text, raw_level, stable_level, conf, next_goal)
@@ -785,14 +878,8 @@ async def process_ai_and_push_full(shop_id: str, user_id: str, conv_key: str, us
 
         try:
             save_message(
-                shop_id,
-                conv_key,
-                "assistant",
-                ai_reply,
-                temp_level_raw=raw_level,
-                temp_level_stable=stable_level,
-                confidence=conf,
-                next_goal=next_goal,
+                shop_id, conv_key, "assistant", reply_text,
+                temp_level_raw=raw_level, temp_level_stable=stable_level, confidence=conf, next_goal=next_goal
             )
         except Exception as db_e2:
             print("[DB] save assistant message failed:", repr(db_e2))
@@ -800,7 +887,7 @@ async def process_ai_and_push_full(shop_id: str, user_id: str, conv_key: str, us
         if reasons:
             print(f"[TEMP] {conv_key} raw={raw_level} stable={stable_level} conf={conf:.2f} goal={next_goal} reasons={reasons}")
 
-        await push_message(user_id, ai_reply)
+        await push_message(user_id, reply_text)
 
     except Exception as e:
         print("[BG] process_ai_and_push_full exception:", repr(e))
@@ -811,13 +898,8 @@ async def process_analysis_only_store(shop_id: str, user_id: str, conv_key: str,
     Used when fast-reply succeeded: store scoring + same reply text, NO push.
     """
     try:
-        raw_level, _, conf, next_goal, reasons = await analyze_only(user_text)
-
-        # stable median (last 3)
-        hist = TEMP_HISTORY[conv_key]
-        hist.append(raw_level)
-        sorted_hist = sorted(hist)
-        stable_level = sorted_hist[len(sorted_hist) // 2]
+        raw_level, conf, next_goal, reasons = await analyze_only(shop_id, conv_key, user_text)
+        stable_level = stable_from_history(conv_key, raw_level)
 
         try:
             upsert_customer(shop_id, conv_key, user_id, user_text, raw_level, stable_level, conf, next_goal)
@@ -826,14 +908,8 @@ async def process_analysis_only_store(shop_id: str, user_id: str, conv_key: str,
 
         try:
             save_message(
-                shop_id,
-                conv_key,
-                "assistant",
-                reply_text,
-                temp_level_raw=raw_level,
-                temp_level_stable=stable_level,
-                confidence=conf,
-                next_goal=next_goal,
+                shop_id, conv_key, "assistant", reply_text,
+                temp_level_raw=raw_level, temp_level_stable=stable_level, confidence=conf, next_goal=next_goal
             )
         except Exception as db_e2:
             print("[DB] save assistant message failed:", repr(db_e2))
@@ -887,7 +963,7 @@ async def line_webhook(
         except Exception as e:
             print("[DB] save user message failed:", repr(e))
 
-        # ★Try FAST AI reply (no "確認中"). If it fails/slow, fallback message is used.
+        # Try FAST AI reply. If it fails/slow, fallback message is used.
         fast_reply_text: Optional[str] = None
         try:
             fast_reply_text = await asyncio.wait_for(
@@ -899,14 +975,10 @@ async def line_webhook(
             fast_reply_text = None
 
         if fast_reply_text:
-            # AI is working -> reply directly, no "確認中"
             await reply_message(reply_token, fast_reply_text)
-            # Store scoring in background (no push)
             background.add_task(process_analysis_only_store, SHOP_ID, user_id, conv_key, user_text, fast_reply_text)
         else:
-            # AI not working/slow -> show fallback ONLY then
             await reply_message(reply_token, "ありがとうございます！内容を確認しています。少々お待ちください😊")
-            # Full AI in background + push
             background.add_task(process_ai_and_push_full, SHOP_ID, user_id, conv_key, user_text)
 
     return {"ok": True}
@@ -953,7 +1025,6 @@ async def api_hot(
             for r in rows
         ])
 
-    # events view: user/assistant both, scoring stored on assistant rows
     rows = db_fetchall(
         """
         SELECT
