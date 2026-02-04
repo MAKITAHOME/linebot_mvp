@@ -27,6 +27,11 @@
 #   FOLLOWUP_JST_FROM=10
 #   FOLLOWUP_JST_TO=20
 #   FOLLOWUP_USE_OPENAI=0   (optional)
+#
+# B(2) "完全版"対応:
+# - messages に temp_level/confidence/next_goal を追加し、assistant返信の行に保存
+# - events view で user/assistant 両方を表示（assistant行だけ温度/確度/次ゴールが入る）
+# - dashboard も「種別(user/assistant)」列を追加
 
 import os
 import json
@@ -85,7 +90,7 @@ TEMP_HISTORY: Dict[str, deque] = defaultdict(lambda: deque(maxlen=3))
 
 JST = timezone(timedelta(hours=9))
 
-app = FastAPI(title="linebot_mvp", version="0.3.1")
+app = FastAPI(title="linebot_mvp", version="0.4.0")
 
 
 # ============================================================
@@ -208,7 +213,6 @@ def _connect_db_with_fallback():
 def ensure_tables_and_columns() -> None:
     """
     Create tables (if missing) and add columns (if missing).
-    This avoids 'column does not exist' in older DB schemas.
     """
     if not DATABASE_URL:
         return
@@ -249,6 +253,12 @@ def ensure_tables_and_columns() -> None:
         );
         """
     )
+
+    # ★B(2) 完全版：assistant返信に判定を保存する列
+    cur.execute("""ALTER TABLE messages ADD COLUMN IF NOT EXISTS temp_level_raw INT;""")
+    cur.execute("""ALTER TABLE messages ADD COLUMN IF NOT EXISTS temp_level_stable INT;""")
+    cur.execute("""ALTER TABLE messages ADD COLUMN IF NOT EXISTS confidence REAL;""")
+    cur.execute("""ALTER TABLE messages ADD COLUMN IF NOT EXISTS next_goal TEXT;""")
 
     # job locks
     cur.execute(
@@ -549,15 +559,33 @@ async def analyze_and_generate_reply(user_text: str, user_id: str, conv_key: str
 # DB helpers
 # ============================================================
 
-def save_message(shop_id: str, conv_key: str, role: str, content: str) -> None:
+def save_message(
+    shop_id: str,
+    conv_key: str,
+    role: str,
+    content: str,
+    temp_level_raw: Optional[int] = None,
+    temp_level_stable: Optional[int] = None,
+    confidence: Optional[float] = None,
+    next_goal: Optional[str] = None,
+) -> None:
     if not DATABASE_URL:
         return
     db_execute(
         """
-        INSERT INTO messages (shop_id, conv_key, role, content)
-        VALUES (%s, %s, %s, %s)
+        INSERT INTO messages (shop_id, conv_key, role, content, temp_level_raw, temp_level_stable, confidence, next_goal)
+        VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
         """,
-        (shop_id, conv_key, role, content),
+        (
+            shop_id,
+            conv_key,
+            role,
+            content,
+            temp_level_raw,
+            temp_level_stable,
+            confidence,
+            (next_goal[:120] if next_goal else None),
+        ),
     )
 
 
@@ -631,13 +659,10 @@ def is_within_jst_window(dt: Optional[datetime] = None) -> bool:
     start = max(0, min(23, int(FOLLOWUP_JST_FROM)))
     end = max(0, min(23, int(FOLLOWUP_JST_TO)))
 
-    # start < end: 10-20 など
     if start < end:
         return start <= h < end
-    # start > end: 22-6 など（深夜跨ぎ）
     if start > end:
         return (h >= start) or (h < end)
-    # start == end: 送らない
     return False
 
 
@@ -803,6 +828,7 @@ async def process_ai_and_push(shop_id: str, user_id: str, conv_key: str, user_te
             conv_key=conv_key,
         )
 
+        # customers（最新状態）更新
         try:
             upsert_customer(
                 shop_id=shop_id,
@@ -817,8 +843,18 @@ async def process_ai_and_push(shop_id: str, user_id: str, conv_key: str, user_te
         except Exception as db_e:
             print("[DB] upsert_customer failed:", repr(db_e))
 
+        # ★assistantメッセージに判定値を保存（履歴分析用）
         try:
-            save_message(shop_id, conv_key, "assistant", ai_reply)
+            save_message(
+                shop_id,
+                conv_key,
+                "assistant",
+                ai_reply,
+                temp_level_raw=raw_level,
+                temp_level_stable=stable_level,
+                confidence=conf,
+                next_goal=next_goal,
+            )
         except Exception as db_e2:
             print("[DB] save assistant message failed:", repr(db_e2))
 
@@ -865,6 +901,7 @@ async def line_webhook(
 
         conv_key = f"user:{user_id}"
 
+        # userメッセージ保存（判定値はまだ無い）
         try:
             save_message(SHOP_ID, conv_key, "user", user_text)
         except Exception as e:
@@ -904,33 +941,35 @@ async def api_hot(
         )
         return JSONResponse([
             {
+                "view": "customers",
+                "role": "state",
                 "conv_key": r[0],
                 "user_id": r[1],
-                "last_user_text": r[2],
+                "message": r[2],  # 表示上は直近メッセージ
                 "temp_level_stable": r[3],
                 "confidence": float(r[4]) if r[4] is not None else None,
                 "next_goal": r[5],
-                "updated_at": r[6].isoformat() if r[6] else None,
+                "ts": r[6].isoformat() if r[6] else None,
             }
             for r in rows
         ])
 
-    # events view（履歴）
+    # events view（履歴）：user/assistant 両方
     rows = db_fetchall(
         """
         SELECT
-          c.conv_key,
+          m.role,
           c.user_id,
           m.content,
           m.created_at,
-          NULL AS temp_level_stable,
-          NULL AS confidence,
-          NULL AS next_goal
-        FROM customers c
-        LEFT JOIN messages m
-          ON c.conv_key = m.conv_key AND m.role = 'user'
-        WHERE c.shop_id = %s
-        ORDER BY m.created_at DESC NULLS LAST
+          m.temp_level_stable,
+          m.confidence,
+          m.next_goal
+        FROM messages m
+        LEFT JOIN customers c
+          ON c.shop_id = m.shop_id AND c.conv_key = m.conv_key
+        WHERE m.shop_id = %s
+        ORDER BY m.created_at DESC
         LIMIT %s
         """,
         (shop_id, limit),
@@ -938,10 +977,11 @@ async def api_hot(
 
     return JSONResponse([
         {
-            "conv_key": r[0],
+            "view": "events",
+            "role": r[0],
             "user_id": r[1],
-            "last_user_text": r[2],
-            "message_created_at": r[3].isoformat() if r[3] else None,
+            "message": r[2],
+            "ts": r[3].isoformat() if r[3] else None,
             "temp_level_stable": r[4],
             "confidence": float(r[5]) if r[5] is not None else None,
             "next_goal": r[6],
@@ -996,7 +1036,7 @@ async def dashboard(
     padding: 16px;
     color: #111;
   }}
-  .wrap {{ max-width: 1100px; margin: 0 auto; }}
+  .wrap {{ max-width: 1180px; margin: 0 auto; }}
   .card {{
     background: #fff;
     border-radius: 14px;
@@ -1015,7 +1055,7 @@ async def dashboard(
   .meta {{ font-size: 12px; color: #555; }}
   .filters {{
     display: grid;
-    grid-template-columns: 1fr 160px 120px 120px 140px;
+    grid-template-columns: 1fr 170px 120px 120px 140px;
     gap: 10px;
     align-items: end;
   }}
@@ -1052,9 +1092,26 @@ async def dashboard(
     font-weight: 700;
     white-space: nowrap;
   }}
+  .badge {{
+    display: inline-flex;
+    align-items: center;
+    padding: 3px 10px;
+    border-radius: 999px;
+    font-size: 12px;
+    font-weight: 700;
+    white-space: nowrap;
+    border: 1px solid #e6e6e6;
+    background: #f7f7f7;
+    color: #333;
+  }}
+  .badge.assistant {{
+    background: #111;
+    color: #fff;
+    border-color: #111;
+  }}
   .mono {{ font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas; font-size: 12px; }}
   .muted {{ color: #777; font-size: 12px; }}
-  .rowmsg {{ max-width: 520px; word-break: break-word; }}
+  .rowmsg {{ max-width: 620px; word-break: break-word; white-space: pre-wrap; }}
   .link {{ color: #0b57d0; text-decoration: none; }}
   .link:hover {{ text-decoration: underline; }}
   .search {{ display:flex; gap:10px; align-items: center; margin-top: 10px; }}
@@ -1089,7 +1146,7 @@ async def dashboard(
         <label>view</label>
         <select id="viewSelect">
           <option value="customers" {"selected" if view=="customers" else ""}>customers（最新状態）</option>
-          <option value="events" {"selected" if view=="events" else ""}>events（履歴）</option>
+          <option value="events" {"selected" if view=="events" else ""}>events（履歴：user/assistant）</option>
         </select>
       </div>
       <div>
@@ -1108,7 +1165,7 @@ async def dashboard(
 
     <div class="search">
       <div style="flex:1">
-        <label>検索（自動） user_id / next_goal / 直近メッセージ</label>
+        <label>検索（自動） user_id / next_goal / message</label>
         <input id="searchBox" placeholder="例: 渋谷 / 3LDK / 内見 / Uxxxxxxxx" />
         <div class="hint">入力すると即フィルタ（サーバー再読込なし）</div>
       </div>
@@ -1124,15 +1181,16 @@ async def dashboard(
       <thead>
         <tr>
           <th>更新</th>
+          <th>種別</th>
           <th>温度</th>
           <th>確度</th>
           <th>次のゴール</th>
           <th class="mono">user_id</th>
-          <th>直近メッセージ</th>
+          <th>メッセージ</th>
         </tr>
       </thead>
       <tbody id="tbody">
-        <tr><td colspan="6" class="muted">Loading...</td></tr>
+        <tr><td colspan="7" class="muted">Loading...</td></tr>
       </tbody>
     </table>
   </div>
@@ -1157,6 +1215,13 @@ async def dashboard(
     return `<span class="pill" style="background:${{c}}">Lv${{level}}</span>`;
   }}
 
+  function badge(role) {{
+    const r = (role || "").toLowerCase();
+    if (r === "assistant") return `<span class="badge assistant">assistant</span>`;
+    if (r === "user") return `<span class="badge">user</span>`;
+    return `<span class="badge">${{escapeHtml(role || "-")}}</span>`;
+  }}
+
   function escapeHtml(s) {{
     return (s || "").replace(/[&<>"]/g, c => ({{"&":"&amp;","<":"&lt;",">":"&gt;","\\"":"&quot;"}}[c]));
   }}
@@ -1166,7 +1231,7 @@ async def dashboard(
   function matchesSearch(row, q) {{
     if (!q) return true;
     q = q.toLowerCase();
-    const fields = [row.user_id, row.next_goal, row.last_user_text].map(x => (x || "").toLowerCase());
+    const fields = [row.user_id, row.next_goal, row.message, row.role].map(x => (x || "").toLowerCase());
     return fields.some(f => f.includes(q));
   }}
 
@@ -1177,26 +1242,25 @@ async def dashboard(
 
     const tbody = document.getElementById("tbody");
     if (!rows.length) {{
-      tbody.innerHTML = `<tr><td colspan="6" class="muted">No data</td></tr>`;
+      tbody.innerHTML = `<tr><td colspan="7" class="muted">No data</td></tr>`;
       return;
     }}
 
     tbody.innerHTML = rows.map(r => {{
-      const updated = r.message_created_at || r.updated_at;
-
-      // ★ここが今回の修正ポイント（NULLを 0 にしない）
+      const ts = r.ts;
       const levelHtml = (r.temp_level_stable == null) ? "-" : pill(r.temp_level_stable);
       const confHtml  = (r.confidence == null) ? "-" : (Number(r.confidence).toFixed(2));
       const goalHtml  = (r.next_goal == null || r.next_goal === "") ? "-" : escapeHtml(r.next_goal);
-
+      const msgHtml   = escapeHtml(r.message || "");
       return `
         <tr>
-          <td class="mono">${{escapeHtml(fmtTime(updated))}}</td>
+          <td class="mono">${{escapeHtml(fmtTime(ts))}}</td>
+          <td>${{badge(r.role)}}</td>
           <td>${{levelHtml}}</td>
           <td class="mono">${{confHtml}}</td>
           <td>${{goalHtml}}</td>
           <td class="mono">${{escapeHtml(r.user_id || "")}}</td>
-          <td class="rowmsg">${{escapeHtml(r.last_user_text || "")}}</td>
+          <td class="rowmsg">${{msgHtml}}</td>
         </tr>
       `;
     }}).join("");
@@ -1247,7 +1311,7 @@ async def dashboard(
 
   fetchData().then(setupAutoRefresh).catch(e => {{
     console.error(e);
-    document.getElementById("tbody").innerHTML = `<tr><td colspan="6" class="muted">Error loading</td></tr>`;
+    document.getElementById("tbody").innerHTML = `<tr><td colspan="7" class="muted">Error loading</td></tr>`;
   }});
 </script>
 
