@@ -33,6 +33,12 @@
 #   FOLLOWUP_JST_FROM=10
 #   FOLLOWUP_JST_TO=20
 #   FOLLOWUP_USE_OPENAI=0
+#
+# AB Test + Schedule Proposal (added):
+#   FOLLOWUP_AB_ENABLED=1                # default 1
+#   VISIT_DAYS_AHEAD=3                   # default 3
+#   VISIT_SLOT_HOURS=11,14,17            # default "11,14,17"
+#   FOLLOWUP_ATTRIBUTION_WINDOW_HOURS=72 # default 72 (追客→返信の紐付け)
 
 import os
 import json
@@ -86,12 +92,17 @@ FOLLOWUP_JST_FROM = int(os.getenv("FOLLOWUP_JST_FROM", "10"))
 FOLLOWUP_JST_TO = int(os.getenv("FOLLOWUP_JST_TO", "20"))
 FOLLOWUP_USE_OPENAI = os.getenv("FOLLOWUP_USE_OPENAI", "0").strip() == "1"
 
+FOLLOWUP_AB_ENABLED = os.getenv("FOLLOWUP_AB_ENABLED", "1").strip() == "1"
+VISIT_DAYS_AHEAD = int(os.getenv("VISIT_DAYS_AHEAD", "3"))
+VISIT_SLOT_HOURS = os.getenv("VISIT_SLOT_HOURS", "11,14,17").strip()
+FOLLOWUP_ATTRIBUTION_WINDOW_HOURS = int(os.getenv("FOLLOWUP_ATTRIBUTION_WINDOW_HOURS", "72"))
+
 CHAT_HISTORY: Dict[str, deque] = defaultdict(lambda: deque(maxlen=40))
 TEMP_HISTORY: Dict[str, deque] = defaultdict(lambda: deque(maxlen=5))
 
 JST = timezone(timedelta(hours=9))
 
-app = FastAPI(title="linebot_mvp", version="0.5.0")
+app = FastAPI(title="linebot_mvp", version="0.6.0")
 
 
 # ============================================================
@@ -109,7 +120,6 @@ CANCEL_PATTERNS = [
     r"検討(やめます|しません)|やめときます",
 ]
 
-# opt-out（今後連絡しない）判定：より強い
 OPTOUT_PATTERNS = [
     r"連絡(不要|いらない)|もう連絡(しないで|いりません)",
     r"配信停止|停止して|ブロックする",
@@ -127,23 +137,17 @@ def require_dashboard_key(
 ) -> None:
     expected = (DASHBOARD_KEY or "").strip()
     if not expected:
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="DASHBOARD_KEY is not configured",
-        )
+        raise HTTPException(status_code=500, detail="DASHBOARD_KEY is not configured")
     provided = (x_dashboard_key or key or "").strip()
     if not provided or not secrets.compare_digest(provided, expected):
-        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Unauthorized")
+        raise HTTPException(status_code=401, detail="Unauthorized")
 
 
 def require_admin_key(x_admin_key: Optional[str] = Header(default=None, alias="x-admin-key")) -> None:
     if not ADMIN_API_KEY:
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="ADMIN_API_KEY is not configured",
-        )
+        raise HTTPException(status_code=500, detail="ADMIN_API_KEY is not configured")
     if not x_admin_key or not secrets.compare_digest(x_admin_key.strip(), ADMIN_API_KEY):
-        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Unauthorized")
+        raise HTTPException(status_code=401, detail="Unauthorized")
 
 
 # ============================================================
@@ -178,14 +182,7 @@ def parse_database_url(url: str) -> Dict[str, Any]:
         host = host_port
         port = 5432
 
-    return {
-        "user": user,
-        "password": password,
-        "host": host,
-        "port": port,
-        "database": database,
-        "params": params,
-    }
+    return {"user": user, "password": password, "host": host, "port": port, "database": database, "params": params}
 
 
 def create_db_ssl_context(verify: bool = True) -> ssl.SSLContext:
@@ -266,7 +263,6 @@ def ensure_tables_and_columns() -> None:
     cur.execute("""ALTER TABLE customers ADD COLUMN IF NOT EXISTS temp_level_stable INT;""")
     cur.execute("""ALTER TABLE customers ADD COLUMN IF NOT EXISTS confidence REAL;""")
     cur.execute("""ALTER TABLE customers ADD COLUMN IF NOT EXISTS next_goal TEXT;""")
-    # ★opt-out
     cur.execute("""ALTER TABLE customers ADD COLUMN IF NOT EXISTS opt_out BOOLEAN;""")
     cur.execute("""ALTER TABLE customers ADD COLUMN IF NOT EXISTS opt_out_at TIMESTAMPTZ;""")
 
@@ -277,7 +273,7 @@ def ensure_tables_and_columns() -> None:
           id BIGSERIAL PRIMARY KEY,
           shop_id TEXT NOT NULL,
           conv_key TEXT NOT NULL,
-          role TEXT NOT NULL,          -- user|assistant|system
+          role TEXT NOT NULL,
           content TEXT NOT NULL,
           created_at TIMESTAMPTZ DEFAULT now()
         );
@@ -288,7 +284,7 @@ def ensure_tables_and_columns() -> None:
     cur.execute("""ALTER TABLE messages ADD COLUMN IF NOT EXISTS confidence REAL;""")
     cur.execute("""ALTER TABLE messages ADD COLUMN IF NOT EXISTS next_goal TEXT;""")
 
-    # job locks
+    # locks
     cur.execute(
         """
         CREATE TABLE IF NOT EXISTS job_locks (
@@ -298,7 +294,7 @@ def ensure_tables_and_columns() -> None:
         """
     )
 
-    # followup logs
+    # followup logs (AB + attribution)
     cur.execute(
         """
         CREATE TABLE IF NOT EXISTS followup_logs (
@@ -314,11 +310,14 @@ def ensure_tables_and_columns() -> None:
         );
         """
     )
+    cur.execute("""ALTER TABLE followup_logs ADD COLUMN IF NOT EXISTS variant TEXT;""")       # A/B
+    cur.execute("""ALTER TABLE followup_logs ADD COLUMN IF NOT EXISTS responded_at TIMESTAMPTZ;""")  # 返信計測
 
-    # Indexes
+    # indexes
     cur.execute("""CREATE INDEX IF NOT EXISTS idx_customers_shop_updated ON customers(shop_id, updated_at DESC);""")
     cur.execute("""CREATE INDEX IF NOT EXISTS idx_messages_conv_created ON messages(conv_key, created_at DESC);""")
     cur.execute("""CREATE INDEX IF NOT EXISTS idx_followup_shop_conv_created ON followup_logs(shop_id, conv_key, created_at DESC);""")
+    cur.execute("""CREATE INDEX IF NOT EXISTS idx_followup_variant_created ON followup_logs(variant, created_at DESC);""")
 
     cur.close()
     conn.close()
@@ -349,11 +348,9 @@ def verify_signature(body: bytes, signature: str) -> bool:
 async def reply_message(reply_token: str, text: str) -> None:
     if not LINE_CHANNEL_ACCESS_TOKEN or not reply_token:
         return
-
     url = "https://api.line.me/v2/bot/message/reply"
     headers = {"Authorization": f"Bearer {LINE_CHANNEL_ACCESS_TOKEN}", "Content-Type": "application/json"}
     payload = {"replyToken": reply_token, "messages": [{"type": "text", "text": (text or "")[:4900]}]}
-
     try:
         async with httpx.AsyncClient(timeout=10, verify=certifi.where()) as client:
             r = await client.post(url, headers=headers, json=payload)
@@ -368,11 +365,9 @@ async def push_message(user_id: str, text: str) -> None:
         return
     if not user_id or user_id == "unknown":
         return
-
     url = "https://api.line.me/v2/bot/message/push"
     headers = {"Authorization": f"Bearer {LINE_CHANNEL_ACCESS_TOKEN}", "Content-Type": "application/json"}
     payload = {"to": user_id, "messages": [{"type": "text", "text": (text or "")[:4900]}]}
-
     try:
         async with httpx.AsyncClient(timeout=10, verify=certifi.where()) as client:
             r = await client.post(url, headers=headers, json=payload)
@@ -417,18 +412,6 @@ Lv1 : 明確に不要、拒否、ブロック示唆
 - 入居時期が半年以上先なら最大でも Lv6
 - 条件が全く出ていない場合は最大でも Lv5
 - 返信が短い/曖昧な場合はLvを上げすぎない
-
-【confidence】
-- 根拠が2つ以上揃う → 0.70〜0.90
-- 情報不足/どちらとも取れる → 0.40〜0.65
-- ほぼ推測 → 0.30〜0.45
-
-【next_goal】
-次に営業が達成すべき「1ステップ」を短く。
-例：予算確認 / 入居時期確認 / 希望エリア確認 / 内見候補日提示 / 申込意思確認
-
-【reasons】
-短い根拠を最大3つ
 """
 
 SYSTEM_PROMPT_ASSISTANT = """
@@ -450,10 +433,8 @@ SYSTEM_PROMPT_FOLLOWUP = """
 async def openai_chat(messages: List[Dict[str, str]], temperature: float = 0.2, timeout_sec: float = 25.0) -> str:
     if not OPENAI_API_KEY:
         raise RuntimeError("OPENAI_API_KEY is missing")
-
     headers = {"Authorization": f"Bearer {OPENAI_API_KEY}", "Content-Type": "application/json"}
     payload = {"model": "gpt-4o-mini", "messages": messages, "temperature": temperature}
-
     async with httpx.AsyncClient(timeout=timeout_sec, verify=certifi.where()) as client:
         r = await client.post(OPENAI_API_URL, headers=headers, json=payload)
         r.raise_for_status()
@@ -495,28 +476,20 @@ def coerce_confidence(v: Any) -> float:
 def extract_slots(text: str) -> Dict[str, str]:
     t = text or ""
     slots: Dict[str, str] = {}
-
     m = re.search(r"(\d{1,3})(?:\.(\d))?\s*(?:万円|万)", t)
     if m:
         slots["budget"] = m.group(0)
-
     m = re.search(r"(\d)\s*(?:LDK|DK|K)|ワンルーム|1R", t, re.IGNORECASE)
     if m:
         slots["layout"] = m.group(0)
-
-    for kw in ["今月", "来月", "再来月", "すぐ", "早め", "急ぎ", "春", "夏", "秋", "冬"]:
+    for kw in ["今月", "来月", "再来月", "すぐ", "早め", "急ぎ"]:
         if kw in t:
             slots["move_in"] = kw
             break
-    m = re.search(r"(\d{1,2})\s*月", t)
-    if m:
-        slots.setdefault("move_in", m.group(0))
-
-    for kw in ["渋谷", "新宿", "品川", "池袋", "目黒", "中目黒", "恵比寿", "吉祥寺", "横浜", "川崎", "浦和"]:
+    for kw in ["渋谷", "新宿", "品川", "池袋", "目黒", "中目黒", "恵比寿", "吉祥寺", "横浜"]:
         if kw in t:
             slots["area"] = kw
             break
-
     return slots
 
 
@@ -565,16 +538,7 @@ def save_message(
         INSERT INTO messages (shop_id, conv_key, role, content, temp_level_raw, temp_level_stable, confidence, next_goal)
         VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
         """,
-        (
-            shop_id,
-            conv_key,
-            role,
-            content,
-            temp_level_raw,
-            temp_level_stable,
-            confidence,
-            (next_goal[:120] if next_goal else None),
-        ),
+        (shop_id, conv_key, role, content, temp_level_raw, temp_level_stable, confidence, (next_goal[:120] if next_goal else None)),
     )
 
 
@@ -624,6 +588,13 @@ def mark_opt_out(shop_id: str, conv_key: str, user_id: str) -> None:
     )
 
 
+def is_opted_out(shop_id: str, conv_key: str) -> bool:
+    if not DATABASE_URL:
+        return False
+    rows = db_fetchall("SELECT COALESCE(opt_out, FALSE) FROM customers WHERE shop_id=%s AND conv_key=%s", (shop_id, conv_key))
+    return bool(rows[0][0]) if rows else False
+
+
 def save_followup_log(
     shop_id: str,
     conv_key: str,
@@ -632,28 +603,45 @@ def save_followup_log(
     mode: str,
     status: str,
     error: Optional[str] = None,
+    variant: Optional[str] = None,
 ) -> None:
     if not DATABASE_URL:
         return
     db_execute(
         """
-        INSERT INTO followup_logs (shop_id, conv_key, user_id, message, mode, status, error)
-        VALUES (%s, %s, %s, %s, %s, %s, %s)
+        INSERT INTO followup_logs (shop_id, conv_key, user_id, message, mode, status, error, variant)
+        VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
         """,
-        (shop_id, conv_key, user_id, message, mode, status, (error or None)),
+        (shop_id, conv_key, user_id, message, mode, status, (error or None), (variant or None)),
     )
 
 
-def is_opted_out(shop_id: str, conv_key: str) -> bool:
+def attribute_followup_response(shop_id: str, conv_key: str) -> None:
+    """
+    ユーザー返信が来た時、直近の追客(sent)に responded_at を付ける
+    """
     if not DATABASE_URL:
-        return False
+        return
+    window_since = datetime.now(timezone.utc) - timedelta(hours=FOLLOWUP_ATTRIBUTION_WINDOW_HOURS)
+
+    # 直近 sent で responded_at が空のものを1件
     rows = db_fetchall(
-        "SELECT COALESCE(opt_out, FALSE) FROM customers WHERE shop_id=%s AND conv_key=%s",
-        (shop_id, conv_key),
+        """
+        SELECT id
+        FROM followup_logs
+        WHERE shop_id=%s AND conv_key=%s
+          AND status='sent'
+          AND responded_at IS NULL
+          AND created_at >= %s
+        ORDER BY created_at DESC
+        LIMIT 1
+        """,
+        (shop_id, conv_key, window_since),
     )
     if not rows:
-        return False
-    return bool(rows[0][0])
+        return
+    fid = rows[0][0]
+    db_execute("UPDATE followup_logs SET responded_at=now() WHERE id=%s", (fid,))
 
 
 # ============================================================
@@ -663,22 +651,21 @@ def is_opted_out(shop_id: str, conv_key: str) -> bool:
 async def analyze_only(shop_id: str, conv_key: str, user_text: str) -> Tuple[int, float, str, List[str]]:
     t = (user_text or "").strip()
 
-    # opt-out 語が来たら即 opt_out（温度も低く）
+    # opt-out
     for pat in OPTOUT_PATTERNS:
         if re.search(pat, t, flags=re.IGNORECASE):
             return 1, 0.95, "関係終了確認", ["配信停止/連絡不要の意思"]
 
-    # キャンセル/拒否は強制低温度
+    # cancel
     for pat in CANCEL_PATTERNS:
         if re.search(pat, t):
             return 2, 0.90, "関係終了確認", ["キャンセル/拒否の明確表現"]
 
-    # 短文は上がらない
+    # too short
     if len(t) <= SHORT_TEXT_MAX_LEN:
         return 3, 0.75, "要件確認", ["短文で情報不足"]
 
     slots = extract_slots(user_text)
-
     history_msgs = get_recent_conversation(shop_id, conv_key, ANALYZE_HISTORY_LIMIT)
     if not history_msgs or history_msgs[-1].get("content") != user_text:
         history_msgs.append({"role": "user", "content": user_text})
@@ -689,8 +676,8 @@ async def analyze_only(shop_id: str, conv_key: str, user_text: str) -> Tuple[int
     messages.extend(history_msgs[-max(2, ANALYZE_HISTORY_LIMIT):])
 
     raw_level = 5
-    conf = 0.5
-    next_goal = "情報収集を続ける"
+    conf = 0.6
+    next_goal = "要件確認"
     reasons: List[str] = []
 
     try:
@@ -708,7 +695,7 @@ async def analyze_only(shop_id: str, conv_key: str, user_text: str) -> Tuple[int
 
         raw_level = coerce_level(j.get("temp_level_raw", 5))
         conf = coerce_confidence(j.get("confidence", 0.6))
-        next_goal = str(j.get("next_goal", "情報収集を続ける")).strip()[:80]
+        next_goal = str(j.get("next_goal", "要件確認")).strip()[:80]
         rs = j.get("reasons", [])
         if isinstance(rs, list):
             reasons = [str(x).strip()[:60] for x in rs if str(x).strip()][:3]
@@ -736,7 +723,91 @@ async def generate_reply_only(user_id: str, user_text: str) -> str:
 
 
 # ============================================================
-# Followup helpers
+# AB Test + Visit slots (Feature 1 & 2)
+# ============================================================
+
+def pick_ab_variant(conv_key: str) -> str:
+    """
+    同一ユーザーは常に同じ variant（A/B）
+    """
+    if not FOLLOWUP_AB_ENABLED:
+        return "A"
+    h = hashlib.sha256(conv_key.encode("utf-8")).hexdigest()
+    return "A" if (int(h[:2], 16) % 2 == 0) else "B"
+
+
+def parse_slot_hours() -> List[int]:
+    out: List[int] = []
+    for part in (VISIT_SLOT_HOURS or "").split(","):
+        part = part.strip()
+        if not part:
+            continue
+        try:
+            h = int(part)
+            if 0 <= h <= 23:
+                out.append(h)
+        except Exception:
+            pass
+    return out or [11, 14, 17]
+
+
+def upcoming_visit_slots_jst(days_ahead: int = 3) -> List[str]:
+    """
+    例: ["明日 11:00-12:00", "明日 14:00-15:00", ...]
+    """
+    hours = parse_slot_hours()
+    now = datetime.now(JST)
+    slots: List[str] = []
+    for d in range(1, max(1, min(14, days_ahead)) + 1):
+        day = (now + timedelta(days=d))
+        label = "明日" if d == 1 else ("明後日" if d == 2 else f"{d}日後")
+        for h in hours:
+            # JST window outside? still propose; user can respond
+            slots.append(f"{label} {h:02d}:00-{(h+1)%24:02d}:00")
+    return slots[:6]  # 最大6枠
+
+
+def build_followup_template_ab(variant: str, next_goal: str, last_user_text: str, level: int) -> str:
+    goal = (next_goal or "").strip()
+    last = (last_user_text or "").strip()
+
+    # 内見/候補日系なら、候補枠を出す（Feature 2）
+    is_visit = any(k in goal for k in ["内見", "候補日", "日程"])
+    slot_lines = ""
+    if is_visit:
+        slots = upcoming_visit_slots_jst(VISIT_DAYS_AHEAD)
+        if slots:
+            slot_lines = "候補：\n" + "\n".join([f"・{s}" for s in slots]) + "\n"
+
+    if "予算" in goal:
+        q = "ご予算の上限だけ教えていただけますか？"
+    elif "入居" in goal or "時期" in goal:
+        q = "ご入居希望はいつ頃ですか？"
+    elif "エリア" in goal or "沿線" in goal:
+        q = "希望エリア（沿線/駅）はどのあたりが良いですか？"
+    elif is_visit:
+        q = "上の候補で合いそうな枠があれば、番号か時間を返信ください。"
+    else:
+        q = "条件を少し整理したいので、希望があれば教えてください。"
+
+    trimmed = ""
+    if last:
+        trimmed = last[:40] + ("…" if len(last) > 40 else "")
+
+    if variant == "A":
+        lead = "その後いかがでしょうか？"
+        body = f"{lead}\n{('（直近：'+trimmed+'）\\n') if trimmed else ''}{slot_lines}{q}\n必要なら候補をすぐまとめます😊"
+        return body.strip()
+
+    # variant B: “軽い提示→YES/NO”寄り（返信率上げる）
+    lead = "少しだけ確認です。"
+    yn = "①このまま探す ②一旦ストップ ③条件変更" if not is_visit else "①この枠でOK ②別日希望 ③一旦ストップ"
+    body = f"{lead}\n{slot_lines}{q}\n返信は「{yn}」のどれでもOKです。"
+    return body.strip()
+
+
+# ============================================================
+# Followup job
 # ============================================================
 
 def utcnow() -> datetime:
@@ -779,53 +850,6 @@ def acquire_job_lock(key: str, ttl_sec: int) -> bool:
         (key, until),
     )
     return True
-
-
-def build_followup_template(next_goal: str, last_user_text: str, level: int) -> str:
-    goal = (next_goal or "").strip()
-    last = (last_user_text or "").strip()
-
-    if "予算" in goal:
-        q = "ご予算の目安（上限）だけ教えていただけますか？"
-    elif "入居" in goal or "時期" in goal:
-        q = "ご入居希望の時期はいつ頃を想定されていますか？"
-    elif "エリア" in goal or "沿線" in goal:
-        q = "希望エリア（沿線/駅）はどのあたりが良いですか？"
-    elif "内見" in goal or "候補日" in goal:
-        q = "もしご都合よければ、今週 or 来週で空いている時間帯はありますか？"
-    else:
-        q = "条件を少し整理したいので、希望があれば教えてください。"
-
-    lead = "その後いかがでしょうか？" if level >= 8 else "以前の件、その後の状況だけ伺ってもいいですか？"
-    last_hint = ""
-    if last:
-        trimmed = last[:40] + ("…" if len(last) > 40 else "")
-        last_hint = f"（直近：{trimmed}）\n"
-
-    msg = f"{lead}\n{last_hint}{q}\n必要なら条件に合う候補をすぐまとめます😊"
-    return msg.strip()
-
-
-async def build_followup_message_openai(next_goal: str, last_user_text: str, level: int) -> str:
-    prompt = (
-        f"温度レベル: {level}\n"
-        f"next_goal: {next_goal}\n"
-        f"直近メッセージ: {last_user_text}\n"
-    )
-    msgs = [
-        {"role": "system", "content": SYSTEM_PROMPT_FOLLOWUP},
-        {"role": "user", "content": prompt},
-    ]
-    try:
-        out = await openai_chat(msgs, temperature=0.5, timeout_sec=15.0)
-        out = (out or "").strip()
-        if out.startswith("```"):
-            parts = out.split("```")
-            out = parts[1] if len(parts) > 1 else out
-        return out[:600].strip() or build_followup_template(next_goal, last_user_text, level)
-    except Exception as e:
-        print("[OPENAI] followup gen failed:", repr(e))
-        return build_followup_template(next_goal, last_user_text, level)
 
 
 def get_followup_candidates() -> List[Dict[str, Any]]:
@@ -885,7 +909,6 @@ def get_followup_candidates() -> List[Dict[str, Any]]:
                 "next_goal": r[5],
                 "updated_at": r[6].isoformat() if r[6] else None,
                 "last_user_text": r[7],
-                "last_followup_at": last_followup_at.isoformat() if last_followup_at else None,
             }
         )
 
@@ -901,23 +924,12 @@ async def process_analysis_only_store(shop_id: str, user_id: str, conv_key: str,
         raw_level, conf, next_goal, reasons = await analyze_only(shop_id, conv_key, user_text)
         stable_level = stable_from_history(conv_key, raw_level)
 
-        # opt-out 判定が返ったら、DBに反映
         if raw_level == 1 and any("配信停止" in r or "連絡不要" in r for r in reasons):
-            try:
-                mark_opt_out(shop_id, conv_key, user_id)
-            except Exception as e:
-                print("[DB] mark_opt_out failed:", repr(e))
+            mark_opt_out(shop_id, conv_key, user_id)
 
-        try:
-            upsert_customer(shop_id, conv_key, user_id, user_text, raw_level, stable_level, conf, next_goal)
-        except Exception as e:
-            print("[DB] upsert_customer failed:", repr(e))
-
-        try:
-            save_message(shop_id, conv_key, "assistant", reply_text,
-                         temp_level_raw=raw_level, temp_level_stable=stable_level, confidence=conf, next_goal=next_goal)
-        except Exception as e:
-            print("[DB] save assistant failed:", repr(e))
+        upsert_customer(shop_id, conv_key, user_id, user_text, raw_level, stable_level, conf, next_goal)
+        save_message(shop_id, conv_key, "assistant", reply_text,
+                     temp_level_raw=raw_level, temp_level_stable=stable_level, confidence=conf, next_goal=next_goal)
 
         if reasons:
             print(f"[TEMP] {conv_key} raw={raw_level} stable={stable_level} conf={conf:.2f} goal={next_goal} reasons={reasons}")
@@ -930,14 +942,9 @@ async def process_ai_and_push_full(shop_id: str, user_id: str, conv_key: str, us
         raw_level, conf, next_goal, reasons = await analyze_only(shop_id, conv_key, user_text)
         stable_level = stable_from_history(conv_key, raw_level)
 
-        # opt-out
         if raw_level == 1 and any("配信停止" in r or "連絡不要" in r for r in reasons):
-            try:
-                mark_opt_out(shop_id, conv_key, user_id)
-            except Exception as e:
-                print("[DB] mark_opt_out failed:", repr(e))
+            mark_opt_out(shop_id, conv_key, user_id)
 
-        # 通常返信（bg）
         try:
             reply_text = await openai_chat(
                 [{"role": "system", "content": SYSTEM_PROMPT_ASSISTANT}, {"role": "user", "content": user_text}],
@@ -945,25 +952,16 @@ async def process_ai_and_push_full(shop_id: str, user_id: str, conv_key: str, us
                 timeout_sec=20.0,
             )
             reply_text = (reply_text or "").strip() or "ありがとうございます。条件をもう少し教えてください（エリア/予算/間取り/入居時期など）。"
-        except Exception as e:
-            print("[OPENAI] reply(bg) failed:", repr(e))
+        except Exception:
             reply_text = "ありがとうございます。条件をもう少し教えてください（エリア/予算/間取り/入居時期など）。"
 
-        try:
-            upsert_customer(shop_id, conv_key, user_id, user_text, raw_level, stable_level, conf, next_goal)
-        except Exception as e:
-            print("[DB] upsert_customer failed:", repr(e))
-
-        try:
-            save_message(shop_id, conv_key, "assistant", reply_text,
-                         temp_level_raw=raw_level, temp_level_stable=stable_level, confidence=conf, next_goal=next_goal)
-        except Exception as e:
-            print("[DB] save assistant failed:", repr(e))
+        upsert_customer(shop_id, conv_key, user_id, user_text, raw_level, stable_level, conf, next_goal)
+        save_message(shop_id, conv_key, "assistant", reply_text,
+                     temp_level_raw=raw_level, temp_level_stable=stable_level, confidence=conf, next_goal=next_goal)
 
         if reasons:
             print(f"[TEMP] {conv_key} raw={raw_level} stable={stable_level} conf={conf:.2f} goal={next_goal} reasons={reasons}")
 
-        # opt-out 直後は push しない（希望なら送ってもいいが安全側で止める）
         if is_opted_out(shop_id, conv_key):
             return
 
@@ -994,7 +992,6 @@ async def line_webhook(
     x_line_signature: str = Header(default="", alias="X-Line-Signature"),
 ):
     body = await request.body()
-
     if not verify_signature(body, x_line_signature):
         raise HTTPException(status_code=401, detail="invalid signature")
 
@@ -1023,9 +1020,15 @@ async def line_webhook(
         try:
             save_message(SHOP_ID, conv_key, "user", user_text)
         except Exception as e:
-            print("[DB] save user message failed:", repr(e))
+            print("[DB] save user failed:", repr(e))
 
-        # 即opt-out（ユーザー体験優先）
+        # 追客返信 attribution（Feature 1）
+        try:
+            attribute_followup_response(SHOP_ID, conv_key)
+        except Exception as e:
+            print("[DB] attribute_followup_response failed:", repr(e))
+
+        # immediate opt-out
         for pat in OPTOUT_PATTERNS:
             if re.search(pat, user_text, flags=re.IGNORECASE):
                 try:
@@ -1035,7 +1038,7 @@ async def line_webhook(
                 await reply_message(reply_token, "承知しました。今後こちらからのご連絡は停止します。")
                 return {"ok": True}
 
-        # Try FAST AI reply (no "確認中"). If it fails -> fallback.
+        # Try fast reply
         fast_reply_text: Optional[str] = None
         try:
             fast_reply_text = await asyncio.wait_for(
@@ -1043,7 +1046,7 @@ async def line_webhook(
                 timeout=FAST_REPLY_TIMEOUT_SEC,
             )
         except Exception as e:
-            print("[FAST_REPLY] failed or timeout:", repr(e))
+            print("[FAST_REPLY] failed/timeout:", repr(e))
             fast_reply_text = None
 
         if fast_reply_text:
@@ -1066,7 +1069,7 @@ async def api_hot(
     shop_id: str = Query(default=SHOP_ID),
     min_level: int = Query(default=1, ge=1, le=10),
     limit: int = Query(default=50, ge=1, le=200),
-    view: str = Query(default="events", pattern="^(customers|events|followups)$"),
+    view: str = Query(default="events", pattern="^(customers|events|followups|ab_stats)$"),
 ):
     if not DATABASE_URL:
         return JSONResponse([], status_code=200)
@@ -1102,7 +1105,7 @@ async def api_hot(
     if view == "followups":
         rows = db_fetchall(
             """
-            SELECT user_id, conv_key, mode, status, message, error, created_at
+            SELECT user_id, conv_key, variant, mode, status, message, error, responded_at, created_at
             FROM followup_logs
             WHERE shop_id = %s
             ORDER BY created_at DESC
@@ -1115,14 +1118,38 @@ async def api_hot(
                 "view": "followups",
                 "user_id": r[0],
                 "conv_key": r[1],
-                "mode": r[2],
-                "status": r[3],
-                "message": r[4],
-                "error": r[5],
-                "ts": r[6].isoformat() if r[6] else None,
+                "variant": r[2],
+                "mode": r[3],
+                "status": r[4],
+                "message": r[5],
+                "error": r[6],
+                "responded_at": r[7].isoformat() if r[7] else None,
+                "ts": r[8].isoformat() if r[8] else None,
             }
             for r in rows
         ])
+
+    if view == "ab_stats":
+        rows = db_fetchall(
+            """
+            SELECT
+              COALESCE(variant, 'A') as variant,
+              COUNT(*) FILTER (WHERE status='sent') as sent_count,
+              COUNT(*) FILTER (WHERE status='sent' AND responded_at IS NOT NULL) as responded_count
+            FROM followup_logs
+            WHERE shop_id=%s
+            GROUP BY COALESCE(variant, 'A')
+            ORDER BY variant
+            """,
+            (shop_id,),
+        )
+        out = []
+        for v, sent, resp in rows:
+            sent = int(sent or 0)
+            resp = int(resp or 0)
+            rate = (resp / sent) if sent > 0 else 0.0
+            out.append({"view": "ab_stats", "variant": v, "sent": sent, "responded": resp, "rate": rate})
+        return JSONResponse(out)
 
     # events
     rows = db_fetchall(
@@ -1160,20 +1187,12 @@ async def api_hot(
 
 
 # ============================================================
-# Dashboard
+# Dashboard (simple)
 # ============================================================
 
 LEVEL_COLORS = {
-    1: "#9aa0a6",
-    2: "#8ab4f8",
-    3: "#a7ffeb",
-    4: "#c6ff00",
-    5: "#ffd54f",
-    6: "#ffab91",
-    7: "#ff8a80",
-    8: "#ff5252",
-    9: "#e040fb",
-    10: "#7c4dff",
+    1: "#9aa0a6", 2: "#8ab4f8", 3: "#a7ffeb", 4: "#c6ff00", 5: "#ffd54f",
+    6: "#ffab91", 7: "#ff8a80", 8: "#ff5252", 9: "#e040fb", 10: "#7c4dff",
 }
 
 
@@ -1181,7 +1200,7 @@ LEVEL_COLORS = {
 async def dashboard(
     _: None = Depends(require_dashboard_key),
     shop_id: str = Query(default=SHOP_ID),
-    view: str = Query(default="events", pattern="^(customers|events|followups)$"),
+    view: str = Query(default="events", pattern="^(customers|events|followups|ab_stats)$"),
     min_level: int = Query(default=1, ge=1, le=10),
     limit: int = Query(default=50, ge=1, le=200),
     refresh: int = Query(default=DASHBOARD_REFRESH_SEC_DEFAULT, ge=0, le=300),
@@ -1191,354 +1210,214 @@ async def dashboard(
     api_url = f"/api/hot?shop_id={shop_id}&min_level={min_level}&limit={limit}&view={view}&key={key_q}"
 
     html = f"""
-<!doctype html>
-<html lang="ja">
-<head>
+<!doctype html><html lang="ja"><head>
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1" />
-<title>HOT顧客ダッシュボード</title>
+<title>HOT顧客</title>
 <style>
-  body {{
-    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Noto Sans JP", sans-serif;
-    background: #fafafa;
-    margin: 0;
-    padding: 16px;
-    color: #111;
-  }}
-  .wrap {{ max-width: 1240px; margin: 0 auto; }}
-  .card {{
-    background: #fff;
-    border-radius: 14px;
-    box-shadow: 0 1px 6px rgba(0,0,0,.08);
-    padding: 14px 16px;
-    margin-bottom: 14px;
-  }}
-  .title {{
-    display: flex; justify-content: space-between; align-items: center;
-    gap: 12px; flex-wrap: wrap;
-  }}
-  .title h1 {{ font-size: 18px; margin: 0; }}
-  .meta {{ font-size: 12px; color: #555; }}
-  .filters {{
-    display: grid;
-    grid-template-columns: 1fr 220px 120px 120px 140px;
-    gap: 10px;
-    align-items: end;
-  }}
-  @media (max-width: 920px) {{ .filters {{ grid-template-columns: 1fr 1fr; }} }}
-  label {{ font-size: 12px; color: #444; display: block; margin-bottom: 4px; }}
-  input, select {{
-    width: 100%;
-    padding: 10px 10px;
-    border: 1px solid #ddd;
-    border-radius: 10px;
-    font-size: 14px;
-    background: #fff;
-  }}
-  button {{
-    padding: 10px 12px;
-    border: 0;
-    border-radius: 10px;
-    background: #111;
-    color: #fff;
-    font-size: 14px;
-    cursor: pointer;
-  }}
-  table {{ width: 100%; border-collapse: collapse; font-size: 14px; }}
-  th, td {{ padding: 10px 8px; border-bottom: 1px solid #eee; vertical-align: top; }}
-  th {{ text-align: left; font-size: 12px; color: #666; font-weight: 600; }}
-  .pill {{
-    display: inline-flex; align-items: center; gap: 6px;
-    padding: 4px 10px; border-radius: 999px;
-    font-size: 12px; color: #fff; font-weight: 700; white-space: nowrap;
-  }}
-  .badge {{
-    display: inline-flex; align-items: center;
-    padding: 3px 10px; border-radius: 999px;
-    font-size: 12px; font-weight: 700; white-space: nowrap;
-    border: 1px solid #e6e6e6; background: #f7f7f7; color: #333;
-  }}
-  .badge.assistant {{ background: #111; color: #fff; border-color: #111; }}
-  .badge.ok {{ background:#0b8043; color:#fff; border-color:#0b8043; }}
-  .badge.ng {{ background:#b00020; color:#fff; border-color:#b00020; }}
-  .mono {{ font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas; font-size: 12px; }}
-  .muted {{ color: #777; font-size: 12px; }}
-  .rowmsg {{ max-width: 720px; word-break: break-word; white-space: pre-wrap; }}
-  .link {{ color: #0b57d0; text-decoration: none; }}
-  .link:hover {{ text-decoration: underline; }}
-  .search {{ display:flex; gap:10px; align-items: center; margin-top: 10px; }}
-  .search input {{ flex: 1; }}
-  .hint {{ font-size: 12px; color: #666; margin-top: 6px; }}
-  .optout {{ color:#b00020; font-weight:700; }}
-</style>
-</head>
-<body>
+body{{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,"Noto Sans JP",sans-serif;background:#fafafa;margin:0;padding:16px;color:#111}}
+.wrap{{max-width:1240px;margin:0 auto}}
+.card{{background:#fff;border-radius:14px;box-shadow:0 1px 6px rgba(0,0,0,.08);padding:14px 16px;margin-bottom:14px}}
+.title{{display:flex;justify-content:space-between;align-items:center;gap:12px;flex-wrap:wrap}}
+.meta{{font-size:12px;color:#555}}
+.filters{{display:grid;grid-template-columns:1fr 220px 120px 120px 140px;gap:10px;align-items:end}}
+@media(max-width:920px){{.filters{{grid-template-columns:1fr 1fr}}}}
+label{{font-size:12px;color:#444;display:block;margin-bottom:4px}}
+input,select{{width:100%;padding:10px 10px;border:1px solid #ddd;border-radius:10px;font-size:14px;background:#fff}}
+button{{padding:10px 12px;border:0;border-radius:10px;background:#111;color:#fff;font-size:14px;cursor:pointer}}
+table{{width:100%;border-collapse:collapse;font-size:14px}}
+th,td{{padding:10px 8px;border-bottom:1px solid #eee;vertical-align:top}}
+th{{text-align:left;font-size:12px;color:#666;font-weight:600}}
+.pill{{display:inline-flex;align-items:center;gap:6px;padding:4px 10px;border-radius:999px;font-size:12px;color:#fff;font-weight:700;white-space:nowrap}}
+.badge{{display:inline-flex;align-items:center;padding:3px 10px;border-radius:999px;font-size:12px;font-weight:700;white-space:nowrap;border:1px solid #e6e6e6;background:#f7f7f7;color:#333}}
+.badge.assistant{{background:#111;color:#fff;border-color:#111}}
+.badge.ok{{background:#0b8043;color:#fff;border-color:#0b8043}}
+.badge.ng{{background:#b00020;color:#fff;border-color:#b00020}}
+.mono{{font-family:ui-monospace,SFMono-Regular,Menlo,Monaco,Consolas;font-size:12px}}
+.rowmsg{{max-width:760px;word-break:break-word;white-space:pre-wrap}}
+.link{{color:#0b57d0;text-decoration:none}}
+.link:hover{{text-decoration:underline}}
+.search{{display:flex;gap:10px;align-items:center;margin-top:10px}}
+.search input{{flex:1}}
+.muted{{color:#777;font-size:12px}}
+.optout{{color:#b00020;font-weight:700}}
+</style></head><body>
 <div class="wrap">
   <div class="card title">
     <div>
-      <h1>HOT顧客 <span class="mono">{shop_id}</span></h1>
-      <div class="meta">
-        view={view} / min_level={min_level} / limit={limit}
-        / count=<span id="count">-</span>
-        / <span id="now">-</span>
-      </div>
-      <div class="meta">
-        JSON: <a class="link" href="{api_url}" target="_blank">{api_url}</a>
-      </div>
+      <div style="font-size:18px;font-weight:700">HOT顧客 <span class="mono">{shop_id}</span></div>
+      <div class="meta">view={view} / min_level={min_level} / limit={limit} / count=<span id="count">-</span> / <span id="now">-</span></div>
+      <div class="meta">JSON: <a class="link" href="{api_url}" target="_blank">{api_url}</a></div>
     </div>
     <div><button id="btnRefresh">更新</button></div>
   </div>
 
   <div class="card">
     <div class="filters">
-      <div>
-        <label>shop_id</label>
-        <input id="shopId" value="{shop_id}" />
-      </div>
+      <div><label>shop_id</label><input id="shopId" value="{shop_id}" /></div>
       <div>
         <label>view</label>
         <select id="viewSelect">
-          <option value="events" {"selected" if view=="events" else ""}>events（履歴：user/assistant）</option>
-          <option value="customers" {"selected" if view=="customers" else ""}>customers（最新状態）</option>
+          <option value="events" {"selected" if view=="events" else ""}>events（履歴）</option>
+          <option value="customers" {"selected" if view=="customers" else ""}>customers（最新）</option>
           <option value="followups" {"selected" if view=="followups" else ""}>followups（追客ログ）</option>
+          <option value="ab_stats" {"selected" if view=="ab_stats" else ""}>ab_stats（A/B集計）</option>
         </select>
       </div>
-      <div>
-        <label>min_level</label>
-        <input id="minLevel" type="number" min="1" max="10" value="{min_level}" />
-      </div>
-      <div>
-        <label>limit</label>
-        <input id="limit" type="number" min="1" max="200" value="{limit}" />
-      </div>
-      <div>
-        <label>auto refresh (sec)</label>
-        <input id="refreshSec" type="number" min="0" max="300" value="{refresh}" />
-      </div>
+      <div><label>min_level</label><input id="minLevel" type="number" min="1" max="10" value="{min_level}" /></div>
+      <div><label>limit</label><input id="limit" type="number" min="1" max="200" value="{limit}" /></div>
+      <div><label>auto refresh (sec)</label><input id="refreshSec" type="number" min="0" max="300" value="{refresh}" /></div>
     </div>
-
     <div class="search">
       <div style="flex:1">
-        <label>検索（自動） user_id / next_goal / message / status</label>
-        <input id="searchBox" placeholder="例: 渋谷 / 3LDK / 内見 / Uxxxxxxxx / failed" />
-        <div class="hint">入力すると即フィルタ（サーバー再読込なし）</div>
+        <label>検索（自動） user_id / next_goal / message / status / variant</label>
+        <input id="searchBox" placeholder="例: 内見 / failed / A / Uxxxx" />
+        <div class="muted">入力すると即フィルタ（サーバー再読込なし）</div>
       </div>
-      <div>
-        <label>&nbsp;</label>
-        <button id="btnApply">反映</button>
-      </div>
+      <div><label>&nbsp;</label><button id="btnApply">反映</button></div>
     </div>
   </div>
 
   <div class="card">
     <table>
       <thead id="thead"></thead>
-      <tbody id="tbody">
-        <tr><td class="muted">Loading...</td></tr>
-      </tbody>
+      <tbody id="tbody"><tr><td class="muted">Loading...</td></tr></tbody>
     </table>
   </div>
 </div>
 
 <script>
-  const LEVEL_COLORS = {json.dumps(LEVEL_COLORS)};
-  const DASH_KEY = {json.dumps(key_q)};
+const LEVEL_COLORS = {json.dumps(LEVEL_COLORS)};
+const DASH_KEY = {json.dumps(key_q)};
+let cache = [];
 
-  function fmtTime(iso) {{
-    if (!iso) return "-";
-    try {{ return new Date(iso).toLocaleString(); }} catch (e) {{ return iso; }}
+function escapeHtml(s){{return (s||"").replace(/[&<>"]/g,c=>({{"&":"&amp;","<":"&lt;",">":"&gt;","\\"":"&quot;"}}[c]));}}
+function fmtTime(iso){{if(!iso) return "-"; try{{return new Date(iso).toLocaleString();}}catch(e){{return iso;}}}}
+function pill(level){{const c=LEVEL_COLORS[level]||"#999"; return `<span class="pill" style="background:${{c}}">Lv${{level}}</span>`;}}
+function badge(role){{const r=(role||"").toLowerCase(); if(r==="assistant")return `<span class="badge assistant">assistant</span>`; if(r==="user")return `<span class="badge">user</span>`; return `<span class="badge">${{escapeHtml(role||"-")}}</span>`;}}
+function badgeStatus(s){{const v=(s||"").toLowerCase(); if(v==="sent")return `<span class="badge ok">sent</span>`; if(v==="failed")return `<span class="badge ng">failed</span>`; return `<span class="badge">${{escapeHtml(s||"-")}}</span>`;}}
+function matchesSearch(row,q){{if(!q) return true; q=q.toLowerCase(); const fields=[row.user_id,row.next_goal,row.message,row.role,row.status,row.mode,row.error,row.variant].map(x=>(x||"").toLowerCase()); return fields.some(f=>f.includes(q));}}
+
+function setHeader(view){{
+  const thead=document.getElementById("thead");
+  if(view==="customers") {{
+    thead.innerHTML=`<tr><th>更新</th><th>温度</th><th>確度</th><th>次のゴール</th><th class="mono">user_id</th><th>直近メッセ</th><th>optout</th></tr>`;
+    return;
+  }}
+  if(view==="followups") {{
+    thead.innerHTML=`<tr><th>更新</th><th>status</th><th>variant</th><th>mode</th><th class="mono">user_id</th><th>本文</th><th>返信</th><th>error</th></tr>`;
+    return;
+  }}
+  if(view==="ab_stats") {{
+    thead.innerHTML=`<tr><th>variant</th><th>sent</th><th>responded</th><th>rate</th></tr>`;
+    return;
+  }}
+  thead.innerHTML=`<tr><th>更新</th><th>種別</th><th>温度</th><th>確度</th><th>次のゴール</th><th class="mono">user_id</th><th>メッセージ</th></tr>`;
+}}
+
+function render(){{
+  const view=document.getElementById("viewSelect").value;
+  setHeader(view);
+  const q=document.getElementById("searchBox").value.trim().toLowerCase();
+  const rows=cache.filter(r=>matchesSearch(r,q));
+  document.getElementById("count").textContent=rows.length;
+  const tbody=document.getElementById("tbody");
+  if(!rows.length){{tbody.innerHTML=`<tr><td colspan="8" class="muted">No data</td></tr>`;return;}}
+
+  if(view==="ab_stats") {{
+    tbody.innerHTML = rows.map(r=>`<tr><td class="mono">${{escapeHtml(r.variant)}}</td><td class="mono">${{r.sent}}</td><td class="mono">${{r.responded}}</td><td class="mono">${{(r.rate*100).toFixed(1)}}%</td></tr>`).join("");
+    return;
   }}
 
-  function pill(level) {{
-    const c = LEVEL_COLORS[level] || "#999";
-    return `<span class="pill" style="background:${{c}}">Lv${{level}}</span>`;
+  if(view==="followups") {{
+    tbody.innerHTML = rows.map(r=>`<tr>
+      <td class="mono">${{escapeHtml(fmtTime(r.ts))}}</td>
+      <td>${{badgeStatus(r.status)}}</td>
+      <td class="mono">${{escapeHtml(r.variant||"-")}}</td>
+      <td class="mono">${{escapeHtml(r.mode||"-")}}</td>
+      <td class="mono">${{escapeHtml(r.user_id||"")}}</td>
+      <td class="rowmsg">${{escapeHtml(r.message||"")}}</td>
+      <td class="mono">${{r.responded_at ? "YES" : "-"}}</td>
+      <td class="rowmsg mono">${{escapeHtml(r.error||"-")}}</td>
+    </tr>`).join("");
+    return;
   }}
 
-  function badge(role) {{
-    const r = (role || "").toLowerCase();
-    if (r === "assistant") return `<span class="badge assistant">assistant</span>`;
-    if (r === "user") return `<span class="badge">user</span>`;
-    return `<span class="badge">${{escapeHtml(role || "-")}}</span>`;
-  }}
-
-  function badgeStatus(s) {{
-    const v = (s || "").toLowerCase();
-    if (v === "sent") return `<span class="badge ok">sent</span>`;
-    if (v === "failed") return `<span class="badge ng">failed</span>`;
-    return `<span class="badge">${{escapeHtml(s || "-")}}</span>`;
-  }}
-
-  function escapeHtml(s) {{
-    return (s || "").replace(/[&<>"]/g, c => ({{"&":"&amp;","<":"&lt;",">":"&gt;","\\"":"&quot;"}}[c]));
-  }}
-
-  let cache = [];
-  function matchesSearch(row, q) {{
-    if (!q) return true;
-    q = q.toLowerCase();
-    const fields = [
-      row.user_id, row.next_goal, row.message, row.role, row.status, row.mode, row.error
-    ].map(x => (x || "").toLowerCase());
-    return fields.some(f => f.includes(q));
-  }}
-
-  function setHeader(view) {{
-    const thead = document.getElementById("thead");
-    if (view === "followups") {{
-      thead.innerHTML = `
-        <tr>
-          <th>更新</th>
-          <th>status</th>
-          <th>mode</th>
-          <th class="mono">user_id</th>
-          <th>本文</th>
-          <th>error</th>
-        </tr>`;
-      return;
-    }}
-    if (view === "customers") {{
-      thead.innerHTML = `
-        <tr>
-          <th>更新</th>
-          <th>温度</th>
-          <th>確度</th>
-          <th>次のゴール</th>
-          <th class="mono">user_id</th>
-          <th>直近メッセージ</th>
-          <th>optout</th>
-        </tr>`;
-      return;
-    }}
-    thead.innerHTML = `
-      <tr>
-        <th>更新</th>
-        <th>種別</th>
-        <th>温度</th>
-        <th>確度</th>
-        <th>次のゴール</th>
-        <th class="mono">user_id</th>
-        <th>メッセージ</th>
+  if(view==="customers") {{
+    tbody.innerHTML = rows.map(r=>{{
+      const levelHtml=(r.temp_level_stable==null)?"-":pill(r.temp_level_stable);
+      const confHtml=(r.confidence==null)?"-":Number(r.confidence).toFixed(2);
+      const goalHtml=(r.next_goal==null||r.next_goal==="")?"-":escapeHtml(r.next_goal);
+      const opt=r.opt_out?`<span class="optout">STOP</span>`:"-";
+      return `<tr>
+        <td class="mono">${{escapeHtml(fmtTime(r.ts))}}</td>
+        <td>${{levelHtml}}</td>
+        <td class="mono">${{confHtml}}</td>
+        <td>${{goalHtml}}</td>
+        <td class="mono">${{escapeHtml(r.user_id||"")}}</td>
+        <td class="rowmsg">${{escapeHtml(r.message||"")}}</td>
+        <td>${{opt}}</td>
       </tr>`;
-  }}
-
-  function render() {{
-    const view = document.getElementById("viewSelect").value;
-    setHeader(view);
-
-    const q = document.getElementById("searchBox").value.trim().toLowerCase();
-    const rows = cache.filter(r => matchesSearch(r, q));
-    document.getElementById("count").textContent = rows.length;
-
-    const tbody = document.getElementById("tbody");
-    if (!rows.length) {{
-      tbody.innerHTML = `<tr><td colspan="7" class="muted">No data</td></tr>`;
-      return;
-    }}
-
-    if (view === "followups") {{
-      tbody.innerHTML = rows.map(r => {{
-        return `
-          <tr>
-            <td class="mono">${{escapeHtml(fmtTime(r.ts))}}</td>
-            <td>${{badgeStatus(r.status)}}</td>
-            <td class="mono">${{escapeHtml(r.mode || "-")}}</td>
-            <td class="mono">${{escapeHtml(r.user_id || "")}}</td>
-            <td class="rowmsg">${{escapeHtml(r.message || "")}}</td>
-            <td class="rowmsg mono">${{escapeHtml(r.error || "-")}}</td>
-          </tr>`;
-      }}).join("");
-      return;
-    }}
-
-    if (view === "customers") {{
-      tbody.innerHTML = rows.map(r => {{
-        const levelHtml = (r.temp_level_stable == null) ? "-" : pill(r.temp_level_stable);
-        const confHtml  = (r.confidence == null) ? "-" : (Number(r.confidence).toFixed(2));
-        const goalHtml  = (r.next_goal == null || r.next_goal === "") ? "-" : escapeHtml(r.next_goal);
-        const opt = r.opt_out ? `<span class="optout">STOP</span>` : "-";
-        return `
-          <tr>
-            <td class="mono">${{escapeHtml(fmtTime(r.ts))}}</td>
-            <td>${{levelHtml}}</td>
-            <td class="mono">${{confHtml}}</td>
-            <td>${{goalHtml}}</td>
-            <td class="mono">${{escapeHtml(r.user_id || "")}}</td>
-            <td class="rowmsg">${{escapeHtml(r.message || "")}}</td>
-            <td>${{opt}}</td>
-          </tr>`;
-      }}).join("");
-      return;
-    }}
-
-    // events
-    tbody.innerHTML = rows.map(r => {{
-      const levelHtml = (r.temp_level_stable == null) ? "-" : pill(r.temp_level_stable);
-      const confHtml  = (r.confidence == null) ? "-" : (Number(r.confidence).toFixed(2));
-      const goalHtml  = (r.next_goal == null || r.next_goal === "") ? "-" : escapeHtml(r.next_goal);
-      return `
-        <tr>
-          <td class="mono">${{escapeHtml(fmtTime(r.ts))}}</td>
-          <td>${{badge(r.role)}}</td>
-          <td>${{levelHtml}}</td>
-          <td class="mono">${{confHtml}}</td>
-          <td>${{goalHtml}}</td>
-          <td class="mono">${{escapeHtml(r.user_id || "")}}</td>
-          <td class="rowmsg">${{escapeHtml(r.message || "")}}</td>
-        </tr>`;
     }}).join("");
+    return;
   }}
 
-  async function fetchData() {{
-    const shopId = document.getElementById("shopId").value.trim();
-    const view = document.getElementById("viewSelect").value;
-    const minLevel = document.getElementById("minLevel").value;
-    const limit = document.getElementById("limit").value;
+  tbody.innerHTML = rows.map(r=>{{
+    const levelHtml=(r.temp_level_stable==null)?"-":pill(r.temp_level_stable);
+    const confHtml=(r.confidence==null)?"-":Number(r.confidence).toFixed(2);
+    const goalHtml=(r.next_goal==null||r.next_goal==="")?"-":escapeHtml(r.next_goal);
+    return `<tr>
+      <td class="mono">${{escapeHtml(fmtTime(r.ts))}}</td>
+      <td>${{badge(r.role)}}</td>
+      <td>${{levelHtml}}</td>
+      <td class="mono">${{confHtml}}</td>
+      <td>${{goalHtml}}</td>
+      <td class="mono">${{escapeHtml(r.user_id||"")}}</td>
+      <td class="rowmsg">${{escapeHtml(r.message||"")}}</td>
+    </tr>`;
+  }}).join("");
+}}
 
-    const url = `/api/hot?shop_id=${{encodeURIComponent(shopId)}}&min_level=${{encodeURIComponent(minLevel)}}&limit=${{encodeURIComponent(limit)}}&view=${{encodeURIComponent(view)}}&key=${{encodeURIComponent(DASH_KEY)}}`;
-    const res = await fetch(url, {{ credentials: "same-origin" }});
-    const data = await res.json();
-    cache = Array.isArray(data) ? data : [];
-    document.getElementById("now").textContent = new Date().toLocaleString();
-    render();
-  }}
+async function fetchData(){{
+  const shopId=document.getElementById("shopId").value.trim();
+  const view=document.getElementById("viewSelect").value;
+  const minLevel=document.getElementById("minLevel").value;
+  const limit=document.getElementById("limit").value;
+  const url=`/api/hot?shop_id=${{encodeURIComponent(shopId)}}&min_level=${{encodeURIComponent(minLevel)}}&limit=${{encodeURIComponent(limit)}}&view=${{encodeURIComponent(view)}}&key=${{encodeURIComponent(DASH_KEY)}}`;
+  const res=await fetch(url, {{credentials:"same-origin"}});
+  const data=await res.json();
+  cache=Array.isArray(data)?data:[];
+  document.getElementById("now").textContent=new Date().toLocaleString();
+  render();
+}}
 
-  document.getElementById("btnApply").addEventListener("click", () => {{
-    const shopId = document.getElementById("shopId").value.trim();
-    const view = document.getElementById("viewSelect").value;
-    const minLevel = document.getElementById("minLevel").value;
-    const limit = document.getElementById("limit").value;
-    const refreshSec = document.getElementById("refreshSec").value;
+document.getElementById("btnApply").addEventListener("click",()=>{{
+  const shopId=document.getElementById("shopId").value.trim();
+  const view=document.getElementById("viewSelect").value;
+  const minLevel=document.getElementById("minLevel").value;
+  const limit=document.getElementById("limit").value;
+  const refreshSec=document.getElementById("refreshSec").value;
+  const qs=new URLSearchParams({{shop_id:shopId,view:view,min_level:minLevel,limit:limit,refresh:refreshSec,key:DASH_KEY}});
+  window.location.href=`/dashboard?${{qs.toString()}}`;
+}});
 
-    const qs = new URLSearchParams({{
-      shop_id: shopId,
-      view: view,
-      min_level: minLevel,
-      limit: limit,
-      refresh: refreshSec,
-      key: DASH_KEY
-    }});
-    window.location.href = `/dashboard?${{qs.toString()}}`;
-  }});
+document.getElementById("btnRefresh").addEventListener("click",fetchData);
+document.getElementById("searchBox").addEventListener("input",()=>render());
 
-  document.getElementById("btnRefresh").addEventListener("click", fetchData);
-  document.getElementById("searchBox").addEventListener("input", () => render());
+let timer=null;
+function setupAutoRefresh(){{
+  if(timer) clearInterval(timer);
+  const sec=parseInt(document.getElementById("refreshSec").value||"0",10);
+  if(sec>0) timer=setInterval(fetchData, sec*1000);
+}}
+document.getElementById("refreshSec").addEventListener("change",setupAutoRefresh);
 
-  let timer = null;
-  function setupAutoRefresh() {{
-    if (timer) clearInterval(timer);
-    const sec = parseInt(document.getElementById("refreshSec").value || "0", 10);
-    if (sec > 0) timer = setInterval(fetchData, sec * 1000);
-  }}
-  document.getElementById("refreshSec").addEventListener("change", setupAutoRefresh);
-
-  fetchData().then(setupAutoRefresh).catch(e => {{
-    console.error(e);
-    document.getElementById("tbody").innerHTML = `<tr><td class="muted">Error loading</td></tr>`;
-  }});
+fetchData().then(setupAutoRefresh).catch(e=>{{
+  console.error(e);
+  document.getElementById("tbody").innerHTML=`<tr><td class="muted">Error loading</td></tr>`;
+}});
 </script>
-
-</body>
-</html>
+</body></html>
 """
     return HTMLResponse(html)
 
@@ -1553,13 +1432,7 @@ async def job_followup(_: None = Depends(require_admin_key)):
         return {"ok": True, "enabled": False, "reason": "FOLLOWUP_ENABLED!=1"}
 
     if not is_within_jst_window():
-        return {
-            "ok": True,
-            "enabled": True,
-            "skipped": True,
-            "reason": f"out_of_time_window (JST {FOLLOWUP_JST_FROM}-{FOLLOWUP_JST_TO})",
-            "now_jst": now_jst().isoformat(),
-        }
+        return {"ok": True, "enabled": True, "skipped": True, "reason": f"out_of_time_window (JST {FOLLOWUP_JST_FROM}-{FOLLOWUP_JST_TO})"}
 
     if not acquire_job_lock("followup", FOLLOWUP_LOCK_TTL_SEC):
         return {"ok": True, "enabled": True, "skipped": True, "reason": "locked"}
@@ -1571,6 +1444,7 @@ async def job_followup(_: None = Depends(require_admin_key)):
 
     sent = 0
     failed = 0
+
     for c in candidates:
         user_id = c["user_id"]
         conv_key = c["conv_key"]
@@ -1578,25 +1452,27 @@ async def job_followup(_: None = Depends(require_admin_key)):
         goal = c.get("next_goal") or ""
         last_text = c.get("last_user_text") or ""
 
-        # opt-out safety
         if is_opted_out(SHOP_ID, conv_key):
-            save_followup_log(SHOP_ID, conv_key, user_id, "(skipped opt_out)", "template", "skipped", "opt_out")
+            save_followup_log(SHOP_ID, conv_key, user_id, "(skipped opt_out)", "template", "skipped", "opt_out", variant=None)
             continue
+
+        variant = pick_ab_variant(conv_key)  # Feature 1
 
         mode = "template"
         if FOLLOWUP_USE_OPENAI and OPENAI_API_KEY:
             mode = "openai"
-            msg = await build_followup_message_openai(goal, last_text, level)
+            # OpenAI版でも、末尾に候補枠を添付したいならここで append する設計にできる
+            msg = build_followup_template_ab(variant, goal, last_text, level)
         else:
-            msg = build_followup_template(goal, last_text, level)
+            msg = build_followup_template_ab(variant, goal, last_text, level)
 
         try:
             await push_message(user_id, msg)
-            save_followup_log(SHOP_ID, conv_key, user_id, msg, mode, "sent", None)
+            save_followup_log(SHOP_ID, conv_key, user_id, msg, mode, "sent", None, variant=variant)
             sent += 1
         except Exception as e:
             err = str(e)[:200]
-            save_followup_log(SHOP_ID, conv_key, user_id, msg, mode, "failed", err)
+            save_followup_log(SHOP_ID, conv_key, user_id, msg, mode, "failed", err, variant=variant)
             failed += 1
 
     return {"ok": True, "enabled": True, "dryrun": False, "candidates": len(candidates), "sent": sent, "failed": failed}
