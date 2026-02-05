@@ -1,53 +1,4 @@
-# app.py (FULL REWRITE - STABLE)
-# FastAPI + Render + Postgres(pg8000)
-#
-# ✅ LINE webhook
-#   - AIが間に合う時: そのまま返信（「確認中」なし）
-#   - AIが遅い/失敗: 「確認中」だけ返して、後でpushで本返信
-#
-# ✅ 温度判定（過大評価防止 + hard rule）
-# ✅ 追客（A/Bテンプレ + 2段追客 + 返信率計測）
-# ✅ status自動化（ACTIVE/COLD/LOST/OPTOUT）
-# ✅ COLD復活（受信でACTIVEへ）
-# ✅ LOST復活（復活キーワードでACTIVEへ）
-# ✅ 条件スロット（budget/area/move_in/layout）を保存＆表示
-# ✅ 内見候補提示 → ユーザーが「1〜6/①〜⑥」で確定してDB保存
-# ✅ Dashboard: customers / events / followups / ab_stats
-#
-# Required env:
-#   LINE_CHANNEL_SECRET
-#   LINE_CHANNEL_ACCESS_TOKEN
-#   DATABASE_URL
-#   OPENAI_API_KEY
-#   DASHBOARD_KEY
-#   ADMIN_API_KEY
-#
-# Optional env:
-#   SHOP_ID
-#   DASHBOARD_REFRESH_SEC_DEFAULT
-#   FAST_REPLY_TIMEOUT_SEC (default 3.0)
-#   ANALYZE_HISTORY_LIMIT (default 10)
-#   SHORT_TEXT_MAX_LEN (default 2)
-#
-# Followup env:
-#   FOLLOWUP_ENABLED=1
-#   FOLLOWUP_AFTER_MINUTES=180
-#   FOLLOWUP_MIN_LEVEL=8
-#   FOLLOWUP_LIMIT=50
-#   FOLLOWUP_DRYRUN=1
-#   FOLLOWUP_LOCK_TTL_SEC=180
-#   FOLLOWUP_MIN_HOURS_BETWEEN=24
-#   FOLLOWUP_JST_FROM=10
-#   FOLLOWUP_JST_TO=20
-#
-# AB + visit slots:
-#   FOLLOWUP_AB_ENABLED=1
-#   VISIT_DAYS_AHEAD=3
-#   VISIT_SLOT_HOURS=11,14,17
-#   FOLLOWUP_ATTRIBUTION_WINDOW_HOURS=72
-#   FOLLOWUP_SECOND_TOUCH_AFTER_HOURS=48
-#   FOLLOWUP_SECOND_TOUCH_LIMIT=50
-
+# app.py (FULL - dashboard redesigned)
 import os
 import json
 import hmac
@@ -278,7 +229,6 @@ def ensure_tables_and_columns() -> None:
         );
         """
     )
-    # base columns
     cur.execute("""ALTER TABLE customers ADD COLUMN IF NOT EXISTS user_id TEXT;""")
     cur.execute("""ALTER TABLE customers ADD COLUMN IF NOT EXISTS last_user_text TEXT;""")
     cur.execute("""ALTER TABLE customers ADD COLUMN IF NOT EXISTS temp_level_raw INT;""")
@@ -286,23 +236,19 @@ def ensure_tables_and_columns() -> None:
     cur.execute("""ALTER TABLE customers ADD COLUMN IF NOT EXISTS confidence REAL;""")
     cur.execute("""ALTER TABLE customers ADD COLUMN IF NOT EXISTS next_goal TEXT;""")
 
-    # status
-    cur.execute("""ALTER TABLE customers ADD COLUMN IF NOT EXISTS status TEXT;""")  # ACTIVE/COLD/LOST/OPTOUT
+    cur.execute("""ALTER TABLE customers ADD COLUMN IF NOT EXISTS status TEXT;""")
     cur.execute("""ALTER TABLE customers ADD COLUMN IF NOT EXISTS opt_out BOOLEAN;""")
     cur.execute("""ALTER TABLE customers ADD COLUMN IF NOT EXISTS opt_out_at TIMESTAMPTZ;""")
 
-    # visit slot selection
     cur.execute("""ALTER TABLE customers ADD COLUMN IF NOT EXISTS visit_slot_selected TEXT;""")
     cur.execute("""ALTER TABLE customers ADD COLUMN IF NOT EXISTS visit_slot_selected_at TIMESTAMPTZ;""")
 
-    # slot fields
     cur.execute("""ALTER TABLE customers ADD COLUMN IF NOT EXISTS slot_budget TEXT;""")
     cur.execute("""ALTER TABLE customers ADD COLUMN IF NOT EXISTS slot_area TEXT;""")
     cur.execute("""ALTER TABLE customers ADD COLUMN IF NOT EXISTS slot_move_in TEXT;""")
     cur.execute("""ALTER TABLE customers ADD COLUMN IF NOT EXISTS slot_layout TEXT;""")
     cur.execute("""ALTER TABLE customers ADD COLUMN IF NOT EXISTS slots_json TEXT;""")
 
-    # messages
     cur.execute(
         """
         CREATE TABLE IF NOT EXISTS messages (
@@ -320,7 +266,6 @@ def ensure_tables_and_columns() -> None:
     cur.execute("""ALTER TABLE messages ADD COLUMN IF NOT EXISTS confidence REAL;""")
     cur.execute("""ALTER TABLE messages ADD COLUMN IF NOT EXISTS next_goal TEXT;""")
 
-    # locks
     cur.execute(
         """
         CREATE TABLE IF NOT EXISTS job_locks (
@@ -330,7 +275,6 @@ def ensure_tables_and_columns() -> None:
         """
     )
 
-    # followup logs
     cur.execute(
         """
         CREATE TABLE IF NOT EXISTS followup_logs (
@@ -350,7 +294,6 @@ def ensure_tables_and_columns() -> None:
     cur.execute("""ALTER TABLE followup_logs ADD COLUMN IF NOT EXISTS responded_at TIMESTAMPTZ;""")
     cur.execute("""ALTER TABLE followup_logs ADD COLUMN IF NOT EXISTS stage INT;""")
 
-    # indexes
     cur.execute("""CREATE INDEX IF NOT EXISTS idx_customers_shop_updated ON customers(shop_id, updated_at DESC);""")
     cur.execute("""CREATE INDEX IF NOT EXISTS idx_messages_conv_created ON messages(conv_key, created_at DESC);""")
     cur.execute("""CREATE INDEX IF NOT EXISTS idx_followup_shop_conv_created ON followup_logs(shop_id, conv_key, created_at DESC);""")
@@ -986,7 +929,6 @@ async def generate_reply_only(user_id: str, user_text: str) -> str:
 def maintenance_update_statuses(shop_id: str) -> None:
     if not DATABASE_URL:
         return
-    # optout => OPTOUT
     db_execute(
         """
         UPDATE customers SET status='OPTOUT'
@@ -994,7 +936,6 @@ def maintenance_update_statuses(shop_id: str) -> None:
         """,
         (shop_id,),
     )
-    # ACTIVE + Lv<=2 + 7days => COLD
     db_execute(
         """
         UPDATE customers SET status='COLD'
@@ -1215,37 +1156,31 @@ async def line_webhook(
 
         conv_key = f"user:{user_id}"
 
-        # ensure customer row
         try:
             ensure_customer_row(SHOP_ID, conv_key, user_id)
         except Exception as e:
             print("[DB] ensure_customer_row:", repr(e))
 
-        # revive cold always
         try:
             revive_if_cold(SHOP_ID, conv_key)
         except Exception:
             pass
 
-        # revive lost by keywords
         try:
             revive_if_lost_by_keywords(SHOP_ID, conv_key, user_text)
         except Exception:
             pass
 
-        # save user message
         try:
             save_message(SHOP_ID, conv_key, "user", user_text)
         except Exception as e:
             print("[DB] save user:", repr(e))
 
-        # followup attribution
         try:
             attribute_followup_response(SHOP_ID, conv_key)
         except Exception:
             pass
 
-        # slot merge
         try:
             prev = get_customer_slots(SHOP_ID, conv_key)
             merged = merge_slots(prev, extract_slots(user_text))
@@ -1254,13 +1189,11 @@ async def line_webhook(
         except Exception:
             pass
 
-        # visit slot change request
         if is_visit_change_request(user_text):
             set_visit_slot(SHOP_ID, conv_key, "REQUEST_CHANGE")
             await reply_line(reply_token, "承知しました。ご希望の曜日や時間帯（例：平日夜/土日午後など）を教えてください。")
             continue
 
-        # visit slot selection 1-6 / ①-⑥
         sel = parse_slot_selection(user_text)
         if sel is not None:
             slots = upcoming_visit_slots_jst(VISIT_DAYS_AHEAD)
@@ -1272,21 +1205,18 @@ async def line_webhook(
                 await reply_line(reply_token, "番号は 1〜6 の範囲でお願いします。")
             continue
 
-        # immediate optout
         for pat in OPTOUT_PATTERNS:
             if re.search(pat, user_text, flags=re.IGNORECASE):
                 mark_opt_out(SHOP_ID, conv_key, user_id)
                 await reply_line(reply_token, "承知しました。今後こちらからのご連絡は停止します。")
                 return {"ok": True}
 
-        # immediate cancel => lost
         for pat in CANCEL_PATTERNS:
             if re.search(pat, user_text):
                 mark_lost(SHOP_ID, conv_key)
                 await reply_line(reply_token, "承知しました。必要になったらまたいつでもご連絡ください。")
                 return {"ok": True}
 
-        # fast reply attempt
         fast_reply_text: Optional[str] = None
         try:
             fast_reply_text = await asyncio.wait_for(
@@ -1432,7 +1362,7 @@ async def api_hot(
 
 
 # ============================================================
-# Dashboard HTML
+# Dashboard HTML (HOME STYLE)
 # ============================================================
 
 LEVEL_COLORS = {
@@ -1451,205 +1381,959 @@ async def dashboard(
     key: Optional[str] = Query(default=None),
 ):
     key_q = (key or "").strip()
-    api_url = f"/api/hot?shop_id={shop_id}&min_level={min_level}&limit={limit}&view={view}&key={key_q}"
 
     html = f"""
-<!doctype html><html lang="ja"><head>
-<meta charset="utf-8" /><meta name="viewport" content="width=device-width, initial-scale=1" />
-<title>HOT顧客</title>
-<style>
-body{{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,"Noto Sans JP",sans-serif;background:#fafafa;margin:0;padding:16px;color:#111}}
-.wrap{{max-width:1240px;margin:0 auto}}
-.card{{background:#fff;border-radius:14px;box-shadow:0 1px 6px rgba(0,0,0,.08);padding:14px 16px;margin-bottom:14px}}
-.filters{{display:grid;grid-template-columns:1fr 220px 120px 120px 140px;gap:10px;align-items:end}}
-@media(max-width:920px){{.filters{{grid-template-columns:1fr 1fr}}}}
-label{{font-size:12px;color:#444;display:block;margin-bottom:4px}}
-input,select{{width:100%;padding:10px;border:1px solid #ddd;border-radius:10px;font-size:14px;background:#fff}}
-button{{padding:10px 12px;border:0;border-radius:10px;background:#111;color:#fff;font-size:14px;cursor:pointer}}
-table{{width:100%;border-collapse:collapse;font-size:14px}}
-th,td{{padding:10px 8px;border-bottom:1px solid #eee;vertical-align:top}}
-th{{text-align:left;font-size:12px;color:#666;font-weight:600}}
-.pill{{display:inline-flex;align-items:center;gap:6px;padding:4px 10px;border-radius:999px;font-size:12px;color:#fff;font-weight:700;white-space:nowrap}}
-.badge{{display:inline-flex;align-items:center;padding:3px 10px;border-radius:999px;font-size:12px;font-weight:700;white-space:nowrap;border:1px solid #e6e6e6;background:#f7f7f7;color:#333}}
-.badge.ok{{background:#0b8043;color:#fff;border-color:#0b8043}}
-.badge.ng{{background:#b00020;color:#fff;border-color:#b00020}}
-.mono{{font-family:ui-monospace,SFMono-Regular,Menlo,Monaco,Consolas;font-size:12px}}
-.rowmsg{{max-width:760px;word-break:break-word;white-space:pre-wrap}}
-.search{{display:flex;gap:10px;align-items:center;margin-top:10px}}
-.search input{{flex:1}}
-.tag{{padding:2px 8px;border-radius:999px;border:1px solid #e6e6e6;background:#f7f7f7;font-size:12px}}
-.tag.ok{{background:#0b8043;color:#fff;border-color:#0b8043}}
-.tag.ng{{background:#b00020;color:#fff;border-color:#b00020}}
-.slot{{display:inline-flex;gap:6px;flex-wrap:wrap}}
-</style></head><body>
-<div class="wrap">
-  <div class="card">
-    <div style="font-size:18px;font-weight:700">HOT顧客 <span class="mono">{shop_id}</span></div>
-    <div class="mono" style="margin-top:6px">JSON: <a href="{api_url}" target="_blank">{api_url}</a></div>
-  </div>
+<!doctype html>
+<html lang="ja">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Dashboard | {shop_id}</title>
+  <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
+  <style>
+    :root {{
+      --bg: #0b1020;
+      --panel: rgba(255,255,255,0.06);
+      --panel2: rgba(255,255,255,0.09);
+      --text: rgba(255,255,255,0.92);
+      --muted: rgba(255,255,255,0.62);
+      --border: rgba(255,255,255,0.10);
+      --shadow: 0 12px 30px rgba(0,0,0,0.35);
 
-  <div class="card">
-    <div class="filters">
-      <div><label>shop_id</label><input id="shopId" value="{shop_id}" /></div>
-      <div>
-        <label>view</label>
-        <select id="viewSelect">
-          <option value="customers" {"selected" if view=="customers" else ""}>customers</option>
-          <option value="events" {"selected" if view=="events" else ""}>events</option>
-          <option value="followups" {"selected" if view=="followups" else ""}>followups</option>
-          <option value="ab_stats" {"selected" if view=="ab_stats" else ""}>ab_stats</option>
-        </select>
+      --good: #37d67a;
+      --warn: #ffb020;
+      --bad: #ff4d4d;
+      --blue: #4da3ff;
+
+      --radius: 18px;
+      --radius2: 14px;
+      --gap: 14px;
+      --font: ui-sans-serif, system-ui, -apple-system, "SF Pro Display", "Hiragino Sans", "Noto Sans JP", "Segoe UI", Roboto, "Helvetica Neue", Arial;
+    }}
+
+    body.light {{
+      --bg: #f7f8fb;
+      --panel: rgba(0,0,0,0.04);
+      --panel2: rgba(0,0,0,0.06);
+      --text: rgba(0,0,0,0.88);
+      --muted: rgba(0,0,0,0.56);
+      --border: rgba(0,0,0,0.10);
+      --shadow: 0 10px 24px rgba(0,0,0,0.10);
+    }}
+
+    * {{ box-sizing: border-box; }}
+    html, body {{ height: 100%; }}
+    body {{
+      margin: 0;
+      font-family: var(--font);
+      background: radial-gradient(1200px 700px at 20% 0%, rgba(77,163,255,0.25), transparent 60%),
+                  radial-gradient(900px 500px at 90% 10%, rgba(255,77,77,0.20), transparent 60%),
+                  radial-gradient(900px 600px at 60% 100%, rgba(55,214,122,0.14), transparent 60%),
+                  var(--bg);
+      color: var(--text);
+    }}
+    a {{ color: inherit; text-decoration: none; }}
+
+    .app {{
+      display: grid;
+      grid-template-columns: 290px 1fr;
+      min-height: 100vh;
+    }}
+
+    /* Sidebar */
+    .sidebar {{
+      padding: 18px;
+      border-right: 1px solid var(--border);
+      backdrop-filter: blur(10px);
+    }}
+    .brand {{
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      padding: 12px 12px;
+      border-radius: var(--radius2);
+      background: var(--panel);
+      box-shadow: var(--shadow);
+    }}
+    .logo {{
+      width: 36px; height: 36px;
+      border-radius: 14px;
+      background: linear-gradient(135deg, rgba(77,163,255,0.9), rgba(255,77,77,0.7));
+    }}
+    .brand-title {{ font-weight: 900; letter-spacing: 0.2px; }}
+    .brand-sub {{ font-size: 12px; color: var(--muted); margin-top: 2px; }}
+
+    .nav {{
+      margin-top: 14px;
+      display: grid;
+      gap: 8px;
+    }}
+    .nav a {{
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      padding: 12px 12px;
+      border-radius: 14px;
+      border: 1px solid transparent;
+      color: var(--muted);
+      background: transparent;
+    }}
+    .nav a.active {{
+      background: var(--panel2);
+      border-color: var(--border);
+      color: var(--text);
+    }}
+    .nav a:hover {{
+      background: var(--panel);
+      border-color: var(--border);
+      color: var(--text);
+    }}
+    .pill {{
+      font-size: 12px;
+      padding: 4px 10px;
+      border-radius: 999px;
+      background: var(--panel2);
+      border: 1px solid var(--border);
+      color: var(--muted);
+      white-space: nowrap;
+    }}
+
+    .sidecard {{
+      margin-top: 14px;
+      padding: 12px;
+      border-radius: var(--radius2);
+      border: 1px solid var(--border);
+      background: var(--panel);
+    }}
+    .sidecard .small {{
+      font-size: 12px;
+      color: var(--muted);
+      line-height: 1.6;
+    }}
+
+    /* Main */
+    .main {{ padding: 18px 18px 28px; }}
+
+    .topbar {{
+      display: flex;
+      gap: 12px;
+      align-items: center;
+      justify-content: space-between;
+      margin-bottom: 14px;
+    }}
+    .title {{
+      display: grid;
+      gap: 2px;
+    }}
+    .title h1 {{
+      font-size: 22px;
+      margin: 0;
+      letter-spacing: 0.2px;
+    }}
+    .title .meta {{ font-size: 12px; color: var(--muted); }}
+
+    .actions {{
+      display: flex;
+      gap: 10px;
+      align-items: center;
+      flex-wrap: wrap;
+      justify-content: flex-end;
+    }}
+    .search {{
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      padding: 10px 12px;
+      border-radius: 999px;
+      border: 1px solid var(--border);
+      background: var(--panel);
+      min-width: 280px;
+    }}
+    .search input {{
+      flex: 1;
+      border: none;
+      outline: none;
+      background: transparent;
+      color: var(--text);
+      font-size: 14px;
+    }}
+    .btn {{
+      border: 1px solid var(--border);
+      background: var(--panel);
+      color: var(--text);
+      padding: 10px 12px;
+      border-radius: 999px;
+      cursor: pointer;
+      white-space: nowrap;
+    }}
+    .btn:hover {{ background: var(--panel2); }}
+    .btn.primary {{
+      background: rgba(77,163,255,0.22);
+      border-color: rgba(77,163,255,0.35);
+    }}
+    .btn.primary:hover {{ background: rgba(77,163,255,0.28); }}
+
+    .grid {{
+      display: grid;
+      gap: var(--gap);
+    }}
+    .grid.kpis {{
+      grid-template-columns: repeat(4, minmax(0, 1fr));
+    }}
+    .grid.cols {{
+      grid-template-columns: 1.25fr 0.75fr;
+      align-items: start;
+      margin-top: 14px;
+    }}
+    .card {{
+      border: 1px solid var(--border);
+      background: var(--panel);
+      border-radius: var(--radius);
+      box-shadow: var(--shadow);
+      padding: 14px;
+    }}
+    .section-title {{
+      display: flex;
+      align-items: baseline;
+      justify-content: space-between;
+      margin-bottom: 10px;
+      gap: 10px;
+    }}
+    .section-title h2 {{
+      margin: 0;
+      font-size: 14px;
+      letter-spacing: 0.2px;
+    }}
+    .section-title span {{
+      font-size: 12px;
+      color: var(--muted);
+    }}
+
+    /* KPI */
+    .kpi-top {{
+      display: flex;
+      align-items: baseline;
+      justify-content: space-between;
+      gap: 10px;
+      margin-bottom: 8px;
+    }}
+    .kpi-label {{ font-size: 13px; color: var(--muted); }}
+    .kpi-value {{ font-size: 26px; font-weight: 900; letter-spacing: 0.2px; }}
+    .kpi-delta {{ font-size: 12px; color: var(--muted); }}
+
+    /* Table */
+    table {{
+      width: 100%;
+      border-collapse: collapse;
+      overflow: hidden;
+      border-radius: 14px;
+    }}
+    thead th {{
+      text-align: left;
+      font-size: 12px;
+      color: var(--muted);
+      font-weight: 800;
+      padding: 10px 10px;
+      border-bottom: 1px solid var(--border);
+      white-space: nowrap;
+    }}
+    tbody td {{
+      padding: 12px 10px;
+      border-bottom: 1px solid var(--border);
+      font-size: 13px;
+      color: var(--text);
+      vertical-align: top;
+    }}
+    tbody tr:hover {{ background: var(--panel2); }}
+    .mono {{ font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas; font-size: 12px; }}
+    .muted {{ color: var(--muted); }}
+    .rowmsg {{ max-width: 820px; word-break: break-word; white-space: pre-wrap; }}
+
+    /* Badges */
+    .badge {{
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      padding: 4px 10px;
+      border-radius: 999px;
+      font-size: 12px;
+      border: 1px solid var(--border);
+      background: var(--panel2);
+      color: var(--text);
+      white-space: nowrap;
+    }}
+    .badge.good {{ background: rgba(55,214,122,0.14); border-color: rgba(55,214,122,0.35); }}
+    .badge.warn {{ background: rgba(255,176,32,0.14); border-color: rgba(255,176,32,0.35); }}
+    .badge.bad  {{ background: rgba(255,77,77,0.14); border-color: rgba(255,77,77,0.35); }}
+
+    .chips {{
+      display: inline-flex;
+      gap: 6px;
+      flex-wrap: wrap;
+    }}
+    .chip {{
+      font-size: 12px;
+      padding: 3px 10px;
+      border-radius: 999px;
+      border: 1px solid var(--border);
+      background: var(--panel2);
+      color: var(--muted);
+      white-space: nowrap;
+    }}
+    .chip.ok {{ color: var(--text); }}
+    .chip.ng {{ opacity: 0.8; }}
+
+    /* Activity */
+    .activity-item {{
+      display: grid;
+      grid-template-columns: 72px 1fr;
+      gap: 10px;
+      padding: 10px 0;
+      border-bottom: 1px solid var(--border);
+    }}
+    .activity-item:last-child {{ border-bottom: none; }}
+    .activity-time {{ font-size: 12px; color: var(--muted); padding-top: 2px; }}
+    .activity-text {{ font-size: 13px; line-height: 1.5; }}
+
+    /* Controls */
+    .controls {{
+      display: grid;
+      grid-template-columns: 1fr 140px 140px 160px;
+      gap: 10px;
+      margin-top: 10px;
+    }}
+    .controls label {{ font-size: 12px; color: var(--muted); display: block; margin-bottom: 4px; }}
+    .controls input, .controls select {{
+      width: 100%;
+      padding: 10px;
+      border-radius: 12px;
+      border: 1px solid var(--border);
+      background: var(--panel);
+      color: var(--text);
+      outline: none;
+    }}
+    .controls input::placeholder {{ color: var(--muted); }}
+
+    @media (max-width: 1100px) {{
+      .grid.kpis {{ grid-template-columns: repeat(2, minmax(0, 1fr)); }}
+      .grid.cols {{ grid-template-columns: 1fr; }}
+      .search {{ min-width: 180px; }}
+    }}
+    @media (max-width: 860px) {{
+      .app {{ grid-template-columns: 1fr; }}
+      .sidebar {{ position: sticky; top: 0; z-index: 10; }}
+      .controls {{ grid-template-columns: 1fr 1fr; }}
+      .search {{ display: none; }}
+    }}
+  </style>
+</head>
+<body>
+  <div class="app">
+    <aside class="sidebar">
+      <div class="brand">
+        <div class="logo"></div>
+        <div>
+          <div class="brand-title">LINE追客 Dashboard</div>
+          <div class="brand-sub"><span class="mono">{shop_id}</span> / <span id="now">-</span></div>
+        </div>
       </div>
-      <div><label>min_level</label><input id="minLevel" type="number" min="1" max="10" value="{min_level}" /></div>
-      <div><label>limit</label><input id="limit" type="number" min="1" max="200" value="{limit}" /></div>
-      <div><label>auto refresh</label><input id="refreshSec" type="number" min="0" max="300" value="{refresh}" /></div>
-    </div>
-    <div class="search">
-      <input id="searchBox" placeholder="search..." />
-      <button id="btnApply">反映</button>
-      <button id="btnRefresh">更新</button>
-    </div>
-  </div>
 
-  <div class="card">
-    <table>
-      <thead id="thead"></thead>
-      <tbody id="tbody"><tr><td>Loading...</td></tr></tbody>
-    </table>
+      <nav class="nav">
+        <a href="#" id="nav-home" class="active" onclick="setTab('home'); return false;">
+          <div>🏠 ホーム</div><div class="pill">Overview</div>
+        </a>
+        <a href="#" id="nav-customers" onclick="setTab('customers'); return false;">
+          <div>👥 顧客</div><div class="pill">customers</div>
+        </a>
+        <a href="#" id="nav-events" onclick="setTab('events'); return false;">
+          <div>🧾 イベント</div><div class="pill">events</div>
+        </a>
+        <a href="#" id="nav-followups" onclick="setTab('followups'); return false;">
+          <div>📨 追客</div><div class="pill">followups</div>
+        </a>
+        <a href="#" id="nav-ab" onclick="setTab('ab_stats'); return false;">
+          <div>🧪 A/B</div><div class="pill">ab_stats</div>
+        </a>
+      </nav>
+
+      <div class="sidecard">
+        <div class="small">
+          ✅ まず “要返信 / 内見 / 温度8+” を上から処理<br/>
+          ✅ 右上「更新」or 自動更新で運用ラク<br/>
+          ✅ URLの <span class="mono">?key=</span> は共有しない
+        </div>
+      </div>
+    </aside>
+
+    <main class="main">
+      <div class="topbar">
+        <div class="title">
+          <h1 id="pageTitle">ホーム</h1>
+          <div class="meta">全体状況が “1ページ” で分かる</div>
+        </div>
+        <div class="actions">
+          <div class="search">
+            🔎 <input id="q" placeholder="user_id / 次のゴール / メッセージ / status で検索" />
+          </div>
+          <button class="btn" id="toggleTheme">🌓</button>
+          <button class="btn" id="btnApply">反映</button>
+          <button class="btn primary" id="btnRefresh">⟲ 更新</button>
+        </div>
+      </div>
+
+      <section class="grid kpis">
+        <div class="card">
+          <div class="kpi-top"><div class="kpi-label">顧客（表示範囲）</div><div class="kpi-delta muted">customers(min_level)</div></div>
+          <div class="kpi-value" id="kpiCustomers">-</div>
+          <div class="kpi-delta" id="kpiCustomersSub">-</div>
+        </div>
+        <div class="card">
+          <div class="kpi-top"><div class="kpi-label">温度 8+（優先）</div><div class="kpi-delta muted">HOT</div></div>
+          <div class="kpi-value" id="kpiHot">-</div>
+          <div class="kpi-delta" id="kpiHotSub">-</div>
+        </div>
+        <div class="card">
+          <div class="kpi-top"><div class="kpi-label">要返信っぽい（目視補助）</div><div class="kpi-delta muted">heuristic</div></div>
+          <div class="kpi-value" id="kpiNeed">-</div>
+          <div class="kpi-delta muted">next_goal/status/文言で推定</div>
+        </div>
+        <div class="card">
+          <div class="kpi-top"><div class="kpi-label">追客返信率（A/B）</div><div class="kpi-delta muted">ab_stats</div></div>
+          <div class="kpi-value" id="kpiAbRate">-</div>
+          <div class="kpi-delta" id="kpiAbSub">-</div>
+        </div>
+      </section>
+
+      <section class="grid cols">
+        <div class="grid" style="gap: var(--gap);">
+          <div class="card">
+            <div class="section-title">
+              <h2>温度分布（表示範囲）</h2>
+              <span>Lv別件数</span>
+            </div>
+            <canvas id="chartLevels" height="120"></canvas>
+          </div>
+
+          <div class="card" id="homeTopCard">
+            <div class="section-title">
+              <h2>今やる（上から処理）</h2>
+              <span>温度/内見/要返信</span>
+            </div>
+            <div style="overflow:auto; border-radius: 14px;">
+              <table>
+                <thead>
+                  <tr>
+                    <th>更新</th>
+                    <th>温度</th>
+                    <th>status</th>
+                    <th>次</th>
+                    <th>user</th>
+                    <th>msg</th>
+                    <th>内見枠</th>
+                  </tr>
+                </thead>
+                <tbody id="homeTop"></tbody>
+              </table>
+            </div>
+          </div>
+
+          <div class="card" id="detailTableCard" style="display:none;">
+            <div class="section-title">
+              <h2 id="detailTitle">詳細</h2>
+              <span id="detailHint">-</span>
+            </div>
+            <div style="overflow:auto; border-radius: 14px;">
+              <table>
+                <thead id="thead"></thead>
+                <tbody id="tbody"><tr><td>Loading...</td></tr></tbody>
+              </table>
+            </div>
+          </div>
+        </div>
+
+        <div class="grid" style="gap: var(--gap);">
+          <div class="card">
+            <div class="section-title">
+              <h2>最近のアクティビティ</h2>
+              <span>events（最新）</span>
+            </div>
+            <div id="activities"></div>
+          </div>
+
+          <div class="card">
+            <div class="section-title">
+              <h2>フィルター</h2>
+              <span>反映 → URL更新</span>
+            </div>
+
+            <div class="controls">
+              <div>
+                <label>shop_id</label>
+                <input id="shopId" value="{shop_id}" />
+              </div>
+              <div>
+                <label>min_level</label>
+                <input id="minLevel" type="number" min="1" max="10" value="{min_level}" />
+              </div>
+              <div>
+                <label>limit</label>
+                <input id="limit" type="number" min="1" max="200" value="{limit}" />
+              </div>
+              <div>
+                <label>auto refresh(sec)</label>
+                <input id="refreshSec" type="number" min="0" max="300" value="{refresh}" />
+              </div>
+            </div>
+
+            <div style="display:flex; gap:10px; margin-top: 10px; flex-wrap: wrap;">
+              <button class="btn" onclick="setTab('home'); return false;">🏠 ホームへ</button>
+              <button class="btn" onclick="setTab('customers'); return false;">👥 顧客</button>
+              <button class="btn" onclick="setTab('followups'); return false;">📨 追客</button>
+              <button class="btn" onclick="setTab('ab_stats'); return false;">🧪 A/B</button>
+            </div>
+
+            <div class="sidecard" style="margin-top: 12px;">
+              <div class="small">
+                <b>TIP</b><br/>
+                ・検索は上の 🔎 で即フィルタ<br/>
+                ・ホームの「今やる」は <span class="mono">温度/内見/要返信推定</span> で並び替え
+              </div>
+            </div>
+          </div>
+        </div>
+      </section>
+
+    </main>
   </div>
-</div>
 
 <script>
-const LEVEL_COLORS = {json.dumps(LEVEL_COLORS)};
-const DASH_KEY = {json.dumps(key_q)};
-let cache = [];
+  const LEVEL_COLORS = {json.dumps(LEVEL_COLORS, ensure_ascii=False)};
+  const DASH_KEY = {json.dumps(key_q, ensure_ascii=False)};
 
-function escapeHtml(s){{return (s||"").replace(/[&<>"]/g,c=>({{"&":"&amp;","<":"&lt;",">":"&gt;","\\"":"&quot;"}}[c]));}}
-function fmtTime(iso){{if(!iso) return "-"; try{{return new Date(iso).toLocaleString();}}catch(e){{return iso;}}}}
-function pill(level){{const c=LEVEL_COLORS[level]||"#999"; return `<span class="pill" style="background:${{c}}">Lv${{level}}</span>`;}}
-function badgeStatus(s){{const v=(s||"").toLowerCase(); if(v==="sent")return `<span class="badge ok">sent</span>`; if(v==="failed")return `<span class="badge ng">failed</span>`; return `<span class="badge">${{escapeHtml(s||"-")}}</span>`;}}
-function matches(row,q){{ if(!q) return true; q=q.toLowerCase(); const fields=[row.user_id,row.message,row.next_goal,row.status,row.variant,row.error,row.visit_slot_selected,row.slot_budget,row.slot_area,row.slot_move_in,row.slot_layout].map(x=>(x||"").toLowerCase()); return fields.some(f=>f.includes(q)); }}
+  const state = {{
+    tab: "home",
+    customers: [],
+    events: [],
+    followups: [],
+    ab: [],
+    timer: null,
+    chart: null,
+  }};
 
-function slotTags(r){{
-  const items=[["予算",r.slot_budget],["エリア",r.slot_area],["時期",r.slot_move_in],["間取り",r.slot_layout]];
-  return `<span class="slot">` + items.map(([k,v])=>`<span class="tag ${{(v? "ok":"ng")}}">${{k}}${{(v? "✓":"✗")}}</span>`).join("") + `</span>`;
-}}
-
-function setHeader(view){{
-  const thead=document.getElementById("thead");
-  if(view==="customers") {{
-    thead.innerHTML=`<tr><th>更新</th><th>温度</th><th>確度</th><th>status</th><th>条件</th><th>次</th><th>user</th><th>msg</th><th>内見枠</th></tr>`;
-    return;
+  function escapeHtml(s) {{
+    return (s ?? "").toString().replace(/[&<>"]/g, (c) => ({{"&":"&amp;","<":"&lt;",">":"&gt;","\\"":"&quot;"}}[c]));
   }}
-  if(view==="ab_stats") {{
-    thead.innerHTML=`<tr><th>variant</th><th>sent</th><th>responded</th><th>rate</th></tr>`;
-    return;
+  function fmtTime(iso) {{
+    if (!iso) return "-";
+    try {{ return new Date(iso).toLocaleString(); }} catch(e) {{ return iso; }}
   }}
-  if(view==="followups") {{
-    thead.innerHTML=`<tr><th>更新</th><th>status</th><th>stage</th><th>variant</th><th>user</th><th>msg</th><th>resp</th><th>err</th></tr>`;
-    return;
+  function pill(level) {{
+    const lv = Number(level || 0);
+    const c = LEVEL_COLORS[lv] || "#999";
+    return `<span class="badge" style="background:${{c}}22;border-color:${{c}}55;">Lv${{lv}}</span>`;
   }}
-  thead.innerHTML=`<tr><th>更新</th><th>role</th><th>温度</th><th>確度</th><th>次</th><th>user</th><th>msg</th></tr>`;
-}}
-
-function render(){{
-  const view=document.getElementById("viewSelect").value;
-  setHeader(view);
-  const q=document.getElementById("searchBox").value.trim().toLowerCase();
-  const rows=cache.filter(r=>matches(r,q));
-  const tbody=document.getElementById("tbody");
-  if(!rows.length){{tbody.innerHTML=`<tr><td colspan="9">No data</td></tr>`; return;}}
-
-  if(view==="ab_stats") {{
-    tbody.innerHTML=rows.map(r=>`<tr><td class="mono">${{r.variant}}</td><td class="mono">${{r.sent}}</td><td class="mono">${{r.responded}}</td><td class="mono">${{(r.rate*100).toFixed(1)}}%</td></tr>`).join("");
-    return;
+  function chipsSlots(r) {{
+    const items = [
+      ["予算", r.slot_budget],
+      ["エリア", r.slot_area],
+      ["時期", r.slot_move_in],
+      ["間取り", r.slot_layout],
+    ];
+    return `<span class="chips">` + items.map(([k,v]) => {{
+      const ok = !!(v && String(v).trim());
+      return `<span class="chip ${{ok ? "ok":"ng"}}">${{k}}${{ok ? "✓":"✗"}}</span>`;
+    }}).join("") + `</span>`;
   }}
 
-  if(view==="followups") {{
-    tbody.innerHTML=rows.map(r=>`<tr>
-      <td class="mono">${{escapeHtml(fmtTime(r.ts))}}</td>
-      <td class="mono">${{escapeHtml(r.status||"-")}}</td>
-      <td class="mono">${{escapeHtml(String(r.stage ?? "-"))}}</td>
-      <td class="mono">${{escapeHtml(r.variant||"-")}}</td>
-      <td class="mono">${{escapeHtml(r.user_id||"")}}</td>
-      <td class="rowmsg">${{escapeHtml(r.message||"")}}</td>
-      <td class="mono">${{r.responded_at ? "YES":"-"}}</td>
-      <td class="mono">${{escapeHtml(r.error||"-")}}</td>
-    </tr>`).join("");
-    return;
+  function isNeedReplyHeuristic(r) {{
+    const st = (r.status || "").toUpperCase();
+    const goal = (r.next_goal || "");
+    const msg = (r.message || "");
+    if (st === "OPTOUT" || st === "LOST" || st === "COLD") return false;
+    if (goal.includes("要件確認") || goal.includes("確認") || goal.includes("日程") || goal.includes("内見")) return true;
+    if (msg.includes("？") || msg.includes("?")) return true;
+    return false;
   }}
 
-  if(view==="customers") {{
-    tbody.innerHTML=rows.map(r=>{{
-      const lvl=(r.temp_level_stable==null)?"-":pill(r.temp_level_stable);
-      const conf=(r.confidence==null)?"-":Number(r.confidence).toFixed(2);
-      const st=escapeHtml(r.status||"ACTIVE");
-      const tags=slotTags(r);
-      const visit=r.visit_slot_selected ? escapeHtml(r.visit_slot_selected) : "-";
+  function scoreForHome(r) {{
+    const lvl = Number(r.temp_level_stable || 0);
+    const hasVisit = !!(r.visit_slot_selected && r.visit_slot_selected !== "REQUEST_CHANGE");
+    const need = isNeedReplyHeuristic(r);
+    const st = (r.status || "ACTIVE").toUpperCase();
+    let s = 0;
+    s += lvl * 10;
+    if (hasVisit) s += 25;
+    if (need) s += 15;
+    if (st === "ACTIVE") s += 5;
+    if (st === "COLD" || st === "LOST" || st === "OPTOUT") s -= 999;
+    return s;
+  }}
+
+  function setTab(tab) {{
+    state.tab = tab;
+    const tabs = ["home","customers","events","followups","ab_stats"];
+    for (const t of tabs) {{
+      const el = document.getElementById("nav-" + (t === "ab_stats" ? "ab" : t));
+      if (el) el.classList.toggle("active", tab === t);
+    }}
+
+    const titleMap = {{
+      home: "ホーム",
+      customers: "顧客（customers）",
+      events: "イベント（events）",
+      followups: "追客（followups）",
+      ab_stats: "A/B（ab_stats）",
+    }};
+    document.getElementById("pageTitle").textContent = titleMap[tab] || "Dashboard";
+
+    document.getElementById("homeTopCard").style.display = (tab === "home") ? "" : "none";
+    document.getElementById("detailTableCard").style.display = (tab === "home") ? "none" : "";
+
+    if (tab !== "home") renderDetail();
+  }}
+
+  async function fetchJson(view) {{
+    const shopId = document.getElementById("shopId").value.trim();
+    const minLevel = document.getElementById("minLevel").value;
+    const limit = document.getElementById("limit").value;
+    const url = `/api/hot?shop_id=${{encodeURIComponent(shopId)}}&min_level=${{encodeURIComponent(minLevel)}}&limit=${{encodeURIComponent(limit)}}&view=${{encodeURIComponent(view)}}&key=${{encodeURIComponent(DASH_KEY)}}`;
+    const res = await fetch(url, {{ credentials: "same-origin" }});
+    return await res.json();
+  }}
+
+  function updateNow() {{
+    const d = new Date();
+    document.getElementById("now").textContent = d.toLocaleString();
+  }}
+
+  function updateKpis() {{
+    const customers = state.customers || [];
+    const total = customers.length;
+
+    const hot = customers.filter(r => Number(r.temp_level_stable || 0) >= 8 && (r.status || "").toUpperCase() === "ACTIVE").length;
+    const need = customers.filter(r => isNeedReplyHeuristic(r)).length;
+
+    document.getElementById("kpiCustomers").textContent = total.toString();
+    document.getElementById("kpiCustomersSub").textContent = `min_level=${{document.getElementById("minLevel").value}} / limit=${{document.getElementById("limit").value}}`;
+
+    document.getElementById("kpiHot").textContent = hot.toString();
+    document.getElementById("kpiHotSub").textContent = `温度8+ & ACTIVE`;
+
+    document.getElementById("kpiNeed").textContent = need.toString();
+
+    // AB rate
+    const ab = state.ab || [];
+    const totalSent = ab.reduce((a,r)=>a + Number(r.sent||0), 0);
+    const totalResp = ab.reduce((a,r)=>a + Number(r.responded||0), 0);
+    const rate = totalSent > 0 ? (totalResp/totalSent) : 0;
+    document.getElementById("kpiAbRate").textContent = totalSent > 0 ? `${{(rate*100).toFixed(1)}}%` : "-";
+    if (ab.length) {{
+      const parts = ab.map(r => `${{r.variant}}:${{Number(r.rate*100).toFixed(1)}}%`);
+      document.getElementById("kpiAbSub").textContent = parts.join(" / ");
+    }} else {{
+      document.getElementById("kpiAbSub").textContent = "データなし";
+    }}
+  }}
+
+  function renderHomeTop() {{
+    const q = (document.getElementById("q").value || "").trim().toLowerCase();
+    const rows = (state.customers || [])
+      .filter(r => {{
+        if (!q) return true;
+        const fields = [r.user_id,r.message,r.next_goal,r.status,r.visit_slot_selected,r.slot_budget,r.slot_area,r.slot_move_in,r.slot_layout]
+          .map(x => (x||"").toString().toLowerCase());
+        return fields.some(f => f.includes(q));
+      }})
+      .slice()
+      .sort((a,b)=> scoreForHome(b) - scoreForHome(a))
+      .slice(0, 30);
+
+    const tbody = document.getElementById("homeTop");
+    if (!rows.length) {{
+      tbody.innerHTML = `<tr><td colspan="7" class="muted">No data</td></tr>`;
+      return;
+    }}
+
+    tbody.innerHTML = rows.map(r => {{
+      const st = (r.status || "ACTIVE").toUpperCase();
+      const stBadge = st === "ACTIVE" ? "badge good" : (st === "COLD" ? "badge warn" : "badge bad");
+      const visit = r.visit_slot_selected ? escapeHtml(r.visit_slot_selected) : "-";
       return `<tr>
-        <td class="mono">${{escapeHtml(fmtTime(r.ts))}}</td>
-        <td>${{lvl}}</td>
-        <td class="mono">${{conf}}</td>
-        <td class="mono">${{st}}</td>
-        <td>${{tags}}</td>
-        <td>${{escapeHtml(r.next_goal||"-")}}</td>
-        <td class="mono">${{escapeHtml(r.user_id||"")}}</td>
-        <td class="rowmsg">${{escapeHtml(r.message||"")}}</td>
+        <td class="mono muted">${{escapeHtml(fmtTime(r.ts))}}</td>
+        <td>${{r.temp_level_stable ? pill(r.temp_level_stable) : "-"}}</td>
+        <td><span class="${{stBadge}}">${{escapeHtml(st)}}</span></td>
+        <td>${{escapeHtml(r.next_goal || "-")}}</td>
+        <td class="mono">${{escapeHtml(r.user_id || "")}}</td>
+        <td class="rowmsg">${{escapeHtml(r.message || "")}}</td>
         <td class="mono">${{visit}}</td>
       </tr>`;
     }}).join("");
-    return;
   }}
 
-  tbody.innerHTML=rows.map(r=>{{
-    const lvl=(r.temp_level_stable==null)?"-":pill(r.temp_level_stable);
-    const conf=(r.confidence==null)?"-":Number(r.confidence).toFixed(2);
-    return `<tr>
-      <td class="mono">${{escapeHtml(fmtTime(r.ts))}}</td>
-      <td class="mono">${{escapeHtml(r.role||"-")}}</td>
-      <td>${{lvl}}</td>
-      <td class="mono">${{conf}}</td>
-      <td>${{escapeHtml(r.next_goal||"-")}}</td>
-      <td class="mono">${{escapeHtml(r.user_id||"")}}</td>
-      <td class="rowmsg">${{escapeHtml(r.message||"")}}</td>
-    </tr>`;
-  }}).join("");
-}}
+  function renderActivities() {{
+    const list = (state.events || []).slice(0, 10);
+    const wrap = document.getElementById("activities");
+    if (!list.length) {{
+      wrap.innerHTML = `<div class="muted">No events</div>`;
+      return;
+    }}
+    wrap.innerHTML = list.map(e => {{
+      const role = (e.role || "").toLowerCase();
+      const badge = role === "user" ? `<span class="badge warn">user</span>` : `<span class="badge good">assistant</span>`;
+      return `<div class="activity-item">
+        <div class="activity-time mono">${{escapeHtml(fmtTime(e.ts))}}</div>
+        <div class="activity-text">
+          <div style="display:flex; gap:8px; align-items:center; flex-wrap:wrap;">
+            ${{badge}}
+            <span class="mono muted">${{escapeHtml(e.user_id || "")}}</span>
+            ${{e.temp_level_stable ? pill(e.temp_level_stable) : ""}}
+            <span class="muted">${{escapeHtml(e.next_goal || "")}}</span>
+          </div>
+          <div style="margin-top:6px" class="rowmsg">${{escapeHtml(e.message || "")}}</div>
+        </div>
+      </div>`;
+    }}).join("");
+  }}
 
-async function fetchData(){{
-  const shopId=document.getElementById("shopId").value.trim();
-  const view=document.getElementById("viewSelect").value;
-  const minLevel=document.getElementById("minLevel").value;
-  const limit=document.getElementById("limit").value;
-  const url=`/api/hot?shop_id=${{encodeURIComponent(shopId)}}&min_level=${{encodeURIComponent(minLevel)}}&limit=${{encodeURIComponent(limit)}}&view=${{encodeURIComponent(view)}}&key=${{encodeURIComponent(DASH_KEY)}}`;
-  const res=await fetch(url, {{credentials:"same-origin"}});
-  cache=await res.json();
-  render();
-}}
+  function renderChartLevels() {{
+    const counts = new Array(10).fill(0);
+    for (const r of (state.customers || [])) {{
+      const lv = Number(r.temp_level_stable || 0);
+      if (lv >= 1 && lv <= 10) counts[lv-1] += 1;
+    }}
+    const labels = ["1","2","3","4","5","6","7","8","9","10"];
+    const data = counts;
 
-document.getElementById("btnRefresh").addEventListener("click", fetchData);
-document.getElementById("btnApply").addEventListener("click", ()=> {{
-  const shopId=document.getElementById("shopId").value.trim();
-  const view=document.getElementById("viewSelect").value;
-  const minLevel=document.getElementById("minLevel").value;
-  const limit=document.getElementById("limit").value;
-  const refreshSec=document.getElementById("refreshSec").value;
-  const qs=new URLSearchParams({{shop_id:shopId,view:view,min_level:minLevel,limit:limit,refresh:refreshSec,key:DASH_KEY}});
-  window.location.href=`/dashboard?${{qs.toString()}}`;
-}});
-document.getElementById("searchBox").addEventListener("input", render);
+    const ctx = document.getElementById("chartLevels");
+    if (state.chart) {{
+      state.chart.data.labels = labels;
+      state.chart.data.datasets[0].data = data;
+      state.chart.update();
+      return;
+    }}
+    state.chart = new Chart(ctx, {{
+      type: 'bar',
+      data: {{
+        labels,
+        datasets: [{{
+          label: '件数',
+          data,
+          borderWidth: 1,
+        }}]
+      }},
+      options: {{
+        responsive: true,
+        plugins: {{
+          legend: {{ labels: {{ color: getComputedStyle(document.body).getPropertyValue('--muted') }} }}
+        }},
+        scales: {{
+          x: {{
+            ticks: {{ color: getComputedStyle(document.body).getPropertyValue('--muted') }},
+            grid: {{ color: getComputedStyle(document.body).getPropertyValue('--border') }}
+          }},
+          y: {{
+            ticks: {{ color: getComputedStyle(document.body).getPropertyValue('--muted') }},
+            grid: {{ color: getComputedStyle(document.body).getPropertyValue('--border') }}
+          }}
+        }}
+      }}
+    }});
+  }}
 
-let timer=null;
-function setupAutoRefresh(){{
-  if(timer) clearInterval(timer);
-  const sec=parseInt(document.getElementById("refreshSec").value||"0",10);
-  if(sec>0) timer=setInterval(fetchData, sec*1000);
-}}
-document.getElementById("refreshSec").addEventListener("change", setupAutoRefresh);
+  function setHeader(view) {{
+    const thead = document.getElementById("thead");
+    if (view === "customers") {{
+      thead.innerHTML = `<tr>
+        <th>更新</th><th>温度</th><th>確度</th><th>status</th><th>条件</th><th>次</th><th>user</th><th>msg</th><th>内見枠</th>
+      </tr>`;
+      return;
+    }}
+    if (view === "ab_stats") {{
+      thead.innerHTML = `<tr><th>variant</th><th>sent</th><th>responded</th><th>rate</th></tr>`;
+      return;
+    }}
+    if (view === "followups") {{
+      thead.innerHTML = `<tr><th>更新</th><th>status</th><th>stage</th><th>variant</th><th>user</th><th>msg</th><th>resp</th><th>err</th></tr>`;
+      return;
+    }}
+    thead.innerHTML = `<tr><th>更新</th><th>role</th><th>温度</th><th>確度</th><th>次</th><th>user</th><th>msg</th></tr>`;
+  }}
 
-fetchData().then(setupAutoRefresh).catch(console.error);
+  function renderDetail() {{
+    const view = state.tab;
+    const q = (document.getElementById("q").value || "").trim().toLowerCase();
+    const tbody = document.getElementById("tbody");
+
+    setHeader(view);
+    document.getElementById("detailTitle").textContent = `詳細：${{view}}`;
+    document.getElementById("detailHint").textContent = `search / auto refresh 対応`;
+
+    let rows = [];
+    if (view === "customers") rows = state.customers || [];
+    else if (view === "events") rows = state.events || [];
+    else if (view === "followups") rows = state.followups || [];
+    else rows = state.ab || [];
+
+    if (q) {{
+      rows = rows.filter(r => {{
+        const fields = [
+          r.user_id, r.message, r.next_goal, r.status, r.variant, r.error, r.role,
+          r.visit_slot_selected, r.slot_budget, r.slot_area, r.slot_move_in, r.slot_layout
+        ].map(x => (x||"").toString().toLowerCase());
+        return fields.some(f => f.includes(q));
+      }});
+    }}
+
+    if (!rows.length) {{
+      tbody.innerHTML = `<tr><td colspan="9" class="muted">No data</td></tr>`;
+      return;
+    }}
+
+    if (view === "ab_stats") {{
+      tbody.innerHTML = rows.map(r => `
+        <tr>
+          <td class="mono">${{escapeHtml(r.variant || "-")}}</td>
+          <td class="mono">${{Number(r.sent || 0)}}</td>
+          <td class="mono">${{Number(r.responded || 0)}}</td>
+          <td class="mono">${{(Number(r.rate || 0) * 100).toFixed(1)}}%</td>
+        </tr>
+      `).join("");
+      return;
+    }}
+
+    if (view === "followups") {{
+      tbody.innerHTML = rows.map(r => `
+        <tr>
+          <td class="mono muted">${{escapeHtml(fmtTime(r.ts))}}</td>
+          <td class="mono">${{escapeHtml(r.status || "-")}}</td>
+          <td class="mono">${{escapeHtml(String(r.stage ?? "-"))}}</td>
+          <td class="mono">${{escapeHtml(r.variant || "-")}}</td>
+          <td class="mono">${{escapeHtml(r.user_id || "")}}</td>
+          <td class="rowmsg">${{escapeHtml(r.message || "")}}</td>
+          <td class="mono">${{r.responded_at ? "YES" : "-"}}</td>
+          <td class="mono muted">${{escapeHtml(r.error || "-")}}</td>
+        </tr>
+      `).join("");
+      return;
+    }}
+
+    if (view === "customers") {{
+      tbody.innerHTML = rows.map(r => {{
+        const st = (r.status || "ACTIVE").toUpperCase();
+        const stBadge = st === "ACTIVE" ? "badge good" : (st === "COLD" ? "badge warn" : "badge bad");
+        const conf = (r.confidence == null) ? "-" : Number(r.confidence).toFixed(2);
+        const visit = r.visit_slot_selected ? escapeHtml(r.visit_slot_selected) : "-";
+        return `
+          <tr>
+            <td class="mono muted">${{escapeHtml(fmtTime(r.ts))}}</td>
+            <td>${{r.temp_level_stable ? pill(r.temp_level_stable) : "-"}}</td>
+            <td class="mono">${{conf}}</td>
+            <td><span class="${{stBadge}}">${{escapeHtml(st)}}</span></td>
+            <td>${{chipsSlots(r)}}</td>
+            <td>${{escapeHtml(r.next_goal || "-")}}</td>
+            <td class="mono">${{escapeHtml(r.user_id || "")}}</td>
+            <td class="rowmsg">${{escapeHtml(r.message || "")}}</td>
+            <td class="mono">${{visit}}</td>
+          </tr>
+        `;
+      }}).join("");
+      return;
+    }}
+
+    // events
+    tbody.innerHTML = rows.map(r => {{
+      const conf = (r.confidence == null) ? "-" : Number(r.confidence).toFixed(2);
+      const role = (r.role || "-").toString();
+      const roleBadge = role === "user" ? `<span class="badge warn">user</span>` : `<span class="badge good">assistant</span>`;
+      return `
+        <tr>
+          <td class="mono muted">${{escapeHtml(fmtTime(r.ts))}}</td>
+          <td>${{roleBadge}}</td>
+          <td>${{r.temp_level_stable ? pill(r.temp_level_stable) : "-"}}</td>
+          <td class="mono">${{conf}}</td>
+          <td>${{escapeHtml(r.next_goal || "-")}}</td>
+          <td class="mono">${{escapeHtml(r.user_id || "")}}</td>
+          <td class="rowmsg">${{escapeHtml(r.message || "")}}</td>
+        </tr>
+      `;
+    }}).join("");
+  }}
+
+  async function fetchAll() {{
+    updateNow();
+
+    // customers（ホーム/KPI/チャートに必須）
+    state.customers = await fetchJson("customers");
+
+    // events（右のアクティビティ用、重いのでlimit小さめ）
+    {{
+      const shopId = document.getElementById("shopId").value.trim();
+      const url = `/api/hot?shop_id=${{encodeURIComponent(shopId)}}&min_level=1&limit=40&view=events&key=${{encodeURIComponent(DASH_KEY)}}`;
+      const res = await fetch(url, {{ credentials: "same-origin" }});
+      state.events = await res.json();
+    }}
+
+    // followups / ab_stats（KPI用）
+    state.followups = await fetchJson("followups");
+    state.ab = await fetchJson("ab_stats");
+
+    updateKpis();
+    renderChartLevels();
+    renderActivities();
+    renderHomeTop();
+
+    if (state.tab !== "home") renderDetail();
+  }}
+
+  function setupAutoRefresh() {{
+    if (state.timer) clearInterval(state.timer);
+    const sec = parseInt(document.getElementById("refreshSec").value || "0", 10);
+    if (sec > 0) {{
+      state.timer = setInterval(() => fetchAll().catch(console.error), sec * 1000);
+    }}
+  }}
+
+  // Theme
+  const keyTheme = "dashboard_theme";
+  const saved = localStorage.getItem(keyTheme);
+  if (saved === "light") document.body.classList.add("light");
+  document.getElementById("toggleTheme").addEventListener("click", () => {{
+    document.body.classList.toggle("light");
+    localStorage.setItem(keyTheme, document.body.classList.contains("light") ? "light" : "dark");
+    // chart repaint colors (simple)
+    if (state.chart) state.chart.update();
+  }});
+
+  // Controls
+  document.getElementById("btnRefresh").addEventListener("click", () => fetchAll().catch(console.error));
+  document.getElementById("btnApply").addEventListener("click", () => {{
+    const shopId = document.getElementById("shopId").value.trim();
+    const minLevel = document.getElementById("minLevel").value;
+    const limit = document.getElementById("limit").value;
+    const refreshSec = document.getElementById("refreshSec").value;
+    const qs = new URLSearchParams({{
+      shop_id: shopId,
+      view: "customers",
+      min_level: minLevel,
+      limit: limit,
+      refresh: refreshSec,
+      key: DASH_KEY
+    }});
+    window.location.href = `/dashboard?${{qs.toString()}}`;
+  }});
+
+  document.getElementById("q").addEventListener("input", () => {{
+    if (state.tab === "home") renderHomeTop();
+    else renderDetail();
+  }});
+  document.getElementById("refreshSec").addEventListener("change", setupAutoRefresh);
+
+  // start
+  setTab("home");
+  fetchAll().then(setupAutoRefresh).catch(console.error);
 </script>
-</body></html>
+</body>
+</html>
 """
     return HTMLResponse(html)
 
