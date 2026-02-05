@@ -1,12 +1,17 @@
 # app.py (FULL REWRITE)
 # FastAPI + Render + Postgres(pg8000)
 #
-# LINE webhook:
-#  - Try FAST AI reply within short timeout (no "確認中" message)
-#  - If AI is slow/failing: send fallback "確認中" ONLY then, and do background AI + push
+# Features:
+#  - LINE webhook fast reply (no "確認中" unless AI fails/slow)
+#  - Temp scoring with hard rules (cancel/optout/short text)
+#  - Followup job with A/B templates + visit slot proposals
+#  - Attribution: user reply -> mark responded_at on latest followup
+#  - Visit slot "reservation": user replies ①/②/1/2... -> store selected slot
+#  - Dashboard views: events / customers / followups / ab_stats
 #
-# Dashboard auth: DASHBOARD_KEY (query ?key=... or header X-Dashboard-Key)
-# Jobs auth: ADMIN_API_KEY (header x-admin-key)
+# Auth:
+#  - Dashboard: DASHBOARD_KEY (query ?key=... or header X-Dashboard-Key)
+#  - Jobs: ADMIN_API_KEY (header x-admin-key)
 #
 # Required env:
 #   LINE_CHANNEL_SECRET
@@ -16,13 +21,14 @@
 #   DASHBOARD_KEY
 #   ADMIN_API_KEY
 #
-# Optional:
+# Optional env:
 #   SHOP_ID
 #   DASHBOARD_REFRESH_SEC_DEFAULT
 #   FAST_REPLY_TIMEOUT_SEC (default 3.0)
 #   ANALYZE_HISTORY_LIMIT (default 10)
+#   SHORT_TEXT_MAX_LEN (default 2)
 #
-# Followup env (recommended):
+# Followup env:
 #   FOLLOWUP_ENABLED=1
 #   FOLLOWUP_AFTER_MINUTES=180
 #   FOLLOWUP_MIN_LEVEL=8
@@ -34,18 +40,17 @@
 #   FOLLOWUP_JST_TO=20
 #   FOLLOWUP_USE_OPENAI=0
 #
-# AB Test + Schedule Proposal (added):
-#   FOLLOWUP_AB_ENABLED=1                # default 1
-#   VISIT_DAYS_AHEAD=3                   # default 3
-#   VISIT_SLOT_HOURS=11,14,17            # default "11,14,17"
-#   FOLLOWUP_ATTRIBUTION_WINDOW_HOURS=72 # default 72 (追客→返信の紐付け)
+# AB + visit slots:
+#   FOLLOWUP_AB_ENABLED=1
+#   VISIT_DAYS_AHEAD=3
+#   VISIT_SLOT_HOURS=11,14,17
+#   FOLLOWUP_ATTRIBUTION_WINDOW_HOURS=72
 
 import os
 import json
 import hmac
 import hashlib
 import base64
-import time
 import ssl
 import secrets
 import asyncio
@@ -102,11 +107,11 @@ TEMP_HISTORY: Dict[str, deque] = defaultdict(lambda: deque(maxlen=5))
 
 JST = timezone(timedelta(hours=9))
 
-app = FastAPI(title="linebot_mvp", version="0.6.0")
+app = FastAPI(title="linebot_mvp", version="0.6.1")
 
 
 # ============================================================
-# HARD RULE patterns
+# Patterns
 # ============================================================
 
 CANCEL_PATTERNS = [
@@ -124,6 +129,10 @@ OPTOUT_PATTERNS = [
     r"連絡(不要|いらない)|もう連絡(しないで|いりません)",
     r"配信停止|停止して|ブロックする",
     r"\bstop\b|\bunsubscribe\b",
+]
+
+VISIT_CHANGE_PATTERNS = [
+    r"別日|他の日|別の?日|別時間|他の時間|時間変えて|日程変えて|調整したい",
 ]
 
 
@@ -265,6 +274,9 @@ def ensure_tables_and_columns() -> None:
     cur.execute("""ALTER TABLE customers ADD COLUMN IF NOT EXISTS next_goal TEXT;""")
     cur.execute("""ALTER TABLE customers ADD COLUMN IF NOT EXISTS opt_out BOOLEAN;""")
     cur.execute("""ALTER TABLE customers ADD COLUMN IF NOT EXISTS opt_out_at TIMESTAMPTZ;""")
+    # ★予約（内見枠確定）
+    cur.execute("""ALTER TABLE customers ADD COLUMN IF NOT EXISTS visit_slot_selected TEXT;""")
+    cur.execute("""ALTER TABLE customers ADD COLUMN IF NOT EXISTS visit_slot_selected_at TIMESTAMPTZ;""")
 
     # messages
     cur.execute(
@@ -303,15 +315,15 @@ def ensure_tables_and_columns() -> None:
           conv_key TEXT NOT NULL,
           user_id TEXT NOT NULL,
           message TEXT NOT NULL,
-          mode TEXT NOT NULL,              -- template|openai
-          status TEXT NOT NULL,            -- sent|skipped|failed
+          mode TEXT NOT NULL,
+          status TEXT NOT NULL,
           error TEXT,
           created_at TIMESTAMPTZ DEFAULT now()
         );
         """
     )
-    cur.execute("""ALTER TABLE followup_logs ADD COLUMN IF NOT EXISTS variant TEXT;""")       # A/B
-    cur.execute("""ALTER TABLE followup_logs ADD COLUMN IF NOT EXISTS responded_at TIMESTAMPTZ;""")  # 返信計測
+    cur.execute("""ALTER TABLE followup_logs ADD COLUMN IF NOT EXISTS variant TEXT;""")
+    cur.execute("""ALTER TABLE followup_logs ADD COLUMN IF NOT EXISTS responded_at TIMESTAMPTZ;""")
 
     # indexes
     cur.execute("""CREATE INDEX IF NOT EXISTS idx_customers_shop_updated ON customers(shop_id, updated_at DESC);""")
@@ -595,6 +607,22 @@ def is_opted_out(shop_id: str, conv_key: str) -> bool:
     return bool(rows[0][0]) if rows else False
 
 
+def set_visit_slot(shop_id: str, conv_key: str, slot_text: str) -> None:
+    """
+    slot_text: "明日 11:00-12:00" など / "REQUEST_CHANGE"
+    """
+    if not DATABASE_URL:
+        return
+    db_execute(
+        """
+        UPDATE customers
+        SET visit_slot_selected=%s, visit_slot_selected_at=now(), updated_at=now()
+        WHERE shop_id=%s AND conv_key=%s
+        """,
+        (slot_text, shop_id, conv_key),
+    )
+
+
 def save_followup_log(
     shop_id: str,
     conv_key: str,
@@ -617,14 +645,9 @@ def save_followup_log(
 
 
 def attribute_followup_response(shop_id: str, conv_key: str) -> None:
-    """
-    ユーザー返信が来た時、直近の追客(sent)に responded_at を付ける
-    """
     if not DATABASE_URL:
         return
     window_since = datetime.now(timezone.utc) - timedelta(hours=FOLLOWUP_ATTRIBUTION_WINDOW_HOURS)
-
-    # 直近 sent で responded_at が空のものを1件
     rows = db_fetchall(
         """
         SELECT id
@@ -723,13 +746,10 @@ async def generate_reply_only(user_id: str, user_text: str) -> str:
 
 
 # ============================================================
-# AB Test + Visit slots (Feature 1 & 2)
+# AB + Visit slots + Reservation
 # ============================================================
 
 def pick_ab_variant(conv_key: str) -> str:
-    """
-    同一ユーザーは常に同じ variant（A/B）
-    """
     if not FOLLOWUP_AB_ENABLED:
         return "A"
     h = hashlib.sha256(conv_key.encode("utf-8")).hexdigest()
@@ -752,32 +772,25 @@ def parse_slot_hours() -> List[int]:
 
 
 def upcoming_visit_slots_jst(days_ahead: int = 3) -> List[str]:
-    """
-    例: ["明日 11:00-12:00", "明日 14:00-15:00", ...]
-    """
     hours = parse_slot_hours()
     now = datetime.now(JST)
     slots: List[str] = []
     for d in range(1, max(1, min(14, days_ahead)) + 1):
-        day = (now + timedelta(days=d))
         label = "明日" if d == 1 else ("明後日" if d == 2 else f"{d}日後")
         for h in hours:
-            # JST window outside? still propose; user can respond
             slots.append(f"{label} {h:02d}:00-{(h+1)%24:02d}:00")
-    return slots[:6]  # 最大6枠
+    return slots[:6]
 
 
 def build_followup_template_ab(variant: str, next_goal: str, last_user_text: str, level: int) -> str:
     goal = (next_goal or "").strip()
     last = (last_user_text or "").strip()
 
-    # 内見/候補日系なら、候補枠を出す（Feature 2）
     is_visit = any(k in goal for k in ["内見", "候補日", "日程"])
+    slots = upcoming_visit_slots_jst(VISIT_DAYS_AHEAD) if is_visit else []
     slot_lines = ""
-    if is_visit:
-        slots = upcoming_visit_slots_jst(VISIT_DAYS_AHEAD)
-        if slots:
-            slot_lines = "候補：\n" + "\n".join([f"・{s}" for s in slots]) + "\n"
+    if slots:
+        slot_lines = "候補：\n" + "\n".join([f"{i+1}. {s}" for i, s in enumerate(slots)]) + "\n"
 
     if "予算" in goal:
         q = "ご予算の上限だけ教えていただけますか？"
@@ -786,28 +799,53 @@ def build_followup_template_ab(variant: str, next_goal: str, last_user_text: str
     elif "エリア" in goal or "沿線" in goal:
         q = "希望エリア（沿線/駅）はどのあたりが良いですか？"
     elif is_visit:
-        q = "上の候補で合いそうな枠があれば、番号か時間を返信ください。"
+        q = "上の候補で合う番号（1〜6）を返信ください。別日/別時間ならそのまま書いてOKです。"
     else:
         q = "条件を少し整理したいので、希望があれば教えてください。"
 
-    trimmed = ""
-    if last:
-        trimmed = last[:40] + ("…" if len(last) > 40 else "")
+    trimmed = last[:40] + ("…" if len(last) > 40 else "") if last else ""
 
     if variant == "A":
         lead = "その後いかがでしょうか？"
         body = f"{lead}\n{('（直近：'+trimmed+'）\\n') if trimmed else ''}{slot_lines}{q}\n必要なら候補をすぐまとめます😊"
         return body.strip()
 
-    # variant B: “軽い提示→YES/NO”寄り（返信率上げる）
     lead = "少しだけ確認です。"
-    yn = "①このまま探す ②一旦ストップ ③条件変更" if not is_visit else "①この枠でOK ②別日希望 ③一旦ストップ"
+    yn = "①このまま探す ②一旦ストップ ③条件変更" if not is_visit else "①番号でOK ②別日希望 ③一旦ストップ"
     body = f"{lead}\n{slot_lines}{q}\n返信は「{yn}」のどれでもOKです。"
     return body.strip()
 
 
+def parse_slot_selection(text: str) -> Optional[int]:
+    """
+    user返信から 1〜6 の選択を抽出（①②③ や 数字1-6）
+    """
+    t = (text or "").strip()
+
+    circ_map = {"①": 1, "②": 2, "③": 3, "④": 4, "⑤": 5, "⑥": 6}
+    if t in circ_map:
+        return circ_map[t]
+
+    # "1", "2", "3" 単独 / 先頭
+    m = re.match(r"^\s*([1-6])\s*$", t)
+    if m:
+        return int(m.group(1))
+
+    # 文中に「1番」「2で」など
+    m2 = re.search(r"([1-6])\s*(?:番|で|がいい|希望|お願いします)?", t)
+    if m2:
+        return int(m2.group(1))
+
+    return None
+
+
+def is_visit_change_request(text: str) -> bool:
+    t = (text or "")
+    return any(re.search(p, t) for p in VISIT_CHANGE_PATTERNS)
+
+
 # ============================================================
-# Followup job
+# Followup job helpers
 # ============================================================
 
 def utcnow() -> datetime:
@@ -982,7 +1020,7 @@ async def root():
 
 @app.get("/healthz")
 async def healthz():
-    return {"ok": True, "ts": int(time.time())}
+    return {"ok": True, "ts": int(datetime.now(timezone.utc).timestamp())}
 
 
 @app.post("/line/webhook")
@@ -1016,19 +1054,46 @@ async def line_webhook(
 
         conv_key = f"user:{user_id}"
 
-        # user message save
+        # save user message
         try:
             save_message(SHOP_ID, conv_key, "user", user_text)
         except Exception as e:
             print("[DB] save user failed:", repr(e))
 
-        # 追客返信 attribution（Feature 1）
+        # attribution: user replied after followup
         try:
             attribute_followup_response(SHOP_ID, conv_key)
         except Exception as e:
             print("[DB] attribute_followup_response failed:", repr(e))
 
-        # immediate opt-out
+        # ★予約（内見枠確定）処理
+        # 1) 別日/別時間リクエスト
+        if is_visit_change_request(user_text):
+            try:
+                set_visit_slot(SHOP_ID, conv_key, "REQUEST_CHANGE")
+            except Exception as e:
+                print("[DB] set_visit_slot(change) failed:", repr(e))
+            # 返信は軽く（AIに任せてもOKだが、安定運用優先）
+            await reply_message(reply_token, "承知しました。ご希望の曜日や時間帯（例：平日夜/土日午後など）を教えてください。")
+            continue
+
+        # 2) 番号選択
+        sel = parse_slot_selection(user_text)
+        if sel is not None:
+            slots = upcoming_visit_slots_jst(VISIT_DAYS_AHEAD)
+            if 1 <= sel <= len(slots):
+                picked = slots[sel - 1]
+                try:
+                    set_visit_slot(SHOP_ID, conv_key, picked)
+                except Exception as e:
+                    print("[DB] set_visit_slot(pick) failed:", repr(e))
+                await reply_message(reply_token, f"ありがとうございます！内見希望枠は「{picked}」で承りました。建物名/住所の候補があれば送りますね。")
+                continue
+            else:
+                await reply_message(reply_token, "番号は 1〜6 の範囲でお願いします。")
+                continue
+
+        # opt-out immediate
         for pat in OPTOUT_PATTERNS:
             if re.search(pat, user_text, flags=re.IGNORECASE):
                 try:
@@ -1038,7 +1103,7 @@ async def line_webhook(
                 await reply_message(reply_token, "承知しました。今後こちらからのご連絡は停止します。")
                 return {"ok": True}
 
-        # Try fast reply
+        # fast reply
         fast_reply_text: Optional[str] = None
         try:
             fast_reply_text = await asyncio.wait_for(
@@ -1078,7 +1143,8 @@ async def api_hot(
         rows = db_fetchall(
             """
             SELECT conv_key, user_id, last_user_text, temp_level_stable, confidence, next_goal, updated_at,
-                   COALESCE(opt_out, FALSE) as opt_out
+                   COALESCE(opt_out, FALSE) as opt_out,
+                   visit_slot_selected, visit_slot_selected_at
             FROM customers
             WHERE shop_id = %s AND COALESCE(temp_level_stable, 0) >= %s
             ORDER BY updated_at DESC
@@ -1098,6 +1164,8 @@ async def api_hot(
                 "next_goal": r[5],
                 "ts": r[6].isoformat() if r[6] else None,
                 "opt_out": bool(r[7]),
+                "visit_slot_selected": r[8],
+                "visit_slot_selected_at": r[9].isoformat() if r[9] else None,
             }
             for r in rows
         ])
@@ -1187,7 +1255,7 @@ async def api_hot(
 
 
 # ============================================================
-# Dashboard (simple)
+# Dashboard
 # ============================================================
 
 LEVEL_COLORS = {
@@ -1211,8 +1279,7 @@ async def dashboard(
 
     html = f"""
 <!doctype html><html lang="ja"><head>
-<meta charset="utf-8" />
-<meta name="viewport" content="width=device-width, initial-scale=1" />
+<meta charset="utf-8" /><meta name="viewport" content="width=device-width, initial-scale=1" />
 <title>HOT顧客</title>
 <style>
 body{{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,"Noto Sans JP",sans-serif;background:#fafafa;margin:0;padding:16px;color:#111}}
@@ -1223,7 +1290,7 @@ body{{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,"Noto Sans 
 .filters{{display:grid;grid-template-columns:1fr 220px 120px 120px 140px;gap:10px;align-items:end}}
 @media(max-width:920px){{.filters{{grid-template-columns:1fr 1fr}}}}
 label{{font-size:12px;color:#444;display:block;margin-bottom:4px}}
-input,select{{width:100%;padding:10px 10px;border:1px solid #ddd;border-radius:10px;font-size:14px;background:#fff}}
+input,select{{width:100%;padding:10px;border:1px solid #ddd;border-radius:10px;font-size:14px;background:#fff}}
 button{{padding:10px 12px;border:0;border-radius:10px;background:#111;color:#fff;font-size:14px;cursor:pointer}}
 table{{width:100%;border-collapse:collapse;font-size:14px}}
 th,td{{padding:10px 8px;border-bottom:1px solid #eee;vertical-align:top}}
@@ -1296,12 +1363,12 @@ function fmtTime(iso){{if(!iso) return "-"; try{{return new Date(iso).toLocaleSt
 function pill(level){{const c=LEVEL_COLORS[level]||"#999"; return `<span class="pill" style="background:${{c}}">Lv${{level}}</span>`;}}
 function badge(role){{const r=(role||"").toLowerCase(); if(r==="assistant")return `<span class="badge assistant">assistant</span>`; if(r==="user")return `<span class="badge">user</span>`; return `<span class="badge">${{escapeHtml(role||"-")}}</span>`;}}
 function badgeStatus(s){{const v=(s||"").toLowerCase(); if(v==="sent")return `<span class="badge ok">sent</span>`; if(v==="failed")return `<span class="badge ng">failed</span>`; return `<span class="badge">${{escapeHtml(s||"-")}}</span>`;}}
-function matchesSearch(row,q){{if(!q) return true; q=q.toLowerCase(); const fields=[row.user_id,row.next_goal,row.message,row.role,row.status,row.mode,row.error,row.variant].map(x=>(x||"").toLowerCase()); return fields.some(f=>f.includes(q));}}
+function matchesSearch(row,q){{if(!q) return true; q=q.toLowerCase(); const fields=[row.user_id,row.next_goal,row.message,row.role,row.status,row.mode,row.error,row.variant,row.visit_slot_selected].map(x=>(x||"").toLowerCase()); return fields.some(f=>f.includes(q));}}
 
 function setHeader(view){{
   const thead=document.getElementById("thead");
   if(view==="customers") {{
-    thead.innerHTML=`<tr><th>更新</th><th>温度</th><th>確度</th><th>次のゴール</th><th class="mono">user_id</th><th>直近メッセ</th><th>optout</th></tr>`;
+    thead.innerHTML=`<tr><th>更新</th><th>温度</th><th>確度</th><th>次のゴール</th><th class="mono">user_id</th><th>直近メッセ</th><th>内見枠</th><th>optout</th></tr>`;
     return;
   }}
   if(view==="followups") {{
@@ -1349,6 +1416,7 @@ function render(){{
       const confHtml=(r.confidence==null)?"-":Number(r.confidence).toFixed(2);
       const goalHtml=(r.next_goal==null||r.next_goal==="")?"-":escapeHtml(r.next_goal);
       const opt=r.opt_out?`<span class="optout">STOP</span>`:"-";
+      const slot = r.visit_slot_selected ? escapeHtml(r.visit_slot_selected) : "-";
       return `<tr>
         <td class="mono">${{escapeHtml(fmtTime(r.ts))}}</td>
         <td>${{levelHtml}}</td>
@@ -1356,6 +1424,7 @@ function render(){{
         <td>${{goalHtml}}</td>
         <td class="mono">${{escapeHtml(r.user_id||"")}}</td>
         <td class="rowmsg">${{escapeHtml(r.message||"")}}</td>
+        <td class="mono">${{slot}}</td>
         <td>${{opt}}</td>
       </tr>`;
     }}).join("");
@@ -1456,15 +1525,9 @@ async def job_followup(_: None = Depends(require_admin_key)):
             save_followup_log(SHOP_ID, conv_key, user_id, "(skipped opt_out)", "template", "skipped", "opt_out", variant=None)
             continue
 
-        variant = pick_ab_variant(conv_key)  # Feature 1
-
+        variant = pick_ab_variant(conv_key)
         mode = "template"
-        if FOLLOWUP_USE_OPENAI and OPENAI_API_KEY:
-            mode = "openai"
-            # OpenAI版でも、末尾に候補枠を添付したいならここで append する設計にできる
-            msg = build_followup_template_ab(variant, goal, last_text, level)
-        else:
-            msg = build_followup_template_ab(variant, goal, last_text, level)
+        msg = build_followup_template_ab(variant, goal, last_text, level)
 
         try:
             await push_message(user_id, msg)
