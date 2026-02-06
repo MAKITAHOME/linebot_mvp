@@ -1,4 +1,44 @@
-# app.py (FULL - dashboard redesigned)
+# app.py (FULL - 1,2,3 bundled)
+# FastAPI + Render + Postgres(pg8000)
+#
+# ✅ ① need_reply を DBで確定（推定じゃない）
+# ✅ ② 顧客詳細ページ /dashboard/customer?conv_key=...
+# ✅ ③ ダッシュボードから操作（COLD/OPTOUT/need_reply解除/今すぐ追客）
+#
+# Required env:
+#   LINE_CHANNEL_SECRET
+#   LINE_CHANNEL_ACCESS_TOKEN
+#   DATABASE_URL
+#   OPENAI_API_KEY
+#   DASHBOARD_KEY
+#   ADMIN_API_KEY
+#
+# Optional env:
+#   SHOP_ID
+#   DASHBOARD_REFRESH_SEC_DEFAULT
+#   FAST_REPLY_TIMEOUT_SEC (default 3.0)
+#   ANALYZE_HISTORY_LIMIT (default 10)
+#   SHORT_TEXT_MAX_LEN (default 2)
+#
+# Followup env:
+#   FOLLOWUP_ENABLED=1
+#   FOLLOWUP_AFTER_MINUTES=180
+#   FOLLOWUP_MIN_LEVEL=8
+#   FOLLOWUP_LIMIT=50
+#   FOLLOWUP_DRYRUN=1
+#   FOLLOWUP_LOCK_TTL_SEC=180
+#   FOLLOWUP_MIN_HOURS_BETWEEN=24
+#   FOLLOWUP_JST_FROM=10
+#   FOLLOWUP_JST_TO=20
+#
+# AB + visit slots:
+#   FOLLOWUP_AB_ENABLED=1
+#   VISIT_DAYS_AHEAD=3
+#   VISIT_SLOT_HOURS=11,14,17
+#   FOLLOWUP_ATTRIBUTION_WINDOW_HOURS=72
+#   FOLLOWUP_SECOND_TOUCH_AFTER_HOURS=48
+#   FOLLOWUP_SECOND_TOUCH_LIMIT=50
+
 import os
 import json
 import hmac
@@ -229,6 +269,8 @@ def ensure_tables_and_columns() -> None:
         );
         """
     )
+
+    # base columns
     cur.execute("""ALTER TABLE customers ADD COLUMN IF NOT EXISTS user_id TEXT;""")
     cur.execute("""ALTER TABLE customers ADD COLUMN IF NOT EXISTS last_user_text TEXT;""")
     cur.execute("""ALTER TABLE customers ADD COLUMN IF NOT EXISTS temp_level_raw INT;""")
@@ -236,19 +278,28 @@ def ensure_tables_and_columns() -> None:
     cur.execute("""ALTER TABLE customers ADD COLUMN IF NOT EXISTS confidence REAL;""")
     cur.execute("""ALTER TABLE customers ADD COLUMN IF NOT EXISTS next_goal TEXT;""")
 
-    cur.execute("""ALTER TABLE customers ADD COLUMN IF NOT EXISTS status TEXT;""")
+    # status
+    cur.execute("""ALTER TABLE customers ADD COLUMN IF NOT EXISTS status TEXT;""")  # ACTIVE/COLD/LOST/OPTOUT
     cur.execute("""ALTER TABLE customers ADD COLUMN IF NOT EXISTS opt_out BOOLEAN;""")
     cur.execute("""ALTER TABLE customers ADD COLUMN IF NOT EXISTS opt_out_at TIMESTAMPTZ;""")
 
+    # visit slot selection
     cur.execute("""ALTER TABLE customers ADD COLUMN IF NOT EXISTS visit_slot_selected TEXT;""")
     cur.execute("""ALTER TABLE customers ADD COLUMN IF NOT EXISTS visit_slot_selected_at TIMESTAMPTZ;""")
 
+    # slot fields
     cur.execute("""ALTER TABLE customers ADD COLUMN IF NOT EXISTS slot_budget TEXT;""")
     cur.execute("""ALTER TABLE customers ADD COLUMN IF NOT EXISTS slot_area TEXT;""")
     cur.execute("""ALTER TABLE customers ADD COLUMN IF NOT EXISTS slot_move_in TEXT;""")
     cur.execute("""ALTER TABLE customers ADD COLUMN IF NOT EXISTS slot_layout TEXT;""")
     cur.execute("""ALTER TABLE customers ADD COLUMN IF NOT EXISTS slots_json TEXT;""")
 
+    # ✅ need_reply (DB truth)
+    cur.execute("""ALTER TABLE customers ADD COLUMN IF NOT EXISTS need_reply BOOLEAN DEFAULT FALSE;""")
+    cur.execute("""ALTER TABLE customers ADD COLUMN IF NOT EXISTS need_reply_reason TEXT;""")
+    cur.execute("""ALTER TABLE customers ADD COLUMN IF NOT EXISTS need_reply_updated_at TIMESTAMPTZ;""")
+
+    # messages
     cur.execute(
         """
         CREATE TABLE IF NOT EXISTS messages (
@@ -266,6 +317,7 @@ def ensure_tables_and_columns() -> None:
     cur.execute("""ALTER TABLE messages ADD COLUMN IF NOT EXISTS confidence REAL;""")
     cur.execute("""ALTER TABLE messages ADD COLUMN IF NOT EXISTS next_goal TEXT;""")
 
+    # locks
     cur.execute(
         """
         CREATE TABLE IF NOT EXISTS job_locks (
@@ -275,6 +327,7 @@ def ensure_tables_and_columns() -> None:
         """
     )
 
+    # followup logs
     cur.execute(
         """
         CREATE TABLE IF NOT EXISTS followup_logs (
@@ -294,9 +347,14 @@ def ensure_tables_and_columns() -> None:
     cur.execute("""ALTER TABLE followup_logs ADD COLUMN IF NOT EXISTS responded_at TIMESTAMPTZ;""")
     cur.execute("""ALTER TABLE followup_logs ADD COLUMN IF NOT EXISTS stage INT;""")
 
+    # indexes
     cur.execute("""CREATE INDEX IF NOT EXISTS idx_customers_shop_updated ON customers(shop_id, updated_at DESC);""")
     cur.execute("""CREATE INDEX IF NOT EXISTS idx_messages_conv_created ON messages(conv_key, created_at DESC);""")
     cur.execute("""CREATE INDEX IF NOT EXISTS idx_followup_shop_conv_created ON followup_logs(shop_id, conv_key, created_at DESC);""")
+    cur.execute("""CREATE INDEX IF NOT EXISTS idx_customers_need_reply ON customers(shop_id, need_reply, updated_at DESC);""")
+
+    # backfill
+    cur.execute("""UPDATE customers SET need_reply=FALSE WHERE need_reply IS NULL;""")
 
     cur.close()
     conn.close()
@@ -306,6 +364,93 @@ def ensure_tables_and_columns() -> None:
 async def on_startup():
     ensure_tables_and_columns()
     print("[BOOT] tables/columns ensured")
+
+
+# ============================================================
+# need_reply logic (DB truth)
+# ============================================================
+
+def set_need_reply(shop_id: str, conv_key: str, need: bool, reason: str = "") -> None:
+    if not DATABASE_URL:
+        return
+    db_execute(
+        """
+        UPDATE customers
+        SET need_reply=%s, need_reply_reason=%s, need_reply_updated_at=now(), updated_at=now()
+        WHERE shop_id=%s AND conv_key=%s
+        """,
+        (bool(need), (reason or "")[:120], shop_id, conv_key),
+    )
+
+
+def get_customer_flags(shop_id: str, conv_key: str) -> Dict[str, Any]:
+    if not DATABASE_URL:
+        return {}
+    rows = db_fetchall(
+        """
+        SELECT visit_slot_selected, slot_budget, slot_area, slot_move_in, slot_layout, COALESCE(status,'ACTIVE'), COALESCE(opt_out,FALSE)
+        FROM customers
+        WHERE shop_id=%s AND conv_key=%s
+        """,
+        (shop_id, conv_key),
+    )
+    if not rows:
+        return {}
+    vsel, b, a, m, l, st, opt = rows[0]
+    return {
+        "visit_slot_selected": vsel,
+        "slot_budget": b,
+        "slot_area": a,
+        "slot_move_in": m,
+        "slot_layout": l,
+        "status": (st or "ACTIVE"),
+        "opt_out": bool(opt),
+    }
+
+
+def compute_need_reply(next_goal: str, flags: Dict[str, Any], assistant_text: str = "") -> Tuple[bool, str]:
+    """
+    need_reply = TRUE means: 「次の返信/反応（ユーザー側）が必要」= 追客や条件回収の“未完了”状態。
+    """
+    goal = (next_goal or "").strip()
+    st = (flags.get("status") or "ACTIVE").upper()
+    if flags.get("opt_out") or st in ("OPTOUT", "LOST"):
+        return False, "inactive"
+
+    visit = flags.get("visit_slot_selected")
+    budget = flags.get("slot_budget")
+    area = flags.get("slot_area")
+    move_in = flags.get("slot_move_in")
+    layout = flags.get("slot_layout")
+
+    # 内見系：候補提示/調整中なら TRUE（確定まで追う）
+    if any(k in goal for k in ["内見", "候補日", "日程"]):
+        if not visit or visit == "REQUEST_CHANGE":
+            return True, "need_visit_slot"
+        return False, "visit_ok"
+
+    # 条件回収：goalに応じて不足なら TRUE
+    if "予算" in goal and not budget:
+        return True, "need_budget"
+    if ("エリア" in goal or "沿線" in goal) and not area:
+        return True, "need_area"
+    if ("入居" in goal or "時期" in goal) and not move_in:
+        return True, "need_move_in"
+    if "間取り" in goal and not layout:
+        return True, "need_layout"
+
+    # 要件確認：どれか欠けてたら TRUE（ざっくり）
+    if "要件確認" in goal:
+        missing = [k for k, v in [("budget", budget), ("area", area), ("move_in", move_in), ("layout", layout)] if not v]
+        if missing:
+            return True, "need_slots"
+        return False, "slots_ok"
+
+    # 文面に質問が入っているなら TRUE（保険）
+    if "？" in (assistant_text or "") or "?" in (assistant_text or ""):
+        return True, "assistant_question"
+
+    return False, "no_need"
 
 
 # ============================================================
@@ -519,8 +664,8 @@ def ensure_customer_row(shop_id: str, conv_key: str, user_id: str) -> None:
         return
     db_execute(
         """
-        INSERT INTO customers (shop_id, conv_key, user_id, updated_at, status)
-        VALUES (%s, %s, %s, now(), 'ACTIVE')
+        INSERT INTO customers (shop_id, conv_key, user_id, updated_at, status, need_reply, need_reply_reason, need_reply_updated_at)
+        VALUES (%s, %s, %s, now(), 'ACTIVE', FALSE, '', now())
         ON CONFLICT (shop_id, conv_key)
         DO UPDATE SET user_id=EXCLUDED.user_id, updated_at=now()
         """,
@@ -532,7 +677,13 @@ def mark_opt_out(shop_id: str, conv_key: str, user_id: str) -> None:
     if not DATABASE_URL:
         return
     db_execute(
-        "UPDATE customers SET opt_out=TRUE, opt_out_at=now(), status='OPTOUT', user_id=%s, updated_at=now() WHERE shop_id=%s AND conv_key=%s",
+        """
+        UPDATE customers
+        SET opt_out=TRUE, opt_out_at=now(), status='OPTOUT', user_id=%s,
+            need_reply=FALSE, need_reply_reason='optout', need_reply_updated_at=now(),
+            updated_at=now()
+        WHERE shop_id=%s AND conv_key=%s
+        """,
         (user_id, shop_id, conv_key),
     )
 
@@ -540,7 +691,31 @@ def mark_opt_out(shop_id: str, conv_key: str, user_id: str) -> None:
 def mark_lost(shop_id: str, conv_key: str) -> None:
     if not DATABASE_URL:
         return
-    db_execute("UPDATE customers SET status='LOST', updated_at=now() WHERE shop_id=%s AND conv_key=%s", (shop_id, conv_key))
+    db_execute(
+        """
+        UPDATE customers
+        SET status='LOST',
+            need_reply=FALSE, need_reply_reason='lost', need_reply_updated_at=now(),
+            updated_at=now()
+        WHERE shop_id=%s AND conv_key=%s
+        """,
+        (shop_id, conv_key),
+    )
+
+
+def mark_cold(shop_id: str, conv_key: str) -> None:
+    if not DATABASE_URL:
+        return
+    db_execute(
+        """
+        UPDATE customers
+        SET status='COLD',
+            need_reply=FALSE, need_reply_reason='cold', need_reply_updated_at=now(),
+            updated_at=now()
+        WHERE shop_id=%s AND conv_key=%s
+        """,
+        (shop_id, conv_key),
+    )
 
 
 def revive_if_cold(shop_id: str, conv_key: str) -> None:
@@ -931,14 +1106,14 @@ def maintenance_update_statuses(shop_id: str) -> None:
         return
     db_execute(
         """
-        UPDATE customers SET status='OPTOUT'
+        UPDATE customers SET status='OPTOUT', need_reply=FALSE, need_reply_reason='optout'
         WHERE shop_id=%s AND COALESCE(opt_out,FALSE)=TRUE AND COALESCE(status,'')<>'OPTOUT'
         """,
         (shop_id,),
     )
     db_execute(
         """
-        UPDATE customers SET status='COLD'
+        UPDATE customers SET status='COLD', need_reply=FALSE, need_reply_reason='cold'
         WHERE shop_id=%s
           AND COALESCE(status,'ACTIVE')='ACTIVE'
           AND COALESCE(temp_level_stable,0) <= 2
@@ -1065,14 +1240,20 @@ async def process_analysis_only_store(shop_id: str, user_id: str, conv_key: str,
 
         if status_override == "OPTOUT":
             mark_opt_out(shop_id, conv_key, user_id)
+            return
         elif status_override == "LOST":
             mark_lost(shop_id, conv_key)
+            return
 
         if merged_slots:
             set_customer_slots(shop_id, conv_key, merged_slots)
 
         upsert_customer_state(shop_id, conv_key, user_id, user_text, raw_level, stable_level, conf, next_goal)
         save_message(shop_id, conv_key, "assistant", reply_text, raw_level, stable_level, conf, next_goal)
+
+        flags = get_customer_flags(shop_id, conv_key)
+        need, reason = compute_need_reply(next_goal, flags, assistant_text=reply_text)
+        set_need_reply(shop_id, conv_key, need, reason)
     except Exception as e:
         print("[BG] process_analysis_only_store:", repr(e))
 
@@ -1084,8 +1265,10 @@ async def process_ai_and_push_full(shop_id: str, user_id: str, conv_key: str, us
 
         if status_override == "OPTOUT":
             mark_opt_out(shop_id, conv_key, user_id)
+            return
         elif status_override == "LOST":
             mark_lost(shop_id, conv_key)
+            return
 
         if merged_slots:
             set_customer_slots(shop_id, conv_key, merged_slots)
@@ -1102,6 +1285,10 @@ async def process_ai_and_push_full(shop_id: str, user_id: str, conv_key: str, us
 
         upsert_customer_state(shop_id, conv_key, user_id, user_text, raw_level, stable_level, conf, next_goal)
         save_message(shop_id, conv_key, "assistant", reply_text, raw_level, stable_level, conf, next_goal)
+
+        flags = get_customer_flags(shop_id, conv_key)
+        need, reason = compute_need_reply(next_goal, flags, assistant_text=reply_text)
+        set_need_reply(shop_id, conv_key, need, reason)
 
         if is_inactive(shop_id, conv_key):
             return
@@ -1156,31 +1343,43 @@ async def line_webhook(
 
         conv_key = f"user:{user_id}"
 
+        # ensure customer row
         try:
             ensure_customer_row(SHOP_ID, conv_key, user_id)
         except Exception as e:
             print("[DB] ensure_customer_row:", repr(e))
 
+        # ✅ ユーザーから来たら need_reply は一旦FALSE（= 返信待ち解除）
+        try:
+            set_need_reply(SHOP_ID, conv_key, False, "user_replied")
+        except Exception:
+            pass
+
+        # revive cold always
         try:
             revive_if_cold(SHOP_ID, conv_key)
         except Exception:
             pass
 
+        # revive lost by keywords
         try:
             revive_if_lost_by_keywords(SHOP_ID, conv_key, user_text)
         except Exception:
             pass
 
+        # save user message
         try:
             save_message(SHOP_ID, conv_key, "user", user_text)
         except Exception as e:
             print("[DB] save user:", repr(e))
 
+        # followup attribution
         try:
             attribute_followup_response(SHOP_ID, conv_key)
         except Exception:
             pass
 
+        # slot merge
         try:
             prev = get_customer_slots(SHOP_ID, conv_key)
             merged = merge_slots(prev, extract_slots(user_text))
@@ -1189,34 +1388,47 @@ async def line_webhook(
         except Exception:
             pass
 
+        # visit slot change request
         if is_visit_change_request(user_text):
             set_visit_slot(SHOP_ID, conv_key, "REQUEST_CHANGE")
+            try:
+                set_need_reply(SHOP_ID, conv_key, True, "visit_change_request")
+            except Exception:
+                pass
             await reply_line(reply_token, "承知しました。ご希望の曜日や時間帯（例：平日夜/土日午後など）を教えてください。")
             continue
 
+        # visit slot selection 1-6 / ①-⑥
         sel = parse_slot_selection(user_text)
         if sel is not None:
             slots = upcoming_visit_slots_jst(VISIT_DAYS_AHEAD)
             if 1 <= sel <= len(slots):
                 picked = slots[sel - 1]
                 set_visit_slot(SHOP_ID, conv_key, picked)
+                try:
+                    set_need_reply(SHOP_ID, conv_key, False, "visit_selected")
+                except Exception:
+                    pass
                 await reply_line(reply_token, f"ありがとうございます！内見希望枠は「{picked}」で承りました。")
             else:
                 await reply_line(reply_token, "番号は 1〜6 の範囲でお願いします。")
             continue
 
+        # immediate optout
         for pat in OPTOUT_PATTERNS:
             if re.search(pat, user_text, flags=re.IGNORECASE):
                 mark_opt_out(SHOP_ID, conv_key, user_id)
                 await reply_line(reply_token, "承知しました。今後こちらからのご連絡は停止します。")
                 return {"ok": True}
 
+        # immediate cancel => lost
         for pat in CANCEL_PATTERNS:
             if re.search(pat, user_text):
                 mark_lost(SHOP_ID, conv_key)
                 await reply_line(reply_token, "承知しました。必要になったらまたいつでもご連絡ください。")
                 return {"ok": True}
 
+        # fast reply attempt
         fast_reply_text: Optional[str] = None
         try:
             fast_reply_text = await asyncio.wait_for(
@@ -1257,10 +1469,12 @@ async def api_hot(
             SELECT conv_key, user_id, last_user_text, temp_level_stable, confidence, next_goal, updated_at,
                    COALESCE(status,'ACTIVE') as status,
                    visit_slot_selected,
-                   slot_budget, slot_area, slot_move_in, slot_layout
+                   slot_budget, slot_area, slot_move_in, slot_layout,
+                   COALESCE(need_reply,FALSE) as need_reply,
+                   COALESCE(need_reply_reason,'') as need_reply_reason
             FROM customers
             WHERE shop_id=%s AND COALESCE(temp_level_stable,0) >= %s
-            ORDER BY updated_at DESC
+            ORDER BY need_reply DESC, updated_at DESC
             LIMIT %s
             """,
             (shop_id, min_level, limit),
@@ -1281,6 +1495,8 @@ async def api_hot(
                 "slot_area": r[10],
                 "slot_move_in": r[11],
                 "slot_layout": r[12],
+                "need_reply": bool(r[13]),
+                "need_reply_reason": r[14],
             }
             for r in rows
         ])
@@ -1288,7 +1504,7 @@ async def api_hot(
     if view == "events":
         rows = db_fetchall(
             """
-            SELECT m.role, c.user_id, m.content, m.created_at, m.temp_level_stable, m.confidence, m.next_goal
+            SELECT m.role, c.user_id, c.conv_key, m.content, m.created_at, m.temp_level_stable, m.confidence, m.next_goal
             FROM messages m
             LEFT JOIN customers c ON c.shop_id=m.shop_id AND c.conv_key=m.conv_key
             WHERE m.shop_id=%s
@@ -1302,11 +1518,12 @@ async def api_hot(
                 "view": "events",
                 "role": r[0],
                 "user_id": r[1],
-                "message": r[2],
-                "ts": r[3].isoformat() if r[3] else None,
-                "temp_level_stable": r[4],
-                "confidence": float(r[5]) if r[5] is not None else None,
-                "next_goal": r[6],
+                "conv_key": r[2],
+                "message": r[3],
+                "ts": r[4].isoformat() if r[4] else None,
+                "temp_level_stable": r[5],
+                "confidence": float(r[6]) if r[6] is not None else None,
+                "next_goal": r[7],
             }
             for r in rows
         ])
@@ -1362,7 +1579,216 @@ async def api_hot(
 
 
 # ============================================================
-# Dashboard HTML (HOME STYLE)
+# Customer detail API (②)
+# ============================================================
+
+@app.get("/api/customer/detail")
+async def api_customer_detail(
+    _: None = Depends(require_dashboard_key),
+    shop_id: str = Query(default=SHOP_ID),
+    conv_key: str = Query(...),
+    msg_limit: int = Query(default=120, ge=10, le=400),
+    followup_limit: int = Query(default=60, ge=10, le=200),
+):
+    if not DATABASE_URL:
+        return JSONResponse({"ok": True, "customer": None, "messages": [], "followups": []}, status_code=200)
+
+    crow = db_fetchall(
+        """
+        SELECT conv_key, user_id, last_user_text, temp_level_stable, confidence, next_goal, updated_at,
+               COALESCE(status,'ACTIVE'), COALESCE(opt_out,FALSE),
+               visit_slot_selected, visit_slot_selected_at,
+               slot_budget, slot_area, slot_move_in, slot_layout,
+               COALESCE(need_reply,FALSE), COALESCE(need_reply_reason,''), need_reply_updated_at
+        FROM customers
+        WHERE shop_id=%s AND conv_key=%s
+        LIMIT 1
+        """,
+        (shop_id, conv_key),
+    )
+    customer = None
+    if crow:
+        r = crow[0]
+        customer = {
+            "conv_key": r[0],
+            "user_id": r[1],
+            "last_user_text": r[2],
+            "temp_level_stable": r[3],
+            "confidence": float(r[4]) if r[4] is not None else None,
+            "next_goal": r[5],
+            "updated_at": r[6].isoformat() if r[6] else None,
+            "status": r[7],
+            "opt_out": bool(r[8]),
+            "visit_slot_selected": r[9],
+            "visit_slot_selected_at": r[10].isoformat() if r[10] else None,
+            "slot_budget": r[11],
+            "slot_area": r[12],
+            "slot_move_in": r[13],
+            "slot_layout": r[14],
+            "need_reply": bool(r[15]),
+            "need_reply_reason": r[16],
+            "need_reply_updated_at": r[17].isoformat() if r[17] else None,
+        }
+
+    msgs = db_fetchall(
+        """
+        SELECT role, content, created_at, temp_level_stable, confidence, next_goal
+        FROM messages
+        WHERE shop_id=%s AND conv_key=%s
+        ORDER BY created_at DESC
+        LIMIT %s
+        """,
+        (shop_id, conv_key, int(msg_limit)),
+    )
+    msgs = list(reversed(msgs))
+    messages = [
+        {
+            "role": m[0],
+            "content": m[1],
+            "ts": m[2].isoformat() if m[2] else None,
+            "temp_level_stable": m[3],
+            "confidence": float(m[4]) if m[4] is not None else None,
+            "next_goal": m[5],
+        }
+        for m in msgs
+    ]
+
+    fls = db_fetchall(
+        """
+        SELECT variant, mode, status, stage, message, error, responded_at, created_at
+        FROM followup_logs
+        WHERE shop_id=%s AND conv_key=%s
+        ORDER BY created_at DESC
+        LIMIT %s
+        """,
+        (shop_id, conv_key, int(followup_limit)),
+    )
+    followups = [
+        {
+            "variant": f[0],
+            "mode": f[1],
+            "status": f[2],
+            "stage": f[3],
+            "message": f[4],
+            "error": f[5],
+            "responded_at": f[6].isoformat() if f[6] else None,
+            "ts": f[7].isoformat() if f[7] else None,
+        }
+        for f in fls
+    ]
+
+    return JSONResponse({"ok": True, "customer": customer, "messages": messages, "followups": followups}, status_code=200)
+
+
+# ============================================================
+# Customer actions API (③)
+#   - protected by ADMIN_API_KEY (header: x-admin-key)
+# ============================================================
+
+def fetch_customer_for_action(shop_id: str, conv_key: str) -> Optional[Dict[str, Any]]:
+    rows = db_fetchall(
+        """
+        SELECT conv_key, user_id, COALESCE(temp_level_stable,0), COALESCE(next_goal,''), COALESCE(last_user_text,''), COALESCE(status,'ACTIVE'), COALESCE(opt_out,FALSE)
+        FROM customers
+        WHERE shop_id=%s AND conv_key=%s
+        LIMIT 1
+        """,
+        (shop_id, conv_key),
+    )
+    if not rows:
+        return None
+    conv_key, user_id, lvl, goal, last_text, st, opt = rows[0]
+    return {
+        "conv_key": conv_key,
+        "user_id": user_id,
+        "level": int(lvl or 0),
+        "next_goal": goal or "",
+        "last_user_text": last_text or "",
+        "status": (st or "ACTIVE"),
+        "opt_out": bool(opt),
+    }
+
+
+@app.post("/api/customer/mark_cold")
+async def api_customer_mark_cold(
+    _: None = Depends(require_admin_key),
+    shop_id: str = Query(default=SHOP_ID),
+    conv_key: str = Query(...),
+):
+    if not DATABASE_URL:
+        return {"ok": True}
+    mark_cold(shop_id, conv_key)
+    return {"ok": True}
+
+
+@app.post("/api/customer/mark_optout")
+async def api_customer_mark_optout(
+    _: None = Depends(require_admin_key),
+    shop_id: str = Query(default=SHOP_ID),
+    conv_key: str = Query(...),
+):
+    if not DATABASE_URL:
+        return {"ok": True}
+    c = fetch_customer_for_action(shop_id, conv_key)
+    uid = (c or {}).get("user_id") or "unknown"
+    mark_opt_out(shop_id, conv_key, uid)
+    return {"ok": True}
+
+
+@app.post("/api/customer/reset_need_reply")
+async def api_customer_reset_need_reply(
+    _: None = Depends(require_admin_key),
+    shop_id: str = Query(default=SHOP_ID),
+    conv_key: str = Query(...),
+):
+    if not DATABASE_URL:
+        return {"ok": True}
+    set_need_reply(shop_id, conv_key, False, "manual_reset")
+    return {"ok": True}
+
+
+@app.post("/api/customer/send_followup_now")
+async def api_customer_send_followup_now(
+    _: None = Depends(require_admin_key),
+    shop_id: str = Query(default=SHOP_ID),
+    conv_key: str = Query(...),
+    stage: int = Query(default=1, ge=1, le=2),
+):
+    """
+    stage=1: ABテンプレ（通常追客）
+    stage=2: セカンドタッチ
+    """
+    if not DATABASE_URL:
+        return {"ok": True, "sent": False, "reason": "no_db"}
+
+    c = fetch_customer_for_action(shop_id, conv_key)
+    if not c:
+        return {"ok": True, "sent": False, "reason": "not_found"}
+
+    if c["opt_out"] or (c["status"] or "").upper() in ("COLD", "LOST", "OPTOUT"):
+        return {"ok": True, "sent": False, "reason": "inactive"}
+
+    user_id = c["user_id"]
+    if not user_id or user_id == "unknown":
+        return {"ok": True, "sent": False, "reason": "no_user_id"}
+
+    variant = pick_ab_variant(conv_key)
+    if stage == 1:
+        msg = build_followup_template_ab(variant, c["next_goal"], c["last_user_text"], c["level"])
+    else:
+        msg = build_second_touch_message(c["next_goal"])
+
+    try:
+        await push_line(user_id, msg)
+        save_followup_log(shop_id, conv_key, user_id, msg, "manual", "sent", None, variant, stage)
+        return {"ok": True, "sent": True, "stage": stage, "variant": variant}
+    except Exception as e:
+        save_followup_log(shop_id, conv_key, user_id, msg, "manual", "failed", str(e)[:200], variant, stage)
+        return {"ok": True, "sent": False, "error": str(e)[:200]}
+
+
+# ============================================================
+# Dashboard HTML (HOME STYLE + detail + actions)
 # ============================================================
 
 LEVEL_COLORS = {
@@ -1370,11 +1796,11 @@ LEVEL_COLORS = {
     6: "#ffab91", 7: "#ff8a80", 8: "#ff5252", 9: "#e040fb", 10: "#7c4dff",
 }
 
+
 @app.get("/dashboard", response_class=HTMLResponse)
 async def dashboard(
     _: None = Depends(require_dashboard_key),
     shop_id: str = Query(default=SHOP_ID),
-    view: str = Query(default="customers", pattern="^(customers|events|followups|ab_stats)$"),
     min_level: int = Query(default=1, ge=1, le=10),
     limit: int = Query(default=50, ge=1, le=200),
     refresh: int = Query(default=DASHBOARD_REFRESH_SEC_DEFAULT, ge=0, le=300),
@@ -1399,18 +1825,15 @@ async def dashboard(
       --muted: rgba(255,255,255,0.62);
       --border: rgba(255,255,255,0.10);
       --shadow: 0 12px 30px rgba(0,0,0,0.35);
-
       --good: #37d67a;
       --warn: #ffb020;
       --bad: #ff4d4d;
       --blue: #4da3ff;
-
       --radius: 18px;
       --radius2: 14px;
       --gap: 14px;
       --font: ui-sans-serif, system-ui, -apple-system, "SF Pro Display", "Hiragino Sans", "Noto Sans JP", "Segoe UI", Roboto, "Helvetica Neue", Arial;
     }}
-
     body.light {{
       --bg: #f7f8fb;
       --panel: rgba(0,0,0,0.04);
@@ -1420,7 +1843,6 @@ async def dashboard(
       --border: rgba(0,0,0,0.10);
       --shadow: 0 10px 24px rgba(0,0,0,0.10);
     }}
-
     * {{ box-sizing: border-box; }}
     html, body {{ height: 100%; }}
     body {{
@@ -1433,286 +1855,77 @@ async def dashboard(
       color: var(--text);
     }}
     a {{ color: inherit; text-decoration: none; }}
-
-    .app {{
-      display: grid;
-      grid-template-columns: 290px 1fr;
-      min-height: 100vh;
-    }}
-
-    /* Sidebar */
-    .sidebar {{
-      padding: 18px;
-      border-right: 1px solid var(--border);
-      backdrop-filter: blur(10px);
-    }}
-    .brand {{
-      display: flex;
-      align-items: center;
-      gap: 10px;
-      padding: 12px 12px;
-      border-radius: var(--radius2);
-      background: var(--panel);
-      box-shadow: var(--shadow);
-    }}
-    .logo {{
-      width: 36px; height: 36px;
-      border-radius: 14px;
-      background: linear-gradient(135deg, rgba(77,163,255,0.9), rgba(255,77,77,0.7));
-    }}
+    .app {{ display: grid; grid-template-columns: 290px 1fr; min-height: 100vh; }}
+    .sidebar {{ padding: 18px; border-right: 1px solid var(--border); backdrop-filter: blur(10px); }}
+    .brand {{ display: flex; align-items: center; gap: 10px; padding: 12px 12px; border-radius: var(--radius2); background: var(--panel); box-shadow: var(--shadow); }}
+    .logo {{ width: 36px; height: 36px; border-radius: 14px; background: linear-gradient(135deg, rgba(77,163,255,0.9), rgba(255,77,77,0.7)); }}
     .brand-title {{ font-weight: 900; letter-spacing: 0.2px; }}
     .brand-sub {{ font-size: 12px; color: var(--muted); margin-top: 2px; }}
-
-    .nav {{
-      margin-top: 14px;
-      display: grid;
-      gap: 8px;
-    }}
-    .nav a {{
-      display: flex;
-      align-items: center;
-      justify-content: space-between;
-      padding: 12px 12px;
-      border-radius: 14px;
-      border: 1px solid transparent;
-      color: var(--muted);
-      background: transparent;
-    }}
-    .nav a.active {{
-      background: var(--panel2);
-      border-color: var(--border);
-      color: var(--text);
-    }}
-    .nav a:hover {{
-      background: var(--panel);
-      border-color: var(--border);
-      color: var(--text);
-    }}
-    .pill {{
-      font-size: 12px;
-      padding: 4px 10px;
-      border-radius: 999px;
-      background: var(--panel2);
-      border: 1px solid var(--border);
-      color: var(--muted);
-      white-space: nowrap;
-    }}
-
-    .sidecard {{
-      margin-top: 14px;
-      padding: 12px;
-      border-radius: var(--radius2);
-      border: 1px solid var(--border);
-      background: var(--panel);
-    }}
-    .sidecard .small {{
-      font-size: 12px;
-      color: var(--muted);
-      line-height: 1.6;
-    }}
-
-    /* Main */
+    .nav {{ margin-top: 14px; display: grid; gap: 8px; }}
+    .nav a {{ display:flex; align-items:center; justify-content:space-between; padding: 12px 12px; border-radius: 14px; border: 1px solid transparent; color: var(--muted); }}
+    .nav a.active {{ background: var(--panel2); border-color: var(--border); color: var(--text); }}
+    .nav a:hover {{ background: var(--panel); border-color: var(--border); color: var(--text); }}
+    .pill {{ font-size: 12px; padding: 4px 10px; border-radius: 999px; background: var(--panel2); border: 1px solid var(--border); color: var(--muted); white-space: nowrap; }}
+    .sidecard {{ margin-top: 14px; padding: 12px; border-radius: var(--radius2); border: 1px solid var(--border); background: var(--panel); }}
+    .sidecard .small {{ font-size: 12px; color: var(--muted); line-height: 1.6; }}
     .main {{ padding: 18px 18px 28px; }}
-
-    .topbar {{
-      display: flex;
-      gap: 12px;
-      align-items: center;
-      justify-content: space-between;
-      margin-bottom: 14px;
-    }}
-    .title {{
-      display: grid;
-      gap: 2px;
-    }}
-    .title h1 {{
-      font-size: 22px;
-      margin: 0;
-      letter-spacing: 0.2px;
-    }}
+    .topbar {{ display:flex; gap:12px; align-items:center; justify-content:space-between; margin-bottom: 14px; }}
+    .title {{ display:grid; gap:2px; }}
+    .title h1 {{ font-size: 22px; margin:0; letter-spacing: 0.2px; }}
     .title .meta {{ font-size: 12px; color: var(--muted); }}
-
-    .actions {{
-      display: flex;
-      gap: 10px;
-      align-items: center;
-      flex-wrap: wrap;
-      justify-content: flex-end;
-    }}
-    .search {{
-      display: flex;
-      align-items: center;
-      gap: 10px;
-      padding: 10px 12px;
-      border-radius: 999px;
-      border: 1px solid var(--border);
-      background: var(--panel);
-      min-width: 280px;
-    }}
-    .search input {{
-      flex: 1;
-      border: none;
-      outline: none;
-      background: transparent;
-      color: var(--text);
-      font-size: 14px;
-    }}
-    .btn {{
-      border: 1px solid var(--border);
-      background: var(--panel);
-      color: var(--text);
-      padding: 10px 12px;
-      border-radius: 999px;
-      cursor: pointer;
-      white-space: nowrap;
-    }}
+    .actions {{ display:flex; gap:10px; align-items:center; flex-wrap:wrap; justify-content:flex-end; }}
+    .search {{ display:flex; align-items:center; gap:10px; padding:10px 12px; border-radius:999px; border:1px solid var(--border); background: var(--panel); min-width: 280px; }}
+    .search input {{ flex:1; border:none; outline:none; background:transparent; color: var(--text); font-size:14px; }}
+    .btn {{ border:1px solid var(--border); background: var(--panel); color: var(--text); padding: 10px 12px; border-radius: 999px; cursor:pointer; white-space: nowrap; }}
     .btn:hover {{ background: var(--panel2); }}
-    .btn.primary {{
-      background: rgba(77,163,255,0.22);
-      border-color: rgba(77,163,255,0.35);
-    }}
+    .btn.primary {{ background: rgba(77,163,255,0.22); border-color: rgba(77,163,255,0.35); }}
     .btn.primary:hover {{ background: rgba(77,163,255,0.28); }}
-
-    .grid {{
-      display: grid;
-      gap: var(--gap);
-    }}
-    .grid.kpis {{
-      grid-template-columns: repeat(4, minmax(0, 1fr));
-    }}
-    .grid.cols {{
-      grid-template-columns: 1.25fr 0.75fr;
-      align-items: start;
-      margin-top: 14px;
-    }}
-    .card {{
-      border: 1px solid var(--border);
-      background: var(--panel);
-      border-radius: var(--radius);
-      box-shadow: var(--shadow);
-      padding: 14px;
-    }}
-    .section-title {{
-      display: flex;
-      align-items: baseline;
-      justify-content: space-between;
-      margin-bottom: 10px;
-      gap: 10px;
-    }}
-    .section-title h2 {{
-      margin: 0;
-      font-size: 14px;
-      letter-spacing: 0.2px;
-    }}
-    .section-title span {{
-      font-size: 12px;
-      color: var(--muted);
-    }}
-
-    /* KPI */
-    .kpi-top {{
-      display: flex;
-      align-items: baseline;
-      justify-content: space-between;
-      gap: 10px;
-      margin-bottom: 8px;
-    }}
-    .kpi-label {{ font-size: 13px; color: var(--muted); }}
+    .grid {{ display:grid; gap: var(--gap); }}
+    .grid.kpis {{ grid-template-columns: repeat(4, minmax(0, 1fr)); }}
+    .grid.cols {{ grid-template-columns: 1.25fr 0.75fr; align-items:start; margin-top: 14px; }}
+    .card {{ border:1px solid var(--border); background: var(--panel); border-radius: var(--radius); box-shadow: var(--shadow); padding: 14px; }}
+    .section-title {{ display:flex; align-items:baseline; justify-content:space-between; margin-bottom:10px; gap:10px; }}
+    .section-title h2 {{ margin:0; font-size:14px; letter-spacing:0.2px; }}
+    .section-title span {{ font-size:12px; color: var(--muted); }}
+    .kpi-top {{ display:flex; align-items:baseline; justify-content:space-between; gap:10px; margin-bottom:8px; }}
+    .kpi-label {{ font-size:13px; color: var(--muted); }}
     .kpi-value {{ font-size: 26px; font-weight: 900; letter-spacing: 0.2px; }}
-    .kpi-delta {{ font-size: 12px; color: var(--muted); }}
+    .kpi-delta {{ font-size:12px; color: var(--muted); }}
 
-    /* Table */
-    table {{
-      width: 100%;
-      border-collapse: collapse;
-      overflow: hidden;
-      border-radius: 14px;
-    }}
-    thead th {{
-      text-align: left;
-      font-size: 12px;
-      color: var(--muted);
-      font-weight: 800;
-      padding: 10px 10px;
-      border-bottom: 1px solid var(--border);
-      white-space: nowrap;
-    }}
-    tbody td {{
-      padding: 12px 10px;
-      border-bottom: 1px solid var(--border);
-      font-size: 13px;
-      color: var(--text);
-      vertical-align: top;
-    }}
+    table {{ width:100%; border-collapse: collapse; overflow:hidden; border-radius: 14px; }}
+    thead th {{ text-align:left; font-size:12px; color: var(--muted); font-weight: 800; padding: 10px 10px; border-bottom: 1px solid var(--border); white-space: nowrap; }}
+    tbody td {{ padding: 12px 10px; border-bottom: 1px solid var(--border); font-size: 13px; color: var(--text); vertical-align: top; }}
     tbody tr:hover {{ background: var(--panel2); }}
     .mono {{ font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas; font-size: 12px; }}
     .muted {{ color: var(--muted); }}
     .rowmsg {{ max-width: 820px; word-break: break-word; white-space: pre-wrap; }}
 
-    /* Badges */
-    .badge {{
-      display: inline-flex;
-      align-items: center;
-      gap: 6px;
-      padding: 4px 10px;
-      border-radius: 999px;
-      font-size: 12px;
-      border: 1px solid var(--border);
-      background: var(--panel2);
-      color: var(--text);
-      white-space: nowrap;
-    }}
+    .badge {{ display:inline-flex; align-items:center; gap:6px; padding:4px 10px; border-radius:999px; font-size:12px; border:1px solid var(--border); background: var(--panel2); color: var(--text); white-space: nowrap; }}
     .badge.good {{ background: rgba(55,214,122,0.14); border-color: rgba(55,214,122,0.35); }}
     .badge.warn {{ background: rgba(255,176,32,0.14); border-color: rgba(255,176,32,0.35); }}
     .badge.bad  {{ background: rgba(255,77,77,0.14); border-color: rgba(255,77,77,0.35); }}
+    .badge.info {{ background: rgba(77,163,255,0.14); border-color: rgba(77,163,255,0.35); }}
 
-    .chips {{
-      display: inline-flex;
-      gap: 6px;
-      flex-wrap: wrap;
-    }}
-    .chip {{
-      font-size: 12px;
-      padding: 3px 10px;
-      border-radius: 999px;
-      border: 1px solid var(--border);
-      background: var(--panel2);
-      color: var(--muted);
-      white-space: nowrap;
-    }}
+    .chips {{ display:inline-flex; gap:6px; flex-wrap:wrap; }}
+    .chip {{ font-size:12px; padding:3px 10px; border-radius:999px; border:1px solid var(--border); background: var(--panel2); color: var(--muted); white-space: nowrap; }}
     .chip.ok {{ color: var(--text); }}
     .chip.ng {{ opacity: 0.8; }}
 
-    /* Activity */
-    .activity-item {{
-      display: grid;
-      grid-template-columns: 72px 1fr;
-      gap: 10px;
-      padding: 10px 0;
-      border-bottom: 1px solid var(--border);
-    }}
-    .activity-item:last-child {{ border-bottom: none; }}
-    .activity-time {{ font-size: 12px; color: var(--muted); padding-top: 2px; }}
-    .activity-text {{ font-size: 13px; line-height: 1.5; }}
+    .activity-item {{ display:grid; grid-template-columns: 72px 1fr; gap:10px; padding:10px 0; border-bottom: 1px solid var(--border); }}
+    .activity-item:last-child {{ border-bottom:none; }}
+    .activity-time {{ font-size:12px; color: var(--muted); padding-top:2px; }}
+    .activity-text {{ font-size:13px; line-height:1.5; }}
 
-    /* Controls */
-    .controls {{
-      display: grid;
-      grid-template-columns: 1fr 140px 140px 160px;
-      gap: 10px;
-      margin-top: 10px;
-    }}
-    .controls label {{ font-size: 12px; color: var(--muted); display: block; margin-bottom: 4px; }}
-    .controls input, .controls select {{
-      width: 100%;
-      padding: 10px;
-      border-radius: 12px;
-      border: 1px solid var(--border);
-      background: var(--panel);
-      color: var(--text);
-      outline: none;
+    .controls {{ display:grid; grid-template-columns: 1fr 140px 140px 160px; gap:10px; margin-top:10px; }}
+    .controls label {{ font-size:12px; color: var(--muted); display:block; margin-bottom:4px; }}
+    .controls input {{
+      width:100%; padding:10px; border-radius:12px; border:1px solid var(--border);
+      background: var(--panel); color: var(--text); outline:none;
     }}
     .controls input::placeholder {{ color: var(--muted); }}
+
+    .link {{ text-decoration: underline; text-underline-offset: 3px; }}
+    .link:hover {{ opacity: 0.85; }}
 
     @media (max-width: 1100px) {{
       .grid.kpis {{ grid-template-columns: repeat(2, minmax(0, 1fr)); }}
@@ -1723,7 +1936,7 @@ async def dashboard(
       .app {{ grid-template-columns: 1fr; }}
       .sidebar {{ position: sticky; top: 0; z-index: 10; }}
       .controls {{ grid-template-columns: 1fr 1fr; }}
-      .search {{ display: none; }}
+      .search {{ display:none; }}
     }}
   </style>
 </head>
@@ -1740,7 +1953,7 @@ async def dashboard(
 
       <nav class="nav">
         <a href="#" id="nav-home" class="active" onclick="setTab('home'); return false;">
-          <div>🏠 ホーム</div><div class="pill">Overview</div>
+          <div>🏠 ホーム</div><div class="pill">need_reply</div>
         </a>
         <a href="#" id="nav-customers" onclick="setTab('customers'); return false;">
           <div>👥 顧客</div><div class="pill">customers</div>
@@ -1758,22 +1971,31 @@ async def dashboard(
 
       <div class="sidecard">
         <div class="small">
-          ✅ まず “要返信 / 内見 / 温度8+” を上から処理<br/>
-          ✅ 右上「更新」or 自動更新で運用ラク<br/>
-          ✅ URLの <span class="mono">?key=</span> は共有しない
+          ✅ ホームは <b>need_reply=TRUE</b> だけ表示（= 未完了）<br/>
+          ✅ 顧客クリックで詳細（会話/追客/条件）<br/>
+          ✅ 操作は ADMIN_KEY を入力して実行
         </div>
       </div>
+
+      <div class="sidecard">
+        <div class="small">
+          <div style="font-weight:800; margin-bottom:6px;">🔐 Admin key（ブラウザ保存）</div>
+          <input id="adminKey" placeholder="ADMIN_API_KEY を貼る（ローカル保存）" style="width:100%; padding:10px; border-radius:12px; border:1px solid var(--border); background: var(--panel); color: var(--text);" />
+          <div class="muted" style="margin-top:6px; font-size:12px;">※共有PCでは入れないで</div>
+        </div>
+      </div>
+
     </aside>
 
     <main class="main">
       <div class="topbar">
         <div class="title">
           <h1 id="pageTitle">ホーム</h1>
-          <div class="meta">全体状況が “1ページ” で分かる</div>
+          <div class="meta">need_reply（DB確定）で “今やる” がブレない</div>
         </div>
         <div class="actions">
           <div class="search">
-            🔎 <input id="q" placeholder="user_id / 次のゴール / メッセージ / status で検索" />
+            🔎 <input id="q" placeholder="検索：user_id / next_goal / msg / status / reason" />
           </div>
           <button class="btn" id="toggleTheme">🌓</button>
           <button class="btn" id="btnApply">反映</button>
@@ -1783,19 +2005,19 @@ async def dashboard(
 
       <section class="grid kpis">
         <div class="card">
-          <div class="kpi-top"><div class="kpi-label">顧客（表示範囲）</div><div class="kpi-delta muted">customers(min_level)</div></div>
+          <div class="kpi-top"><div class="kpi-label">顧客（表示範囲）</div><div class="kpi-delta muted">customers</div></div>
           <div class="kpi-value" id="kpiCustomers">-</div>
           <div class="kpi-delta" id="kpiCustomersSub">-</div>
         </div>
         <div class="card">
-          <div class="kpi-top"><div class="kpi-label">温度 8+（優先）</div><div class="kpi-delta muted">HOT</div></div>
-          <div class="kpi-value" id="kpiHot">-</div>
-          <div class="kpi-delta" id="kpiHotSub">-</div>
+          <div class="kpi-top"><div class="kpi-label">need_reply（確定）</div><div class="kpi-delta muted">TODO</div></div>
+          <div class="kpi-value" id="kpiNeed">-</div>
+          <div class="kpi-delta muted">DB need_reply=TRUE</div>
         </div>
         <div class="card">
-          <div class="kpi-top"><div class="kpi-label">要返信っぽい（目視補助）</div><div class="kpi-delta muted">heuristic</div></div>
-          <div class="kpi-value" id="kpiNeed">-</div>
-          <div class="kpi-delta muted">next_goal/status/文言で推定</div>
+          <div class="kpi-top"><div class="kpi-label">温度 8+（参考）</div><div class="kpi-delta muted">HOT</div></div>
+          <div class="kpi-value" id="kpiHot">-</div>
+          <div class="kpi-delta muted">Lv>=8 & ACTIVE</div>
         </div>
         <div class="card">
           <div class="kpi-top"><div class="kpi-label">追客返信率（A/B）</div><div class="kpi-delta muted">ab_stats</div></div>
@@ -1816,8 +2038,8 @@ async def dashboard(
 
           <div class="card" id="homeTopCard">
             <div class="section-title">
-              <h2>今やる（上から処理）</h2>
-              <span>温度/内見/要返信</span>
+              <h2>今やる（need_reply=TRUE）</h2>
+              <span>クリックで顧客詳細</span>
             </div>
             <div style="overflow:auto; border-radius: 14px;">
               <table>
@@ -1826,6 +2048,7 @@ async def dashboard(
                     <th>更新</th>
                     <th>温度</th>
                     <th>status</th>
+                    <th>need</th>
                     <th>次</th>
                     <th>user</th>
                     <th>msg</th>
@@ -1886,7 +2109,7 @@ async def dashboard(
             </div>
 
             <div style="display:flex; gap:10px; margin-top: 10px; flex-wrap: wrap;">
-              <button class="btn" onclick="setTab('home'); return false;">🏠 ホームへ</button>
+              <button class="btn" onclick="setTab('home'); return false;">🏠 ホーム</button>
               <button class="btn" onclick="setTab('customers'); return false;">👥 顧客</button>
               <button class="btn" onclick="setTab('followups'); return false;">📨 追客</button>
               <button class="btn" onclick="setTab('ab_stats'); return false;">🧪 A/B</button>
@@ -1894,9 +2117,9 @@ async def dashboard(
 
             <div class="sidecard" style="margin-top: 12px;">
               <div class="small">
-                <b>TIP</b><br/>
-                ・検索は上の 🔎 で即フィルタ<br/>
-                ・ホームの「今やる」は <span class="mono">温度/内見/要返信推定</span> で並び替え
+                <b>運用TIP</b><br/>
+                ・まずホームの need_reply を上から処理<br/>
+                ・顧客詳細で「今すぐ追客」「COLD/OPTOUT」操作
               </div>
             </div>
           </div>
@@ -1930,7 +2153,7 @@ async def dashboard(
   function pill(level) {{
     const lv = Number(level || 0);
     const c = LEVEL_COLORS[lv] || "#999";
-    return `<span class="badge" style="background:${{c}}22;border-color:${{c}}55;">Lv${{lv}}</span>`;
+    return `<span class="badge info" style="background:${{c}}22;border-color:${{c}}55;">Lv${{lv}}</span>`;
   }}
   function chipsSlots(r) {{
     const items = [
@@ -1945,38 +2168,24 @@ async def dashboard(
     }}).join("") + `</span>`;
   }}
 
-  function isNeedReplyHeuristic(r) {{
-    const st = (r.status || "").toUpperCase();
-    const goal = (r.next_goal || "");
-    const msg = (r.message || "");
-    if (st === "OPTOUT" || st === "LOST" || st === "COLD") return false;
-    if (goal.includes("要件確認") || goal.includes("確認") || goal.includes("日程") || goal.includes("内見")) return true;
-    if (msg.includes("？") || msg.includes("?")) return true;
-    return false;
-  }}
-
-  function scoreForHome(r) {{
+  function scoreHome(r) {{
     const lvl = Number(r.temp_level_stable || 0);
-    const hasVisit = !!(r.visit_slot_selected && r.visit_slot_selected !== "REQUEST_CHANGE");
-    const need = isNeedReplyHeuristic(r);
     const st = (r.status || "ACTIVE").toUpperCase();
     let s = 0;
+    s += (r.need_reply ? 1000 : 0);
     s += lvl * 10;
-    if (hasVisit) s += 25;
-    if (need) s += 15;
     if (st === "ACTIVE") s += 5;
-    if (st === "COLD" || st === "LOST" || st === "OPTOUT") s -= 999;
+    if (st === "COLD" || st === "LOST" || st === "OPTOUT") s -= 99999;
     return s;
   }}
 
   function setTab(tab) {{
     state.tab = tab;
-    const tabs = ["home","customers","events","followups","ab_stats"];
-    for (const t of tabs) {{
-      const el = document.getElementById("nav-" + (t === "ab_stats" ? "ab" : t));
+    const mapId = (t) => (t === "ab_stats" ? "ab" : t);
+    for (const t of ["home","customers","events","followups","ab_stats"]) {{
+      const el = document.getElementById("nav-" + mapId(t));
       if (el) el.classList.toggle("active", tab === t);
     }}
-
     const titleMap = {{
       home: "ホーム",
       customers: "顧客（customers）",
@@ -1985,10 +2194,8 @@ async def dashboard(
       ab_stats: "A/B（ab_stats）",
     }};
     document.getElementById("pageTitle").textContent = titleMap[tab] || "Dashboard";
-
     document.getElementById("homeTopCard").style.display = (tab === "home") ? "" : "none";
     document.getElementById("detailTableCard").style.display = (tab === "home") ? "none" : "";
-
     if (tab !== "home") renderDetail();
   }}
 
@@ -2002,26 +2209,21 @@ async def dashboard(
   }}
 
   function updateNow() {{
-    const d = new Date();
-    document.getElementById("now").textContent = d.toLocaleString();
+    document.getElementById("now").textContent = new Date().toLocaleString();
   }}
 
   function updateKpis() {{
     const customers = state.customers || [];
     const total = customers.length;
-
+    const need = customers.filter(r => !!r.need_reply).length;
     const hot = customers.filter(r => Number(r.temp_level_stable || 0) >= 8 && (r.status || "").toUpperCase() === "ACTIVE").length;
-    const need = customers.filter(r => isNeedReplyHeuristic(r)).length;
 
     document.getElementById("kpiCustomers").textContent = total.toString();
     document.getElementById("kpiCustomersSub").textContent = `min_level=${{document.getElementById("minLevel").value}} / limit=${{document.getElementById("limit").value}}`;
 
-    document.getElementById("kpiHot").textContent = hot.toString();
-    document.getElementById("kpiHotSub").textContent = `温度8+ & ACTIVE`;
-
     document.getElementById("kpiNeed").textContent = need.toString();
+    document.getElementById("kpiHot").textContent = hot.toString();
 
-    // AB rate
     const ab = state.ab || [];
     const totalSent = ab.reduce((a,r)=>a + Number(r.sent||0), 0);
     const totalResp = ab.reduce((a,r)=>a + Number(r.responded||0), 0);
@@ -2033,66 +2235,6 @@ async def dashboard(
     }} else {{
       document.getElementById("kpiAbSub").textContent = "データなし";
     }}
-  }}
-
-  function renderHomeTop() {{
-    const q = (document.getElementById("q").value || "").trim().toLowerCase();
-    const rows = (state.customers || [])
-      .filter(r => {{
-        if (!q) return true;
-        const fields = [r.user_id,r.message,r.next_goal,r.status,r.visit_slot_selected,r.slot_budget,r.slot_area,r.slot_move_in,r.slot_layout]
-          .map(x => (x||"").toString().toLowerCase());
-        return fields.some(f => f.includes(q));
-      }})
-      .slice()
-      .sort((a,b)=> scoreForHome(b) - scoreForHome(a))
-      .slice(0, 30);
-
-    const tbody = document.getElementById("homeTop");
-    if (!rows.length) {{
-      tbody.innerHTML = `<tr><td colspan="7" class="muted">No data</td></tr>`;
-      return;
-    }}
-
-    tbody.innerHTML = rows.map(r => {{
-      const st = (r.status || "ACTIVE").toUpperCase();
-      const stBadge = st === "ACTIVE" ? "badge good" : (st === "COLD" ? "badge warn" : "badge bad");
-      const visit = r.visit_slot_selected ? escapeHtml(r.visit_slot_selected) : "-";
-      return `<tr>
-        <td class="mono muted">${{escapeHtml(fmtTime(r.ts))}}</td>
-        <td>${{r.temp_level_stable ? pill(r.temp_level_stable) : "-"}}</td>
-        <td><span class="${{stBadge}}">${{escapeHtml(st)}}</span></td>
-        <td>${{escapeHtml(r.next_goal || "-")}}</td>
-        <td class="mono">${{escapeHtml(r.user_id || "")}}</td>
-        <td class="rowmsg">${{escapeHtml(r.message || "")}}</td>
-        <td class="mono">${{visit}}</td>
-      </tr>`;
-    }}).join("");
-  }}
-
-  function renderActivities() {{
-    const list = (state.events || []).slice(0, 10);
-    const wrap = document.getElementById("activities");
-    if (!list.length) {{
-      wrap.innerHTML = `<div class="muted">No events</div>`;
-      return;
-    }}
-    wrap.innerHTML = list.map(e => {{
-      const role = (e.role || "").toLowerCase();
-      const badge = role === "user" ? `<span class="badge warn">user</span>` : `<span class="badge good">assistant</span>`;
-      return `<div class="activity-item">
-        <div class="activity-time mono">${{escapeHtml(fmtTime(e.ts))}}</div>
-        <div class="activity-text">
-          <div style="display:flex; gap:8px; align-items:center; flex-wrap:wrap;">
-            ${{badge}}
-            <span class="mono muted">${{escapeHtml(e.user_id || "")}}</span>
-            ${{e.temp_level_stable ? pill(e.temp_level_stable) : ""}}
-            <span class="muted">${{escapeHtml(e.next_goal || "")}}</span>
-          </div>
-          <div style="margin-top:6px" class="rowmsg">${{escapeHtml(e.message || "")}}</div>
-        </div>
-      </div>`;
-    }}).join("");
   }}
 
   function renderChartLevels() {{
@@ -2115,11 +2257,7 @@ async def dashboard(
       type: 'bar',
       data: {{
         labels,
-        datasets: [{{
-          label: '件数',
-          data,
-          borderWidth: 1,
-        }}]
+        datasets: [{{ label: '件数', data, borderWidth: 1 }}]
       }},
       options: {{
         responsive: true,
@@ -2140,11 +2278,78 @@ async def dashboard(
     }});
   }}
 
+  function renderHomeTop() {{
+    const q = (document.getElementById("q").value || "").trim().toLowerCase();
+    let rows = (state.customers || []).filter(r => !!r.need_reply);
+
+    if (q) {{
+      rows = rows.filter(r => {{
+        const fields = [r.user_id,r.message,r.next_goal,r.status,r.need_reply_reason,r.visit_slot_selected,r.slot_budget,r.slot_area,r.slot_move_in,r.slot_layout]
+          .map(x => (x||"").toString().toLowerCase());
+        return fields.some(f => f.includes(q));
+      }});
+    }}
+
+    rows = rows.slice().sort((a,b)=> scoreHome(b) - scoreHome(a)).slice(0, 50);
+
+    const tbody = document.getElementById("homeTop");
+    if (!rows.length) {{
+      tbody.innerHTML = `<tr><td colspan="8" class="muted">need_reply がありません</td></tr>`;
+      return;
+    }}
+
+    const shopId = document.getElementById("shopId").value.trim();
+    tbody.innerHTML = rows.map(r => {{
+      const st = (r.status || "ACTIVE").toUpperCase();
+      const stBadge = st === "ACTIVE" ? "badge good" : (st === "COLD" ? "badge warn" : "badge bad");
+      const visit = r.visit_slot_selected ? escapeHtml(r.visit_slot_selected) : "-";
+      const need = `<span class="badge warn">${{escapeHtml(r.need_reply_reason || "need_reply")}}</span>`;
+      const link = `/dashboard/customer?shop_id=${{encodeURIComponent(shopId)}}&conv_key=${{encodeURIComponent(r.conv_key)}}&key=${{encodeURIComponent(DASH_KEY)}}`;
+      return `<tr>
+        <td class="mono muted">${{escapeHtml(fmtTime(r.ts))}}</td>
+        <td>${{r.temp_level_stable ? pill(r.temp_level_stable) : "-"}}</td>
+        <td><span class="${{stBadge}}">${{escapeHtml(st)}}</span></td>
+        <td>${{need}}</td>
+        <td>${{escapeHtml(r.next_goal || "-")}}</td>
+        <td class="mono"><a class="link" href="${{link}}">${{escapeHtml(r.user_id || "")}}</a></td>
+        <td class="rowmsg">${{escapeHtml(r.message || "")}}</td>
+        <td class="mono">${{visit}}</td>
+      </tr>`;
+    }}).join("");
+  }}
+
+  function renderActivities() {{
+    const list = (state.events || []).slice(0, 10);
+    const wrap = document.getElementById("activities");
+    if (!list.length) {{
+      wrap.innerHTML = `<div class="muted">No events</div>`;
+      return;
+    }}
+    const shopId = document.getElementById("shopId").value.trim();
+    wrap.innerHTML = list.map(e => {{
+      const role = (e.role || "").toLowerCase();
+      const badge = role === "user" ? `<span class="badge warn">user</span>` : `<span class="badge good">assistant</span>`;
+      const link = e.conv_key ? `/dashboard/customer?shop_id=${{encodeURIComponent(shopId)}}&conv_key=${{encodeURIComponent(e.conv_key)}}&key=${{encodeURIComponent(DASH_KEY)}}` : "#";
+      return `<div class="activity-item">
+        <div class="activity-time mono">${{escapeHtml(fmtTime(e.ts))}}</div>
+        <div class="activity-text">
+          <div style="display:flex; gap:8px; align-items:center; flex-wrap:wrap;">
+            ${{badge}}
+            <a class="link mono muted" href="${{link}}">${{escapeHtml(e.user_id || "")}}</a>
+            ${{e.temp_level_stable ? pill(e.temp_level_stable) : ""}}
+            <span class="muted">${{escapeHtml(e.next_goal || "")}}</span>
+          </div>
+          <div style="margin-top:6px" class="rowmsg">${{escapeHtml(e.message || "")}}</div>
+        </div>
+      </div>`;
+    }}).join("");
+  }}
+
   function setHeader(view) {{
     const thead = document.getElementById("thead");
     if (view === "customers") {{
       thead.innerHTML = `<tr>
-        <th>更新</th><th>温度</th><th>確度</th><th>status</th><th>条件</th><th>次</th><th>user</th><th>msg</th><th>内見枠</th>
+        <th>更新</th><th>温度</th><th>確度</th><th>status</th><th>need</th><th>条件</th><th>次</th><th>user</th><th>msg</th><th>内見枠</th>
       </tr>`;
       return;
     }}
@@ -2163,10 +2368,9 @@ async def dashboard(
     const view = state.tab;
     const q = (document.getElementById("q").value || "").trim().toLowerCase();
     const tbody = document.getElementById("tbody");
-
     setHeader(view);
     document.getElementById("detailTitle").textContent = `詳細：${{view}}`;
-    document.getElementById("detailHint").textContent = `search / auto refresh 対応`;
+    document.getElementById("detailHint").textContent = `検索/自動更新対応`;
 
     let rows = [];
     if (view === "customers") rows = state.customers || [];
@@ -2176,18 +2380,18 @@ async def dashboard(
 
     if (q) {{
       rows = rows.filter(r => {{
-        const fields = [
-          r.user_id, r.message, r.next_goal, r.status, r.variant, r.error, r.role,
-          r.visit_slot_selected, r.slot_budget, r.slot_area, r.slot_move_in, r.slot_layout
-        ].map(x => (x||"").toString().toLowerCase());
+        const fields = [r.user_id,r.message,r.next_goal,r.status,r.variant,r.error,r.role,r.need_reply_reason]
+          .map(x => (x||"").toString().toLowerCase());
         return fields.some(f => f.includes(q));
       }});
     }}
 
     if (!rows.length) {{
-      tbody.innerHTML = `<tr><td colspan="9" class="muted">No data</td></tr>`;
+      tbody.innerHTML = `<tr><td colspan="10" class="muted">No data</td></tr>`;
       return;
     }}
+
+    const shopId = document.getElementById("shopId").value.trim();
 
     if (view === "ab_stats") {{
       tbody.innerHTML = rows.map(r => `
@@ -2208,7 +2412,7 @@ async def dashboard(
           <td class="mono">${{escapeHtml(r.status || "-")}}</td>
           <td class="mono">${{escapeHtml(String(r.stage ?? "-"))}}</td>
           <td class="mono">${{escapeHtml(r.variant || "-")}}</td>
-          <td class="mono">${{escapeHtml(r.user_id || "")}}</td>
+          <td class="mono"><a class="link" href="/dashboard/customer?shop_id=${{encodeURIComponent(shopId)}}&conv_key=${{encodeURIComponent(r.conv_key)}}&key=${{encodeURIComponent(DASH_KEY)}}">${{escapeHtml(r.user_id || "")}}</a></td>
           <td class="rowmsg">${{escapeHtml(r.message || "")}}</td>
           <td class="mono">${{r.responded_at ? "YES" : "-"}}</td>
           <td class="mono muted">${{escapeHtml(r.error || "-")}}</td>
@@ -2223,15 +2427,18 @@ async def dashboard(
         const stBadge = st === "ACTIVE" ? "badge good" : (st === "COLD" ? "badge warn" : "badge bad");
         const conf = (r.confidence == null) ? "-" : Number(r.confidence).toFixed(2);
         const visit = r.visit_slot_selected ? escapeHtml(r.visit_slot_selected) : "-";
+        const need = r.need_reply ? `<span class="badge warn">${{escapeHtml(r.need_reply_reason || "need_reply")}}</span>` : `<span class="badge good">OK</span>`;
+        const link = `/dashboard/customer?shop_id=${{encodeURIComponent(shopId)}}&conv_key=${{encodeURIComponent(r.conv_key)}}&key=${{encodeURIComponent(DASH_KEY)}}`;
         return `
           <tr>
             <td class="mono muted">${{escapeHtml(fmtTime(r.ts))}}</td>
             <td>${{r.temp_level_stable ? pill(r.temp_level_stable) : "-"}}</td>
             <td class="mono">${{conf}}</td>
             <td><span class="${{stBadge}}">${{escapeHtml(st)}}</span></td>
+            <td>${{need}}</td>
             <td>${{chipsSlots(r)}}</td>
             <td>${{escapeHtml(r.next_goal || "-")}}</td>
-            <td class="mono">${{escapeHtml(r.user_id || "")}}</td>
+            <td class="mono"><a class="link" href="${{link}}">${{escapeHtml(r.user_id || "")}}</a></td>
             <td class="rowmsg">${{escapeHtml(r.message || "")}}</td>
             <td class="mono">${{visit}}</td>
           </tr>
@@ -2245,6 +2452,7 @@ async def dashboard(
       const conf = (r.confidence == null) ? "-" : Number(r.confidence).toFixed(2);
       const role = (r.role || "-").toString();
       const roleBadge = role === "user" ? `<span class="badge warn">user</span>` : `<span class="badge good">assistant</span>`;
+      const link = r.conv_key ? `/dashboard/customer?shop_id=${{encodeURIComponent(shopId)}}&conv_key=${{encodeURIComponent(r.conv_key)}}&key=${{encodeURIComponent(DASH_KEY)}}` : "#";
       return `
         <tr>
           <td class="mono muted">${{escapeHtml(fmtTime(r.ts))}}</td>
@@ -2252,7 +2460,7 @@ async def dashboard(
           <td>${{r.temp_level_stable ? pill(r.temp_level_stable) : "-"}}</td>
           <td class="mono">${{conf}}</td>
           <td>${{escapeHtml(r.next_goal || "-")}}</td>
-          <td class="mono">${{escapeHtml(r.user_id || "")}}</td>
+          <td class="mono"><a class="link" href="${{link}}">${{escapeHtml(r.user_id || "")}}</a></td>
           <td class="rowmsg">${{escapeHtml(r.message || "")}}</td>
         </tr>
       `;
@@ -2261,11 +2469,9 @@ async def dashboard(
 
   async function fetchAll() {{
     updateNow();
-
-    // customers（ホーム/KPI/チャートに必須）
     state.customers = await fetchJson("customers");
 
-    // events（右のアクティビティ用、重いのでlimit小さめ）
+    // events（軽め）
     {{
       const shopId = document.getElementById("shopId").value.trim();
       const url = `/api/hot?shop_id=${{encodeURIComponent(shopId)}}&min_level=1&limit=40&view=events&key=${{encodeURIComponent(DASH_KEY)}}`;
@@ -2273,7 +2479,6 @@ async def dashboard(
       state.events = await res.json();
     }}
 
-    // followups / ab_stats（KPI用）
     state.followups = await fetchJson("followups");
     state.ab = await fetchJson("ab_stats");
 
@@ -2281,7 +2486,6 @@ async def dashboard(
     renderChartLevels();
     renderActivities();
     renderHomeTop();
-
     if (state.tab !== "home") renderDetail();
   }}
 
@@ -2300,8 +2504,15 @@ async def dashboard(
   document.getElementById("toggleTheme").addEventListener("click", () => {{
     document.body.classList.toggle("light");
     localStorage.setItem(keyTheme, document.body.classList.contains("light") ? "light" : "dark");
-    // chart repaint colors (simple)
     if (state.chart) state.chart.update();
+  }});
+
+  // Admin key store
+  const adminKeyInput = document.getElementById("adminKey");
+  const savedAdmin = localStorage.getItem("dashboard_admin_key") || "";
+  adminKeyInput.value = savedAdmin;
+  adminKeyInput.addEventListener("change", () => {{
+    localStorage.setItem("dashboard_admin_key", adminKeyInput.value.trim());
   }});
 
   // Controls
@@ -2313,7 +2524,6 @@ async def dashboard(
     const refreshSec = document.getElementById("refreshSec").value;
     const qs = new URLSearchParams({{
       shop_id: shopId,
-      view: "customers",
       min_level: minLevel,
       limit: limit,
       refresh: refreshSec,
@@ -2331,6 +2541,271 @@ async def dashboard(
   // start
   setTab("home");
   fetchAll().then(setupAutoRefresh).catch(console.error);
+</script>
+</body>
+</html>
+"""
+    return HTMLResponse(html)
+
+
+# ============================================================
+# Dashboard customer page (②)
+# ============================================================
+
+@app.get("/dashboard/customer", response_class=HTMLResponse)
+async def dashboard_customer(
+    _: None = Depends(require_dashboard_key),
+    shop_id: str = Query(default=SHOP_ID),
+    conv_key: str = Query(...),
+    key: Optional[str] = Query(default=None),
+):
+    key_q = (key or "").strip()
+    html = f"""
+<!doctype html>
+<html lang="ja">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Customer | {shop_id}</title>
+  <style>
+    :root {{
+      --bg:#0b1020; --panel:rgba(255,255,255,0.06); --panel2:rgba(255,255,255,0.09);
+      --text:rgba(255,255,255,0.92); --muted:rgba(255,255,255,0.62); --border:rgba(255,255,255,0.10);
+      --shadow:0 12px 30px rgba(0,0,0,0.35); --good:#37d67a; --warn:#ffb020; --bad:#ff4d4d; --blue:#4da3ff;
+      --radius:18px; --radius2:14px; --gap:14px;
+      --font:ui-sans-serif, system-ui, -apple-system, "SF Pro Display", "Hiragino Sans", "Noto Sans JP", "Segoe UI", Roboto, "Helvetica Neue", Arial;
+    }}
+    body.light {{ --bg:#f7f8fb; --panel:rgba(0,0,0,0.04); --panel2:rgba(0,0,0,0.06); --text:rgba(0,0,0,0.88); --muted:rgba(0,0,0,0.56); --border:rgba(0,0,0,0.10); --shadow:0 10px 24px rgba(0,0,0,0.10); }}
+    *{{box-sizing:border-box;}} html,body{{height:100%;}}
+    body{{margin:0;font-family:var(--font);background: radial-gradient(1200px 700px at 20% 0%, rgba(77,163,255,0.25), transparent 60%), radial-gradient(900px 500px at 90% 10%, rgba(255,77,77,0.20), transparent 60%), radial-gradient(900px 600px at 60% 100%, rgba(55,214,122,0.14), transparent 60%), var(--bg); color:var(--text);}}
+    a{{color:inherit;text-decoration:none;}}
+    .wrap{{max-width:1200px;margin:0 auto;padding:18px;display:grid;gap:var(--gap);}}
+    .top{{display:flex;justify-content:space-between;align-items:center;gap:10px;flex-wrap:wrap;}}
+    .btn{{border:1px solid var(--border);background:var(--panel);color:var(--text);padding:10px 12px;border-radius:999px;cursor:pointer;}}
+    .btn:hover{{background:var(--panel2);}}
+    .btn.primary{{background:rgba(77,163,255,0.22);border-color:rgba(77,163,255,0.35);}}
+    .card{{border:1px solid var(--border);background:var(--panel);border-radius:var(--radius);box-shadow:var(--shadow);padding:14px;}}
+    .grid{{display:grid;gap:var(--gap);grid-template-columns:1.2fr 0.8fr;align-items:start;}}
+    @media(max-width:980px){{.grid{{grid-template-columns:1fr;}}}}
+    .h1{{font-size:20px;font-weight:900;margin:0;}}
+    .muted{{color:var(--muted);}}
+    .mono{{font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas; font-size:12px;}}
+    .badge{{display:inline-flex;align-items:center;gap:6px;padding:4px 10px;border-radius:999px;font-size:12px;border:1px solid var(--border);background:var(--panel2);white-space:nowrap;}}
+    .badge.good{{background:rgba(55,214,122,0.14);border-color:rgba(55,214,122,0.35);}}
+    .badge.warn{{background:rgba(255,176,32,0.14);border-color:rgba(255,176,32,0.35);}}
+    .badge.bad{{background:rgba(255,77,77,0.14);border-color:rgba(255,77,77,0.35);}}
+    .badge.info{{background:rgba(77,163,255,0.14);border-color:rgba(77,163,255,0.35);}}
+    .row{{display:flex;gap:10px;flex-wrap:wrap;align-items:center;}}
+    .msg{{padding:10px;border-radius:14px;border:1px solid var(--border);background:var(--panel2);white-space:pre-wrap;word-break:break-word;}}
+    .msg.user{{border-color:rgba(255,176,32,0.25);}}
+    .msg.assistant{{border-color:rgba(55,214,122,0.25);}}
+    .stack{{display:grid;gap:10px;}}
+    .input{{width:100%;padding:10px;border-radius:12px;border:1px solid var(--border);background:var(--panel);color:var(--text);outline:none;}}
+    table{{width:100%;border-collapse:collapse;}}
+    th,td{{padding:10px 8px;border-bottom:1px solid var(--border);vertical-align:top;}}
+    th{{text-align:left;font-size:12px;color:var(--muted);font-weight:800;white-space:nowrap;}}
+  </style>
+</head>
+<body>
+<div class="wrap">
+  <div class="top">
+    <div>
+      <div class="h1">顧客詳細</div>
+      <div class="muted mono">shop_id={shop_id} / conv_key={conv_key}</div>
+    </div>
+    <div class="row">
+      <a class="btn" href="/dashboard?shop_id={shop_id}&key={key_q}">← 戻る</a>
+      <button class="btn" id="toggleTheme">🌓</button>
+      <button class="btn primary" id="reload">⟲ 更新</button>
+    </div>
+  </div>
+
+  <div class="grid">
+    <div class="card">
+      <div class="row" style="justify-content:space-between;">
+        <div style="font-weight:900;">会話履歴</div>
+        <div class="muted mono" id="updatedAt">-</div>
+      </div>
+      <div class="stack" id="messages" style="margin-top:12px;">
+        <div class="muted">Loading...</div>
+      </div>
+    </div>
+
+    <div class="stack">
+      <div class="card">
+        <div style="font-weight:900;">状態</div>
+        <div class="row" style="margin-top:10px;" id="statusRow"></div>
+        <div class="muted" style="margin-top:10px;">next_goal</div>
+        <div id="nextGoal" class="msg" style="margin-top:6px;">-</div>
+
+        <div class="muted" style="margin-top:10px;">条件スロット</div>
+        <div class="row" id="slots" style="margin-top:6px;"></div>
+
+        <div class="muted" style="margin-top:10px;">内見枠</div>
+        <div class="msg mono" id="visit">-</div>
+      </div>
+
+      <div class="card">
+        <div style="font-weight:900;">操作（Admin）</div>
+        <div class="muted" style="margin-top:8px;font-size:12px;">ADMIN_API_KEY を入力（ブラウザ保存）</div>
+        <input class="input" id="adminKey" placeholder="ADMIN_API_KEY" />
+
+        <div class="row" style="margin-top:10px;">
+          <button class="btn" id="btnResetNeed">need_reply解除</button>
+          <button class="btn" id="btnCold">COLDにする</button>
+          <button class="btn" id="btnOptout">OPTOUTにする</button>
+        </div>
+        <div class="row" style="margin-top:10px;">
+          <button class="btn primary" id="btnFollow1">今すぐ追客（stage1）</button>
+          <button class="btn" id="btnFollow2">セカンド（stage2）</button>
+        </div>
+        <div class="muted mono" style="margin-top:10px;" id="actionResult">-</div>
+      </div>
+
+      <div class="card">
+        <div style="font-weight:900;">追客ログ</div>
+        <div style="overflow:auto; border-radius:14px; margin-top:10px;">
+          <table>
+            <thead><tr><th>ts</th><th>stage</th><th>variant</th><th>status</th><th>responded</th><th>msg</th></tr></thead>
+            <tbody id="followups"><tr><td class="muted" colspan="6">Loading...</td></tr></tbody>
+          </table>
+        </div>
+      </div>
+
+    </div>
+  </div>
+</div>
+
+<script>
+  const DASH_KEY = {json.dumps(key_q, ensure_ascii=False)};
+  const SHOP_ID = {json.dumps(shop_id, ensure_ascii=False)};
+  const CONV_KEY = {json.dumps(conv_key, ensure_ascii=False)};
+
+  function escapeHtml(s) {{
+    return (s ?? "").toString().replace(/[&<>"]/g, (c) => ({{"&":"&amp;","<":"&lt;",">":"&gt;","\\"":"&quot;"}}[c]));
+  }}
+
+  // Theme
+  const keyTheme = "dashboard_theme";
+  const saved = localStorage.getItem(keyTheme);
+  if (saved === "light") document.body.classList.add("light");
+  document.getElementById("toggleTheme").addEventListener("click", () => {{
+    document.body.classList.toggle("light");
+    localStorage.setItem(keyTheme, document.body.classList.contains("light") ? "light" : "dark");
+  }});
+
+  // Admin key store
+  const adminInput = document.getElementById("adminKey");
+  adminInput.value = localStorage.getItem("dashboard_admin_key") || "";
+  adminInput.addEventListener("change", () => localStorage.setItem("dashboard_admin_key", adminInput.value.trim()));
+
+  async function load() {{
+    const url = `/api/customer/detail?shop_id=${{encodeURIComponent(SHOP_ID)}}&conv_key=${{encodeURIComponent(CONV_KEY)}}&key=${{encodeURIComponent(DASH_KEY)}}`;
+    const res = await fetch(url, {{ credentials: "same-origin" }});
+    const data = await res.json();
+    const c = data.customer;
+
+    document.getElementById("updatedAt").textContent = c?.updated_at ? `更新：${{new Date(c.updated_at).toLocaleString()}}` : "-";
+
+    // Status chips
+    const st = (c?.status || "ACTIVE").toUpperCase();
+    const stClass = st === "ACTIVE" ? "good" : (st === "COLD" ? "warn" : "bad");
+    const need = c?.need_reply ? "warn" : "good";
+    const lvl = c?.temp_level_stable ? `Lv${{c.temp_level_stable}}` : "-";
+    const conf = (c?.confidence == null) ? "-" : Number(c.confidence).toFixed(2);
+
+    document.getElementById("statusRow").innerHTML = `
+      <span class="badge ${{stClass}}">${{escapeHtml(st)}}</span>
+      <span class="badge info">${{escapeHtml(lvl)}}</span>
+      <span class="badge info">conf=${{escapeHtml(conf)}}</span>
+      <span class="badge ${{need}}">need_reply=${{c?.need_reply ? "TRUE":"FALSE"}}</span>
+      <span class="badge warn">${{escapeHtml(c?.need_reply_reason || "-")}}</span>
+      <span class="badge info mono">${{escapeHtml(c?.user_id || "")}}</span>
+    `;
+
+    document.getElementById("nextGoal").textContent = c?.next_goal || "-";
+
+    const slots = [
+      ["予算", c?.slot_budget],
+      ["エリア", c?.slot_area],
+      ["時期", c?.slot_move_in],
+      ["間取り", c?.slot_layout]
+    ];
+    document.getElementById("slots").innerHTML = slots.map(([k,v]) => {{
+      const ok = !!(v && String(v).trim());
+      return `<span class="badge ${{ok ? "good":"warn"}}">${{k}}${{ok ? "✓":"✗"}}</span>`;
+    }}).join("");
+
+    document.getElementById("visit").textContent = c?.visit_slot_selected || "-";
+
+    // Messages
+    const msgs = data.messages || [];
+    const wrap = document.getElementById("messages");
+    if (!msgs.length) {{
+      wrap.innerHTML = `<div class="muted">No messages</div>`;
+    }} else {{
+      wrap.innerHTML = msgs.map(m => {{
+        const role = (m.role || "").toLowerCase();
+        const cls = role === "user" ? "user" : "assistant";
+        const head = role === "user" ? "👤 user" : "🤖 assistant";
+        const ts = m.ts ? new Date(m.ts).toLocaleString() : "-";
+        const meta = ` ${head} / ${{ts}}` + (m.temp_level_stable ? ` / Lv${{m.temp_level_stable}}` : "");
+        return `
+          <div class="msg ${{cls}}">
+            <div class="mono muted">${{escapeHtml(meta)}}</div>
+            <div style="margin-top:6px;">${{escapeHtml(m.content || "")}}</div>
+          </div>
+        `;
+      }}).join("");
+    }}
+
+    // Followups
+    const fl = data.followups || [];
+    const tb = document.getElementById("followups");
+    if (!fl.length) {{
+      tb.innerHTML = `<tr><td class="muted" colspan="6">No followups</td></tr>`;
+    }} else {{
+      tb.innerHTML = fl.map(x => {{
+        const ts = x.ts ? new Date(x.ts).toLocaleString() : "-";
+        const resp = x.responded_at ? "YES" : "-";
+        const msg = (x.message || "").slice(0, 180) + ((x.message || "").length > 180 ? "…" : "");
+        return `<tr>
+          <td class="mono muted">${{escapeHtml(ts)}}</td>
+          <td class="mono">${{escapeHtml(String(x.stage ?? "-"))}}</td>
+          <td class="mono">${{escapeHtml(x.variant || "-")}}</td>
+          <td class="mono">${{escapeHtml(x.status || "-")}}</td>
+          <td class="mono">${{resp}}</td>
+          <td>${{escapeHtml(msg)}}</td>
+        </tr>`;
+      }}).join("");
+    }}
+  }}
+
+  async function postAction(path) {{
+    const ak = (document.getElementById("adminKey").value || "").trim();
+    if (!ak) {{
+      document.getElementById("actionResult").textContent = "ADMIN_API_KEY を入れてください";
+      return;
+    }}
+    const url = `${{path}}&shop_id=${{encodeURIComponent(SHOP_ID)}}&conv_key=${{encodeURIComponent(CONV_KEY)}}`;
+    const res = await fetch(url, {{
+      method: "POST",
+      headers: {{ "x-admin-key": ak }},
+      credentials: "same-origin"
+    }});
+    const data = await res.json().catch(()=> ({{}}));
+    document.getElementById("actionResult").textContent = JSON.stringify(data);
+    await load();
+  }}
+
+  document.getElementById("reload").addEventListener("click", load);
+  document.getElementById("btnResetNeed").addEventListener("click", () => postAction("/api/customer/reset_need_reply?dummy=1"));
+  document.getElementById("btnCold").addEventListener("click", () => postAction("/api/customer/mark_cold?dummy=1"));
+  document.getElementById("btnOptout").addEventListener("click", () => postAction("/api/customer/mark_optout?dummy=1"));
+  document.getElementById("btnFollow1").addEventListener("click", () => postAction("/api/customer/send_followup_now?dummy=1&stage=1"));
+  document.getElementById("btnFollow2").addEventListener("click", () => postAction("/api/customer/send_followup_now?dummy=1&stage=2"));
+
+  load().catch(console.error);
 </script>
 </body>
 </html>
