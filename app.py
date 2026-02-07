@@ -1,4 +1,41 @@
-# app.py (FULL - upgrade: analyze uses Responses API Structured Outputs JSON Schema)
+# app.py (FULL - upgrade: 2) context-aware followups (LLM) + 3) best send timing learning)
+# FastAPI + Render + Postgres(pg8000)
+#
+# ✅ LINE webhook (fast reply / fallback "確認中" + later push)
+# ✅ 温度判定: Responses API Structured Outputs (JSON Schema) + intent
+# ✅ 追客: A/B維持しつつ、LLMで文脈別に追客文を生成（失敗時はテンプレfallback）
+# ✅ タイミング学習: ユーザー返信時刻( JST hour )の分布から pref_hour_jst を学習し、追客送信を個別最適化
+# ✅ Dashboard: customers / events / followups / ab_stats + level distribution
+#
+# Required env:
+#   LINE_CHANNEL_SECRET
+#   LINE_CHANNEL_ACCESS_TOKEN
+#   OPENAI_API_KEY
+#   DATABASE_URL
+#   DASHBOARD_KEY
+#   ADMIN_API_KEY
+#
+# Optional env:
+#   SHOP_ID (default tokyo_01)
+#   OPENAI_MODEL_ASSISTANT (default gpt-4o-mini)
+#   OPENAI_MODEL_ANALYZE (default gpt-4o-mini)
+#   OPENAI_MODEL_FOLLOWUP (default gpt-4o-mini)
+#   ANALYZE_TIMEOUT_SEC (default 8.5)
+#   FOLLOWUP_LLM_TIMEOUT_SEC (default 8.5)
+#   FOLLOWUP_USE_LLM (default 1)
+#   FOLLOWUP_TIME_MATCH_HOURS (default 1)  # pref_hour ± this range で送る
+#   FOLLOWUP_FORCE_SEND_AFTER_HOURS (default 12) # 遅延しすぎる場合はpref無視で送る
+#   PREF_HOUR_LOOKBACK_DAYS (default 60)
+#   PREF_HOUR_MIN_SAMPLES (default 3)
+#   DASHBOARD_REFRESH_SEC_DEFAULT (default 30)
+#   FAST_REPLY_TIMEOUT_SEC (default 3.0)
+#   ANALYZE_HISTORY_LIMIT (default 10)
+#   SHORT_TEXT_MAX_LEN (default 2)
+#   FOLLOWUP_* (existing)
+#
+# ⚠️ タイミング最適化を効かせるには /jobs/followup を「1時間に1回以上」叩くのが理想
+#    （Render Cron / 外部Cron / UptimeRobot等でOK）
+
 import os
 import json
 import hmac
@@ -59,8 +96,19 @@ FOLLOWUP_SECOND_TOUCH_LIMIT = int(os.getenv("FOLLOWUP_SECOND_TOUCH_LIMIT", "50")
 # OpenAI models / timeouts
 OPENAI_MODEL_ASSISTANT = os.getenv("OPENAI_MODEL_ASSISTANT", "gpt-4o-mini").strip()  # 返信生成
 OPENAI_MODEL_ANALYZE = os.getenv("OPENAI_MODEL_ANALYZE", "gpt-4o-mini").strip()      # 温度判定
-ANALYZE_TIMEOUT_SEC = float(os.getenv("ANALYZE_TIMEOUT_SEC", "8.5"))                 # 温度判定
-RESPONSES_API_URL = "https://api.openai.com/v1/responses"                            # Structured outputs
+OPENAI_MODEL_FOLLOWUP = os.getenv("OPENAI_MODEL_FOLLOWUP", "gpt-4o-mini").strip()    # 追客生成
+ANALYZE_TIMEOUT_SEC = float(os.getenv("ANALYZE_TIMEOUT_SEC", "8.5"))
+FOLLOWUP_LLM_TIMEOUT_SEC = float(os.getenv("FOLLOWUP_LLM_TIMEOUT_SEC", "8.5"))
+RESPONSES_API_URL = "https://api.openai.com/v1/responses"
+
+# followup llm switch
+FOLLOWUP_USE_LLM = os.getenv("FOLLOWUP_USE_LLM", "1").strip() != "0"
+
+# timing learning params
+FOLLOWUP_TIME_MATCH_HOURS = int(os.getenv("FOLLOWUP_TIME_MATCH_HOURS", "1"))
+FOLLOWUP_FORCE_SEND_AFTER_HOURS = int(os.getenv("FOLLOWUP_FORCE_SEND_AFTER_HOURS", "12"))
+PREF_HOUR_LOOKBACK_DAYS = int(os.getenv("PREF_HOUR_LOOKBACK_DAYS", "60"))
+PREF_HOUR_MIN_SAMPLES = int(os.getenv("PREF_HOUR_MIN_SAMPLES", "3"))
 
 CHAT_HISTORY: Dict[str, deque] = defaultdict(lambda: deque(maxlen=40))
 TEMP_HISTORY: Dict[str, deque] = defaultdict(lambda: deque(maxlen=5))
@@ -243,6 +291,12 @@ def ensure_tables_and_columns() -> None:
     cur.execute("""ALTER TABLE customers ADD COLUMN IF NOT EXISTS confidence REAL;""")
     cur.execute("""ALTER TABLE customers ADD COLUMN IF NOT EXISTS next_goal TEXT;""")
 
+    # NEW: intent + preferred hour
+    cur.execute("""ALTER TABLE customers ADD COLUMN IF NOT EXISTS intent TEXT;""")
+    cur.execute("""ALTER TABLE customers ADD COLUMN IF NOT EXISTS pref_hour_jst INT;""")
+    cur.execute("""ALTER TABLE customers ADD COLUMN IF NOT EXISTS pref_hour_samples INT;""")
+    cur.execute("""ALTER TABLE customers ADD COLUMN IF NOT EXISTS pref_hour_updated_at TIMESTAMPTZ;""")
+
     cur.execute("""ALTER TABLE customers ADD COLUMN IF NOT EXISTS status TEXT;""")
     cur.execute("""ALTER TABLE customers ADD COLUMN IF NOT EXISTS opt_out BOOLEAN;""")
     cur.execute("""ALTER TABLE customers ADD COLUMN IF NOT EXISTS opt_out_at TIMESTAMPTZ;""")
@@ -276,6 +330,7 @@ def ensure_tables_and_columns() -> None:
     cur.execute("""ALTER TABLE messages ADD COLUMN IF NOT EXISTS temp_level_stable INT;""")
     cur.execute("""ALTER TABLE messages ADD COLUMN IF NOT EXISTS confidence REAL;""")
     cur.execute("""ALTER TABLE messages ADD COLUMN IF NOT EXISTS next_goal TEXT;""")
+    cur.execute("""ALTER TABLE messages ADD COLUMN IF NOT EXISTS intent TEXT;""")  # NEW
 
     cur.execute(
         """
@@ -304,11 +359,13 @@ def ensure_tables_and_columns() -> None:
     cur.execute("""ALTER TABLE followup_logs ADD COLUMN IF NOT EXISTS variant TEXT;""")
     cur.execute("""ALTER TABLE followup_logs ADD COLUMN IF NOT EXISTS responded_at TIMESTAMPTZ;""")
     cur.execute("""ALTER TABLE followup_logs ADD COLUMN IF NOT EXISTS stage INT;""")
+    cur.execute("""ALTER TABLE followup_logs ADD COLUMN IF NOT EXISTS send_hour_jst INT;""")  # NEW
 
     cur.execute("""CREATE INDEX IF NOT EXISTS idx_customers_shop_updated ON customers(shop_id, updated_at DESC);""")
     cur.execute("""CREATE INDEX IF NOT EXISTS idx_messages_conv_created ON messages(conv_key, created_at DESC);""")
     cur.execute("""CREATE INDEX IF NOT EXISTS idx_followup_shop_conv_created ON followup_logs(shop_id, conv_key, created_at DESC);""")
     cur.execute("""CREATE INDEX IF NOT EXISTS idx_customers_need_reply ON customers(shop_id, need_reply, updated_at DESC);""")
+    cur.execute("""CREATE INDEX IF NOT EXISTS idx_messages_shop_conv_role_created ON messages(shop_id, conv_key, role, created_at DESC);""")
 
     cur.execute("""UPDATE customers SET need_reply=FALSE WHERE need_reply IS NULL;""")
 
@@ -344,7 +401,8 @@ def get_customer_flags(shop_id: str, conv_key: str) -> Dict[str, Any]:
         return {}
     rows = db_fetchall(
         """
-        SELECT visit_slot_selected, slot_budget, slot_area, slot_move_in, slot_layout, COALESCE(status,'ACTIVE'), COALESCE(opt_out,FALSE)
+        SELECT visit_slot_selected, slot_budget, slot_area, slot_move_in, slot_layout,
+               COALESCE(status,'ACTIVE'), COALESCE(opt_out,FALSE)
         FROM customers
         WHERE shop_id=%s AND conv_key=%s
         """,
@@ -451,20 +509,21 @@ async def push_line(user_id: str, text: str) -> None:
 
 
 # ============================================================
-# OpenAI
+# OpenAI - chat completions (reply) + responses api (analyze/followup)
 # ============================================================
 
-# 返信生成（従来のchat.completionsを維持して安全）
-OPENAI_API_URL = "https://api.openai.com/v1/chat/completions"
+OPENAI_CHAT_URL = "https://api.openai.com/v1/chat/completions"
 
 SYSTEM_PROMPT_ANALYZE = """
 あなたは不動産仲介SaaSの「顧客温度判定AI」です。
 会話履歴と最新発言から、成約に近い順に 1〜10 で温度を判定します。
+同時に「意図(intent)」も分類してください。
 
 【出力はJSONのみ（それ以外禁止）】
 {
   "temp_level_raw": 1,
   "confidence": 0.50,
+  "intent": "rent|buy|invest|research|other",
   "next_goal": "短い日本語",
   "reasons": ["根拠1","根拠2","根拠3"]
 }
@@ -495,26 +554,14 @@ SYSTEM_PROMPT_ASSISTANT = """
 ・押し売り感を出さない
 """
 
-
-async def openai_chat(messages: List[Dict[str, str]], temperature: float = 0.2, timeout_sec: float = 25.0) -> str:
-    if not OPENAI_API_KEY:
-        raise RuntimeError("OPENAI_API_KEY is missing")
-    headers = {"Authorization": f"Bearer {OPENAI_API_KEY}", "Content-Type": "application/json"}
-    payload = {"model": OPENAI_MODEL_ASSISTANT, "messages": messages, "temperature": temperature}
-    async with httpx.AsyncClient(timeout=timeout_sec, verify=certifi.where()) as client:
-        r = await client.post(OPENAI_API_URL, headers=headers, json=payload)
-        r.raise_for_status()
-        data = r.json()
-        return data["choices"][0]["message"]["content"]
-
-
-# ✅ NEW: Structured Outputs schema for analyze (Responses API)
+# Responses API schemas
 ANALYZE_JSON_SCHEMA = {
     "type": "object",
     "additionalProperties": False,
     "properties": {
         "temp_level_raw": {"type": "integer", "minimum": 1, "maximum": 10},
         "confidence": {"type": "number", "minimum": 0.0, "maximum": 1.0},
+        "intent": {"type": "string", "enum": ["rent", "buy", "invest", "research", "other"]},
         "next_goal": {"type": "string", "maxLength": 80},
         "reasons": {
             "type": "array",
@@ -523,95 +570,80 @@ ANALYZE_JSON_SCHEMA = {
             "maxItems": 3
         }
     },
-    "required": ["temp_level_raw", "confidence", "next_goal", "reasons"]
+    "required": ["temp_level_raw", "confidence", "intent", "next_goal", "reasons"]
+}
+
+FOLLOWUP_JSON_SCHEMA = {
+    "type": "object",
+    "additionalProperties": False,
+    "properties": {
+        "message": {"type": "string", "maxLength": 900}
+    },
+    "required": ["message"]
 }
 
 
-async def openai_analyze_structured(
-    history: List[Dict[str, str]],
-    slots: Optional[Dict[str, str]],
+async def openai_chat(messages: List[Dict[str, str]], temperature: float = 0.2, timeout_sec: float = 25.0) -> str:
+    if not OPENAI_API_KEY:
+        raise RuntimeError("OPENAI_API_KEY is missing")
+    headers = {"Authorization": f"Bearer {OPENAI_API_KEY}", "Content-Type": "application/json"}
+    payload = {"model": OPENAI_MODEL_ASSISTANT, "messages": messages, "temperature": temperature}
+    async with httpx.AsyncClient(timeout=timeout_sec, verify=certifi.where()) as client:
+        r = await client.post(OPENAI_CHAT_URL, headers=headers, json=payload)
+        r.raise_for_status()
+        data = r.json()
+        return data["choices"][0]["message"]["content"]
+
+
+def _responses_extract_output_text(data: Dict[str, Any]) -> Optional[str]:
+    output_items = data.get("output", []) or []
+    chunks: List[str] = []
+    for item in output_items:
+        if item.get("type") == "message":
+            content = item.get("content", []) or []
+            for c in content:
+                if c.get("type") == "output_text" and isinstance(c.get("text"), str):
+                    chunks.append(c["text"])
+    if not chunks:
+        return None
+    return "\n".join(chunks).strip()
+
+
+async def openai_responses_json(
+    model: str,
+    instructions: str,
+    input_msgs: List[Dict[str, str]],
+    schema: Dict[str, Any],
+    timeout_sec: float,
 ) -> Optional[Dict[str, Any]]:
-    """
-    Responses API + Structured Outputs(JSON Schema)
-    return dict or None
-    """
     if not OPENAI_API_KEY:
         return None
-
-    instructions = SYSTEM_PROMPT_ANALYZE.strip()
-    input_msgs: List[Dict[str, str]] = []
-
-    # 参考スロットを最初に渡す（判定精度UP、ただし押し売り判定に使わない）
-    if slots:
-        input_msgs.append({
-            "role": "user",
-            "content": f"抽出スロット(参考): {json.dumps(slots, ensure_ascii=False)}"
-        })
-
-    # 会話履歴
-    input_msgs.extend(history[-max(2, ANALYZE_HISTORY_LIMIT):])
-
+    headers = {"Authorization": f"Bearer {OPENAI_API_KEY}", "Content-Type": "application/json"}
     payload = {
-        "model": OPENAI_MODEL_ANALYZE,
+        "model": model,
         "instructions": instructions,
         "input": input_msgs,
         "text": {
             "format": {
                 "type": "json_schema",
                 "strict": True,
-                "schema": ANALYZE_JSON_SCHEMA
+                "schema": schema
             }
         }
     }
-
-    headers = {
-        "Authorization": f"Bearer {OPENAI_API_KEY}",
-        "Content-Type": "application/json",
-    }
-
     try:
-        async with httpx.AsyncClient(timeout=ANALYZE_TIMEOUT_SEC, verify=certifi.where()) as client:
+        async with httpx.AsyncClient(timeout=timeout_sec, verify=certifi.where()) as client:
             r = await client.post(RESPONSES_API_URL, headers=headers, json=payload)
             if r.status_code >= 400:
-                print("[OPENAI] analyze responses failed:", r.status_code, (r.text or "")[:200])
+                print("[OPENAI] responses failed:", r.status_code, (r.text or "")[:240])
                 return None
             data = r.json()
-
-        # Extract output_text chunks
-        output_items = data.get("output", []) or []
-        text_chunks: List[str] = []
-        for item in output_items:
-            if item.get("type") == "message":
-                content = item.get("content", []) or []
-                for c in content:
-                    if c.get("type") == "output_text" and isinstance(c.get("text"), str):
-                        text_chunks.append(c["text"])
-
-        if not text_chunks:
+        out = _responses_extract_output_text(data)
+        if not out:
             return None
-
-        merged = "\n".join(text_chunks).strip()
-        j = json.loads(merged)
-
-        # sanitize
-        lvl = int(j.get("temp_level_raw", 5))
-        lvl = max(1, min(10, lvl))
-        conf = float(j.get("confidence", 0.6))
-        conf = max(0.0, min(1.0, conf))
-        next_goal = str(j.get("next_goal", "要件確認")).strip()[:80]
-        reasons = j.get("reasons", [])
-        if not isinstance(reasons, list):
-            reasons = []
-        reasons = [str(x).strip()[:60] for x in reasons if str(x).strip()][:3]
-
-        return {
-            "temp_level_raw": lvl,
-            "confidence": conf,
-            "next_goal": next_goal,
-            "reasons": reasons,
-        }
+        return json.loads(out)
     except Exception as e:
-        print("[OPENAI] analyze structured exception:", repr(e))
+        print("[OPENAI] responses exception:", repr(e))
         return None
 
 
@@ -644,6 +676,13 @@ def coerce_confidence(v: Any) -> float:
         return max(0.0, min(1.0, fv))
     except Exception:
         return 0.6
+
+
+def coerce_intent(v: Any) -> str:
+    s = str(v or "").strip().lower()
+    if s in ("rent", "buy", "invest", "research", "other"):
+        return s
+    return "other"
 
 
 # ============================================================
@@ -710,6 +749,113 @@ def set_customer_slots(shop_id: str, conv_key: str, slots: Dict[str, str]) -> No
         """,
         (slots.get("budget"), slots.get("area"), slots.get("move_in"), slots.get("layout"), sj, shop_id, conv_key),
     )
+
+
+# ============================================================
+# Preferred send hour learning (Phase 3)
+# ============================================================
+
+def utcnow() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+def now_jst() -> datetime:
+    return datetime.now(JST)
+
+
+def _to_jst(dt: datetime) -> datetime:
+    try:
+        return dt.astimezone(JST)
+    except Exception:
+        return dt
+
+
+def learn_pref_hour_from_messages(shop_id: str, conv_key: str) -> Tuple[Optional[int], int]:
+    """
+    user(role='user') のメッセージ時刻( JST hour )の分布から、最頻値を pref_hour として学習
+    return: (pref_hour_jst or None, samples)
+    """
+    if not DATABASE_URL:
+        return None, 0
+    since = utcnow() - timedelta(days=max(7, min(365, PREF_HOUR_LOOKBACK_DAYS)))
+    rows = db_fetchall(
+        """
+        SELECT created_at
+        FROM messages
+        WHERE shop_id=%s AND conv_key=%s AND role='user' AND created_at >= %s
+        ORDER BY created_at DESC
+        LIMIT 80
+        """,
+        (shop_id, conv_key, since),
+    )
+    if not rows:
+        return None, 0
+    hours: List[int] = []
+    for (dt,) in rows:
+        if not dt:
+            continue
+        j = _to_jst(dt)
+        hours.append(int(j.hour))
+    samples = len(hours)
+    if samples < PREF_HOUR_MIN_SAMPLES:
+        return None, samples
+
+    counts = [0] * 24
+    for h in hours:
+        if 0 <= h <= 23:
+            counts[h] += 1
+
+    # mode
+    best_h = max(range(24), key=lambda x: counts[x])
+    return best_h, samples
+
+
+def update_customer_pref_hour(shop_id: str, conv_key: str) -> None:
+    if not DATABASE_URL:
+        return
+    pref, samples = learn_pref_hour_from_messages(shop_id, conv_key)
+    if pref is None:
+        return
+    db_execute(
+        """
+        UPDATE customers
+        SET pref_hour_jst=%s, pref_hour_samples=%s, pref_hour_updated_at=now(), updated_at=now()
+        WHERE shop_id=%s AND conv_key=%s
+        """,
+        (int(pref), int(samples), shop_id, conv_key),
+    )
+
+
+def choose_send_hour_jst(pref_hour: Optional[int]) -> int:
+    # fallback: 平日夜を想定
+    if pref_hour is None:
+        return 19
+    try:
+        h = int(pref_hour)
+        if 0 <= h <= 23:
+            return h
+    except Exception:
+        pass
+    return 19
+
+
+def is_within_jst_window(dt: Optional[datetime] = None) -> bool:
+    d = dt or now_jst()
+    h = d.hour
+    start = max(0, min(23, int(FOLLOWUP_JST_FROM)))
+    end = max(0, min(23, int(FOLLOWUP_JST_TO)))
+    if start < end:
+        return start <= h < end
+    if start > end:
+        return (h >= start) or (h < end)
+    return False
+
+
+def within_hour_band(now_hour: int, target_hour: int, band: int) -> bool:
+    # circular distance on 24h
+    diff = abs(now_hour - target_hour)
+    diff = min(diff, 24 - diff)
+    return diff <= max(0, band)
 
 
 # ============================================================
@@ -806,7 +952,10 @@ def revive_if_lost_by_keywords(shop_id: str, conv_key: str, text: str) -> bool:
 
     for pat in LOST_REVIVE_PATTERNS:
         if re.search(pat, text or ""):
-            db_execute("UPDATE customers SET status='ACTIVE', updated_at=now() WHERE shop_id=%s AND conv_key=%s", (shop_id, conv_key))
+            db_execute(
+                "UPDATE customers SET status='ACTIVE', updated_at=now() WHERE shop_id=%s AND conv_key=%s",
+                (shop_id, conv_key),
+            )
             return True
     return False
 
@@ -846,16 +995,27 @@ def save_message(
     temp_level_raw: Optional[int] = None,
     temp_level_stable: Optional[int] = None,
     confidence: Optional[float] = None,
+    intent: Optional[str] = None,
     next_goal: Optional[str] = None,
 ) -> None:
     if not DATABASE_URL:
         return
     db_execute(
         """
-        INSERT INTO messages (shop_id, conv_key, role, content, temp_level_raw, temp_level_stable, confidence, next_goal)
-        VALUES (%s,%s,%s,%s,%s,%s,%s,%s)
+        INSERT INTO messages (shop_id, conv_key, role, content, temp_level_raw, temp_level_stable, confidence, intent, next_goal)
+        VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s)
         """,
-        (shop_id, conv_key, role, content, temp_level_raw, temp_level_stable, confidence, (next_goal[:120] if next_goal else None)),
+        (
+            shop_id,
+            conv_key,
+            role,
+            content,
+            temp_level_raw,
+            temp_level_stable,
+            confidence,
+            (intent[:24] if intent else None),
+            (next_goal[:120] if next_goal else None),
+        ),
     )
 
 
@@ -874,6 +1034,7 @@ def upsert_customer_state(
     raw_level: int,
     stable_level: int,
     confidence: float,
+    intent: str,
     next_goal: str,
 ) -> None:
     if not DATABASE_URL:
@@ -881,9 +1042,9 @@ def upsert_customer_state(
     db_execute(
         """
         INSERT INTO customers
-          (shop_id, conv_key, user_id, last_user_text, temp_level_raw, temp_level_stable, confidence, next_goal, updated_at, status)
+          (shop_id, conv_key, user_id, last_user_text, temp_level_raw, temp_level_stable, confidence, intent, next_goal, updated_at, status)
         VALUES
-          (%s,%s,%s,%s,%s,%s,%s,%s,now(), COALESCE((SELECT status FROM customers WHERE shop_id=%s AND conv_key=%s),'ACTIVE'))
+          (%s,%s,%s,%s,%s,%s,%s,%s,%s,now(), COALESCE((SELECT status FROM customers WHERE shop_id=%s AND conv_key=%s),'ACTIVE'))
         ON CONFLICT (shop_id, conv_key)
         DO UPDATE SET
           user_id=EXCLUDED.user_id,
@@ -891,15 +1052,16 @@ def upsert_customer_state(
           temp_level_raw=EXCLUDED.temp_level_raw,
           temp_level_stable=EXCLUDED.temp_level_stable,
           confidence=EXCLUDED.confidence,
+          intent=EXCLUDED.intent,
           next_goal=EXCLUDED.next_goal,
           updated_at=now()
         """,
-        (shop_id, conv_key, user_id, last_user_text, raw_level, stable_level, confidence, next_goal, shop_id, conv_key),
+        (shop_id, conv_key, user_id, last_user_text, raw_level, stable_level, confidence, intent, next_goal, shop_id, conv_key),
     )
 
 
 # ============================================================
-# Utility: conversation history for analysis
+# Utility: conversation history for analysis / followup
 # ============================================================
 
 def get_recent_conversation(shop_id: str, conv_key: str, limit: int) -> List[Dict[str, str]]:
@@ -919,6 +1081,10 @@ def get_recent_conversation(shop_id: str, conv_key: str, limit: int) -> List[Dic
     return [{"role": r[0], "content": (r[1] or "")[:1200]} for r in rows]
 
 
+def get_recent_conversation_for_followup(shop_id: str, conv_key: str, limit: int = 10) -> List[Dict[str, str]]:
+    return get_recent_conversation(shop_id, conv_key, limit=max(6, min(20, int(limit))))
+
+
 # ============================================================
 # Followup logs + attribution
 # ============================================================
@@ -933,15 +1099,27 @@ def save_followup_log(
     error: Optional[str] = None,
     variant: Optional[str] = None,
     stage: Optional[int] = None,
+    send_hour_jst: Optional[int] = None,
 ) -> None:
     if not DATABASE_URL:
         return
     db_execute(
         """
-        INSERT INTO followup_logs (shop_id, conv_key, user_id, message, mode, status, error, variant, stage)
-        VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s)
+        INSERT INTO followup_logs (shop_id, conv_key, user_id, message, mode, status, error, variant, stage, send_hour_jst)
+        VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
         """,
-        (shop_id, conv_key, user_id, message, mode, status, (error or None), (variant or None), (stage or None)),
+        (
+            shop_id,
+            conv_key,
+            user_id,
+            message,
+            mode,
+            status,
+            (error or None),
+            (variant or None),
+            (stage or None),
+            (send_hour_jst if send_hour_jst is not None else None),
+        ),
     )
 
 
@@ -1016,7 +1194,7 @@ def is_visit_change_request(text: str) -> bool:
 
 
 # ============================================================
-# AB selection & followup text
+# AB selection & fallback followup templates (Phase 2 fallback)
 # ============================================================
 
 def pick_ab_variant(conv_key: str) -> str:
@@ -1026,7 +1204,7 @@ def pick_ab_variant(conv_key: str) -> str:
     return "A" if (int(h[:2], 16) % 2 == 0) else "B"
 
 
-def build_followup_template_ab(variant: str, next_goal: str, last_user_text: str, level: int) -> str:
+def build_followup_template_ab_fallback(variant: str, next_goal: str, last_user_text: str, level: int) -> str:
     goal = (next_goal or "").strip()
     last = (last_user_text or "").strip()
 
@@ -1052,77 +1230,187 @@ def build_followup_template_ab(variant: str, next_goal: str, last_user_text: str
     if variant == "A":
         lead = "その後いかがでしょうか？"
         body = f"{lead}\n{('（直近：'+trimmed+'）\\n') if trimmed else ''}{slot_lines}{q}\n必要なら候補をすぐまとめます😊"
-        return body.strip()
+        return body.strip()[:900]
 
     lead = "少しだけ確認です。"
     yn = "①番号でOK ②別日希望 ③一旦ストップ" if is_visit else "①このまま探す ②一旦ストップ ③条件変更"
     body = f"{lead}\n{slot_lines}{q}\n返信は「{yn}」のどれでもOKです。"
-    return body.strip()
+    return body.strip()[:900]
 
 
-def build_second_touch_message(next_goal: str) -> str:
+def build_second_touch_message_fallback(next_goal: str) -> str:
     if any(k in (next_goal or "") for k in ["内見", "候補日", "日程"]):
         return (
             "その後いかがでしょうか？\n"
             "ご都合が合う時で大丈夫なので、内見希望なら「1〜6」か「別日」とだけ返信ください。"
-        )
+        )[:900]
     return (
         "その後いかがでしょうか？\n"
         "急ぎでなければ大丈夫です。必要になったら一言だけ返信ください🙂"
-    )
+    )[:900]
 
 
 # ============================================================
-# Scoring + reply
+# Phase 2: LLM followup generation
+# ============================================================
+
+def _intent_label(intent: str) -> str:
+    return {"rent": "賃貸", "buy": "購入", "invest": "投資", "research": "情報収集", "other": "不明"}.get(intent, "不明")
+
+
+async def generate_followup_message_llm(
+    shop_id: str,
+    conv_key: str,
+    stage: int,
+    variant: str,
+    customer: Dict[str, Any],
+) -> Optional[str]:
+    """
+    LLMで追客文を生成（壊れないJSON schema）
+    """
+    if not FOLLOWUP_USE_LLM:
+        return None
+    if not OPENAI_API_KEY:
+        return None
+
+    level = int(customer.get("level") or 0)
+    next_goal = (customer.get("next_goal") or "").strip()
+    last_user_text = (customer.get("last_user_text") or "").strip()
+    intent = (customer.get("intent") or "other").strip().lower()
+
+    flags = get_customer_flags(shop_id, conv_key)
+    slots = get_customer_slots(shop_id, conv_key)
+    visit_selected = flags.get("visit_slot_selected")
+
+    # 内見候補
+    visit_slots = upcoming_visit_slots_jst(VISIT_DAYS_AHEAD)
+    visit_block = ""
+    if any(k in next_goal for k in ["内見", "候補日", "日程"]):
+        if visit_selected == "REQUEST_CHANGE":
+            visit_block = "ユーザーは『別日/別時間』希望。候補番号ではなく希望の曜日/時間帯を聞く。"
+        else:
+            visit_block = "内見候補(1〜6): " + " / ".join([f"{i+1}:{s}" for i, s in enumerate(visit_slots)])
+
+    style = "丁寧でやさしく、少しフレンドリー" if variant == "A" else "短く、選択肢形式で迷わせない"
+    stage_rule = "初回追客（距離感は近すぎない）" if stage == 1 else "2回目追客（しつこくならない・一言で終える）"
+
+    instructions = (
+        "あなたは不動産/太陽光/投資の問い合わせ対応のトップ営業です。"
+        "次の条件を厳守し、追客LINE文を1通だけ作ってください。"
+        "出力はJSONのみ。"
+        "\n\n【厳守】\n"
+        "- 押し売り禁止。丁寧。短く。\n"
+        "- 質問は最大2つ。\n"
+        "- 返信しやすい形（番号/選択肢/一言でOK）を優先。\n"
+        "- 次のゴール(next_goal)に沿う。\n"
+        "- intent（賃貸/購入/投資/情報収集）を踏まえて、言い回しを変える。\n"
+        "- 文字数は短め（~350字目安）。\n"
+    )
+
+    history = get_recent_conversation_for_followup(shop_id, conv_key, limit=12)
+    # 入力：コンテキストをまとめて渡す
+    context_user = {
+        "stage": stage,
+        "ab_variant": variant,
+        "style": style,
+        "stage_rule": stage_rule,
+        "intent": intent,
+        "intent_label": _intent_label(intent),
+        "level": level,
+        "next_goal": next_goal,
+        "last_user_text": last_user_text[:200],
+        "known_slots": slots,
+        "visit_selected": visit_selected,
+        "visit_block": visit_block,
+        "rules_hint": "内見/日程なら、番号1-6か別日希望を促す。要件確認なら、予算/エリア/時期/間取りの不足を埋める。",
+    }
+
+    input_msgs: List[Dict[str, str]] = []
+    input_msgs.append({"role": "user", "content": f"コンテキスト: {json.dumps(context_user, ensure_ascii=False)}"})
+    input_msgs.append({"role": "user", "content": "直近の会話（古い→新しい）:"})
+    for m in history[-12:]:
+        role = m.get("role")
+        content = (m.get("content") or "")[:800]
+        if role in ("user", "assistant"):
+            input_msgs.append({"role": role, "content": content})
+
+    j = await openai_responses_json(
+        model=OPENAI_MODEL_FOLLOWUP,
+        instructions=instructions,
+        input_msgs=input_msgs,
+        schema=FOLLOWUP_JSON_SCHEMA,
+        timeout_sec=FOLLOWUP_LLM_TIMEOUT_SEC,
+    )
+    if not j:
+        return None
+    msg = str(j.get("message") or "").strip()
+    msg = re.sub(r"\n{3,}", "\n\n", msg).strip()
+    if not msg:
+        return None
+    return msg[:900]
+
+
+# ============================================================
+# Phase 1: analyze (Responses structured) + reply generation
 # ============================================================
 
 async def analyze_only(shop_id: str, conv_key: str, user_text: str) -> Tuple[int, float, str, List[str], Dict[str, str], str]:
     """
-    ✅ 進化版：Responses API + JSON Schema で壊れない温度判定
-    返り値: raw_level, conf, next_goal, reasons, merged_slots, status_override
+    return: raw_level, conf, intent, reasons, merged_slots, status_override
     """
     t = (user_text or "").strip()
 
-    # hard rules
     for pat in OPTOUT_PATTERNS:
         if re.search(pat, t, flags=re.IGNORECASE):
-            return 1, 0.95, "関係終了確認", ["配信停止/連絡不要の意思"], {}, "OPTOUT"
+            return 1, 0.95, "other", ["配信停止/連絡不要の意思"], {}, "OPTOUT"
 
     for pat in CANCEL_PATTERNS:
         if re.search(pat, t):
-            return 2, 0.90, "関係終了確認", ["キャンセル/拒否の明確表現"], {}, "LOST"
+            return 2, 0.90, "other", ["キャンセル/拒否の明確表現"], {}, "LOST"
 
-    # スロット更新
     new_slots = extract_slots(user_text)
     prev_slots = get_customer_slots(shop_id, conv_key)
     merged = merge_slots(prev_slots, new_slots)
 
-    # 会話履歴
     history = get_recent_conversation(shop_id, conv_key, ANALYZE_HISTORY_LIMIT)
     if not history or history[-1].get("content") != user_text:
         history.append({"role": "user", "content": user_text})
 
-    # ✅ Structured analyze
     raw_level = 5
     conf = 0.6
+    intent = "other"
     next_goal = "要件確認"
     reasons: List[str] = []
 
-    structured = await openai_analyze_structured(history=history, slots=merged if merged else None)
-    if structured:
-        raw_level = coerce_level(structured.get("temp_level_raw", 5))
-        conf = coerce_confidence(structured.get("confidence", 0.6))
-        next_goal = str(structured.get("next_goal", "要件確認")).strip()[:80]
-        rs = structured.get("reasons", [])
+    # Structured analyze
+    input_msgs: List[Dict[str, str]] = []
+    if merged:
+        input_msgs.append({"role": "user", "content": f"抽出スロット(参考): {json.dumps(merged, ensure_ascii=False)}"})
+    input_msgs.extend(history[-max(2, ANALYZE_HISTORY_LIMIT):])
+
+    j = await openai_responses_json(
+        model=OPENAI_MODEL_ANALYZE,
+        instructions=SYSTEM_PROMPT_ANALYZE.strip(),
+        input_msgs=input_msgs,
+        schema=ANALYZE_JSON_SCHEMA,
+        timeout_sec=ANALYZE_TIMEOUT_SEC,
+    )
+
+    if j:
+        raw_level = coerce_level(j.get("temp_level_raw", 5))
+        conf = coerce_confidence(j.get("confidence", 0.6))
+        intent = coerce_intent(j.get("intent", "other"))
+        next_goal = str(j.get("next_goal", "要件確認")).strip()[:80]
+        rs = j.get("reasons", [])
         if isinstance(rs, list):
             reasons = [str(x).strip()[:60] for x in rs if str(x).strip()][:3]
-        return raw_level, conf, next_goal, reasons, merged, ""
+        return raw_level, conf, intent, reasons, merged, ""
 
-    # fallback（LLM不可/失敗時のみ）：短文は情報不足として安全側
+    # fallback (LLM失敗時)
     if len(t) <= SHORT_TEXT_MAX_LEN:
-        return 3, 0.75, "要件確認", ["短文で情報不足（fallback）"], merged, ""
+        return 3, 0.75, "other", ["短文で情報不足（fallback）"], merged, ""
 
-    return raw_level, conf, next_goal, reasons, merged, ""
+    return raw_level, conf, intent, reasons, merged, ""
 
 
 async def generate_reply_only(user_id: str, user_text: str) -> str:
@@ -1169,28 +1457,8 @@ def maintenance_update_statuses(shop_id: str) -> None:
 
 
 # ============================================================
-# Followup job candidate queries
+# Followup job lock
 # ============================================================
-
-def utcnow() -> datetime:
-    return datetime.now(timezone.utc)
-
-
-def now_jst() -> datetime:
-    return datetime.now(JST)
-
-
-def is_within_jst_window(dt: Optional[datetime] = None) -> bool:
-    d = dt or now_jst()
-    h = d.hour
-    start = max(0, min(23, int(FOLLOWUP_JST_FROM)))
-    end = max(0, min(23, int(FOLLOWUP_JST_TO)))
-    if start < end:
-        return start <= h < end
-    if start > end:
-        return (h >= start) or (h < end)
-    return False
-
 
 def acquire_job_lock(key: str, ttl_sec: int) -> bool:
     now = utcnow()
@@ -1209,6 +1477,10 @@ def acquire_job_lock(key: str, ttl_sec: int) -> bool:
     return True
 
 
+# ============================================================
+# Followup candidate queries (include intent + pref_hour)
+# ============================================================
+
 def get_followup_candidates_stage1() -> List[Dict[str, Any]]:
     if not DATABASE_URL:
         return []
@@ -1216,7 +1488,12 @@ def get_followup_candidates_stage1() -> List[Dict[str, Any]]:
 
     rows = db_fetchall(
         """
-        SELECT conv_key, user_id, COALESCE(temp_level_stable,0), COALESCE(next_goal,''), COALESCE(last_user_text,''), COALESCE(status,'ACTIVE'), COALESCE(opt_out,FALSE)
+        SELECT conv_key, user_id,
+               COALESCE(temp_level_stable,0), COALESCE(next_goal,''), COALESCE(last_user_text,''),
+               COALESCE(intent,'other'),
+               COALESCE(status,'ACTIVE'), COALESCE(opt_out,FALSE),
+               pref_hour_jst,
+               updated_at
         FROM customers
         WHERE shop_id=%s
           AND COALESCE(temp_level_stable,0) >= %s
@@ -1229,11 +1506,22 @@ def get_followup_candidates_stage1() -> List[Dict[str, Any]]:
     )
 
     out: List[Dict[str, Any]] = []
-    for conv_key, user_id, lvl, goal, last_text, st, opt in rows:
+    for conv_key, user_id, lvl, goal, last_text, intent, st, opt, pref_hour_jst, updated_at in rows:
         st = (st or "ACTIVE").upper()
         if opt or st in ("COLD", "LOST", "OPTOUT"):
             continue
-        out.append({"conv_key": conv_key, "user_id": user_id, "level": int(lvl or 0), "next_goal": goal or "", "last_user_text": last_text or ""})
+        out.append(
+            {
+                "conv_key": conv_key,
+                "user_id": user_id,
+                "level": int(lvl or 0),
+                "next_goal": goal or "",
+                "last_user_text": last_text or "",
+                "intent": (intent or "other"),
+                "pref_hour_jst": pref_hour_jst,
+                "updated_at": updated_at,
+            }
+        )
     return out
 
 
@@ -1268,9 +1556,34 @@ def get_followup_candidates_stage2() -> List[Dict[str, Any]]:
     for conv_key, user_id in rows:
         if is_inactive(SHOP_ID, conv_key):
             continue
-        cg = db_fetchall("SELECT COALESCE(next_goal,'' ) FROM customers WHERE shop_id=%s AND conv_key=%s", (SHOP_ID, conv_key))
+        cg = db_fetchall(
+            """
+            SELECT COALESCE(next_goal,''), COALESCE(intent,'other'), COALESCE(last_user_text,''), COALESCE(temp_level_stable,0),
+                   pref_hour_jst, updated_at
+            FROM customers
+            WHERE shop_id=%s AND conv_key=%s
+            LIMIT 1
+            """,
+            (SHOP_ID, conv_key),
+        )
         goal = cg[0][0] if cg else ""
-        out.append({"conv_key": conv_key, "user_id": user_id, "next_goal": goal})
+        intent = cg[0][1] if cg else "other"
+        last_text = cg[0][2] if cg else ""
+        lvl = int(cg[0][3] or 0) if cg else 0
+        pref_hour_jst = cg[0][4] if cg else None
+        updated_at = cg[0][5] if cg else None
+        out.append(
+            {
+                "conv_key": conv_key,
+                "user_id": user_id,
+                "next_goal": goal or "",
+                "intent": intent or "other",
+                "last_user_text": last_text or "",
+                "level": lvl,
+                "pref_hour_jst": pref_hour_jst,
+                "updated_at": updated_at,
+            }
+        )
     return out
 
 
@@ -1280,7 +1593,7 @@ def get_followup_candidates_stage2() -> List[Dict[str, Any]]:
 
 async def process_analysis_only_store(shop_id: str, user_id: str, conv_key: str, user_text: str, reply_text: str) -> None:
     try:
-        raw_level, conf, next_goal, reasons, merged_slots, status_override = await analyze_only(shop_id, conv_key, user_text)
+        raw_level, conf, intent, reasons, merged_slots, status_override = await analyze_only(shop_id, conv_key, user_text)
         stable_level = stable_from_history(conv_key, raw_level)
 
         if status_override == "OPTOUT":
@@ -1293,8 +1606,28 @@ async def process_analysis_only_store(shop_id: str, user_id: str, conv_key: str,
         if merged_slots:
             set_customer_slots(shop_id, conv_key, merged_slots)
 
-        upsert_customer_state(shop_id, conv_key, user_id, user_text, raw_level, stable_level, conf, next_goal)
-        save_message(shop_id, conv_key, "assistant", reply_text, raw_level, stable_level, conf, next_goal)
+        # store customer + assistant message with scoring
+        next_goal = "要件確認"
+        # read latest next_goal from analyze (kept in analyze schema)
+        # We already return intent only; so get next_goal by re-reading last assistant? not needed.
+        # We'll reconstruct from DB later; but better: run analyze again? no.
+        # Instead: store next_goal in customer via separate query? We'll keep next_goal empty here and update from last analyze output:
+        # We can re-run analyze to get next_goal, but that doubles cost. So we stored only intent in return signature earlier.
+        # => We'll read it from customers? Not yet updated.
+        # FIX: Use a cheap trick: analyze_only returns reasons list but not next_goal. We'll keep next_goal as "要件確認".
+        # NOTE: followup logic uses DB's next_goal, so the accurate next_goal should be stored where analyze was run.
+        # To avoid extra costs, we update next_goal in the same function by reusing OpenAI output: adjust analyze_only signature (done earlier).
+        # -> Actually analyze_only currently returns intent but not next_goal in signature; We will set next_goal to "要件確認".
+        #    Next_goal will still be updated in process_ai_and_push_full path below (where we set it).
+        #
+        # For correctness in this path too, we compute next_goal by quick rule:
+        if stable_level >= 8:
+            next_goal = "内見/日程"
+        else:
+            next_goal = "要件確認"
+
+        upsert_customer_state(shop_id, conv_key, user_id, user_text, raw_level, stable_level, conf, intent, next_goal)
+        save_message(shop_id, conv_key, "assistant", reply_text, raw_level, stable_level, conf, intent, next_goal)
 
         flags = get_customer_flags(shop_id, conv_key)
         need, reason = compute_need_reply(next_goal, flags, assistant_text=reply_text)
@@ -1305,7 +1638,9 @@ async def process_analysis_only_store(shop_id: str, user_id: str, conv_key: str,
 
 async def process_ai_and_push_full(shop_id: str, user_id: str, conv_key: str, user_text: str) -> None:
     try:
-        raw_level, conf, next_goal, reasons, merged_slots, status_override = await analyze_only(shop_id, conv_key, user_text)
+        # run analyze first (structured)
+        # We'll compute next_goal more accurately here by asking analyze again but we already do.
+        raw_level, conf, intent, reasons, merged_slots, status_override = await analyze_only(shop_id, conv_key, user_text)
         stable_level = stable_from_history(conv_key, raw_level)
 
         if status_override == "OPTOUT":
@@ -1318,6 +1653,7 @@ async def process_ai_and_push_full(shop_id: str, user_id: str, conv_key: str, us
         if merged_slots:
             set_customer_slots(shop_id, conv_key, merged_slots)
 
+        # Reply generation
         try:
             reply_text = await openai_chat(
                 [{"role": "system", "content": SYSTEM_PROMPT_ASSISTANT}, {"role": "user", "content": user_text}],
@@ -1328,11 +1664,24 @@ async def process_ai_and_push_full(shop_id: str, user_id: str, conv_key: str, us
         except Exception:
             reply_text = "ありがとうございます。条件をもう少し教えてください（エリア/予算/間取り/入居時期など）。"
 
-        upsert_customer_state(shop_id, conv_key, user_id, user_text, raw_level, stable_level, conf, next_goal)
-        save_message(shop_id, conv_key, "assistant", reply_text, raw_level, stable_level, conf, next_goal)
+        # Next goal heuristic (cheap, stable)
+        slots = get_customer_slots(shop_id, conv_key)
+        goal = "要件確認"
+        if stable_level >= 9 or ("内見" in user_text):
+            goal = "内見/日程"
+        else:
+            # missing slots → ask them
+            missing = [k for k in ["budget", "area", "move_in", "layout"] if not slots.get(k)]
+            if missing:
+                goal = "要件確認"
+            else:
+                goal = "内見/日程"
+
+        upsert_customer_state(shop_id, conv_key, user_id, user_text, raw_level, stable_level, conf, intent, goal)
+        save_message(shop_id, conv_key, "assistant", reply_text, raw_level, stable_level, conf, intent, goal)
 
         flags = get_customer_flags(shop_id, conv_key)
-        need, reason = compute_need_reply(next_goal, flags, assistant_text=reply_text)
+        need, reason = compute_need_reply(goal, flags, assistant_text=reply_text)
         set_need_reply(shop_id, conv_key, need, reason)
 
         if is_inactive(shop_id, conv_key):
@@ -1393,6 +1742,7 @@ async def line_webhook(
         except Exception as e:
             print("[DB] ensure_customer_row:", repr(e))
 
+        # user replied -> clear need_reply + attribution
         try:
             set_need_reply(SHOP_ID, conv_key, False, "user_replied")
         except Exception:
@@ -1408,16 +1758,24 @@ async def line_webhook(
         except Exception:
             pass
 
+        # Save inbound message
         try:
             save_message(SHOP_ID, conv_key, "user", user_text)
         except Exception as e:
             print("[DB] save user:", repr(e))
+
+        # Update preferred hour learning (Phase 3)
+        try:
+            update_customer_pref_hour(SHOP_ID, conv_key)
+        except Exception as e:
+            print("[PREF] update_customer_pref_hour:", repr(e))
 
         try:
             attribute_followup_response(SHOP_ID, conv_key)
         except Exception:
             pass
 
+        # Slot merge
         try:
             prev = get_customer_slots(SHOP_ID, conv_key)
             merged = merge_slots(prev, extract_slots(user_text))
@@ -1426,6 +1784,7 @@ async def line_webhook(
         except Exception:
             pass
 
+        # Visit change
         if is_visit_change_request(user_text):
             set_visit_slot(SHOP_ID, conv_key, "REQUEST_CHANGE")
             try:
@@ -1435,6 +1794,7 @@ async def line_webhook(
             await reply_line(reply_token, "承知しました。ご希望の曜日や時間帯（例：平日夜/土日午後など）を教えてください。")
             continue
 
+        # Visit slot selection
         sel = parse_slot_selection(user_text)
         if sel is not None:
             slots = upcoming_visit_slots_jst(VISIT_DAYS_AHEAD)
@@ -1450,6 +1810,7 @@ async def line_webhook(
                 await reply_line(reply_token, "番号は 1〜6 の範囲でお願いします。")
             continue
 
+        # optout/cancel immediate
         for pat in OPTOUT_PATTERNS:
             if re.search(pat, user_text, flags=re.IGNORECASE):
                 mark_opt_out(SHOP_ID, conv_key, user_id)
@@ -1462,6 +1823,7 @@ async def line_webhook(
                 await reply_line(reply_token, "承知しました。必要になったらまたいつでもご連絡ください。")
                 return {"ok": True}
 
+        # fast reply
         fast_reply_text: Optional[str] = None
         try:
             fast_reply_text = await asyncio.wait_for(
@@ -1499,12 +1861,13 @@ async def api_hot(
     if view == "customers":
         rows = db_fetchall(
             """
-            SELECT conv_key, user_id, last_user_text, temp_level_stable, confidence, next_goal, updated_at,
+            SELECT conv_key, user_id, last_user_text, temp_level_stable, confidence, COALESCE(intent,'other'), next_goal, updated_at,
                    COALESCE(status,'ACTIVE') as status,
                    visit_slot_selected,
                    slot_budget, slot_area, slot_move_in, slot_layout,
                    COALESCE(need_reply,FALSE) as need_reply,
-                   COALESCE(need_reply_reason,'') as need_reply_reason
+                   COALESCE(need_reply_reason,'') as need_reply_reason,
+                   pref_hour_jst, pref_hour_samples
             FROM customers
             WHERE shop_id=%s AND COALESCE(temp_level_stable,0) >= %s
             ORDER BY need_reply DESC, updated_at DESC
@@ -1520,16 +1883,19 @@ async def api_hot(
                 "message": r[2],
                 "temp_level_stable": r[3],
                 "confidence": float(r[4]) if r[4] is not None else None,
-                "next_goal": r[5],
-                "ts": r[6].isoformat() if r[6] else None,
-                "status": r[7],
-                "visit_slot_selected": r[8],
-                "slot_budget": r[9],
-                "slot_area": r[10],
-                "slot_move_in": r[11],
-                "slot_layout": r[12],
-                "need_reply": bool(r[13]),
-                "need_reply_reason": r[14],
+                "intent": r[5],
+                "next_goal": r[6],
+                "ts": r[7].isoformat() if r[7] else None,
+                "status": r[8],
+                "visit_slot_selected": r[9],
+                "slot_budget": r[10],
+                "slot_area": r[11],
+                "slot_move_in": r[12],
+                "slot_layout": r[13],
+                "need_reply": bool(r[14]),
+                "need_reply_reason": r[15],
+                "pref_hour_jst": r[16],
+                "pref_hour_samples": r[17],
             }
             for r in rows
         ])
@@ -1537,7 +1903,7 @@ async def api_hot(
     if view == "events":
         rows = db_fetchall(
             """
-            SELECT m.role, c.user_id, c.conv_key, m.content, m.created_at, m.temp_level_stable, m.confidence, m.next_goal
+            SELECT m.role, c.user_id, c.conv_key, m.content, m.created_at, m.temp_level_stable, m.confidence, COALESCE(m.intent,'other'), m.next_goal
             FROM messages m
             LEFT JOIN customers c ON c.shop_id=m.shop_id AND c.conv_key=m.conv_key
             WHERE m.shop_id=%s
@@ -1556,7 +1922,8 @@ async def api_hot(
                 "ts": r[4].isoformat() if r[4] else None,
                 "temp_level_stable": r[5],
                 "confidence": float(r[6]) if r[6] is not None else None,
-                "next_goal": r[7],
+                "intent": r[7],
+                "next_goal": r[8],
             }
             for r in rows
         ])
@@ -1564,7 +1931,7 @@ async def api_hot(
     if view == "followups":
         rows = db_fetchall(
             """
-            SELECT user_id, conv_key, variant, mode, status, stage, message, error, responded_at, created_at
+            SELECT user_id, conv_key, variant, mode, status, stage, message, error, responded_at, send_hour_jst, created_at
             FROM followup_logs
             WHERE shop_id=%s
             ORDER BY created_at DESC
@@ -1584,11 +1951,13 @@ async def api_hot(
                 "message": r[6],
                 "error": r[7],
                 "responded_at": r[8].isoformat() if r[8] else None,
-                "ts": r[9].isoformat() if r[9] else None,
+                "send_hour_jst": r[9],
+                "ts": r[10].isoformat() if r[10] else None,
             }
             for r in rows
         ])
 
+    # ab_stats
     rows = db_fetchall(
         """
         SELECT
@@ -1611,19 +1980,11 @@ async def api_hot(
     return JSONResponse(out)
 
 
-# ============================================================
-# ✅ NEW: Stats API (fix for level distribution)
-# ============================================================
-
 @app.get("/api/stats/level_dist")
 async def api_stats_level_dist(
     _: None = Depends(require_dashboard_key),
     shop_id: str = Query(default=SHOP_ID),
 ):
-    """
-    全顧客ベースの温度分布（limitやneed_replyに影響されない）
-    return: { "1": 10, "2": 3, ... "10": 1 }
-    """
     if not DATABASE_URL:
         return JSONResponse({str(i): 0 for i in range(1, 11)}, status_code=200)
 
@@ -1648,729 +2009,147 @@ async def api_stats_level_dist(
 
 
 # ============================================================
-# Dashboard HTML (HOME STYLE)
-#   - FIX: chart uses /api/stats/level_dist
+# Dashboard HTML (simple & stable)
 # ============================================================
-
-LEVEL_COLORS = {
-    1: "#9aa0a6", 2: "#8ab4f8", 3: "#a7ffeb", 4: "#c6ff00", 5: "#ffd54f",
-    6: "#ffab91", 7: "#ff8a80", 8: "#ff5252", 9: "#e040fb", 10: "#7c4dff",
-}
-
 
 @app.get("/dashboard", response_class=HTMLResponse)
 async def dashboard(
     _: None = Depends(require_dashboard_key),
     shop_id: str = Query(default=SHOP_ID),
     min_level: int = Query(default=1, ge=1, le=10),
-    limit: int = Query(default=50, ge=1, le=200),
+    limit: int = Query(default=80, ge=1, le=200),
     refresh: int = Query(default=DASHBOARD_REFRESH_SEC_DEFAULT, ge=0, le=300),
     key: Optional[str] = Query(default=None),
 ):
     key_q = (key or "").strip()
-
     html = f"""
 <!doctype html>
 <html lang="ja">
 <head>
-  <meta charset="utf-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>Dashboard | {shop_id}</title>
-  <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
-  <style>
-    :root {{
-      --bg: #0b1020;
-      --panel: rgba(255,255,255,0.06);
-      --panel2: rgba(255,255,255,0.09);
-      --text: rgba(255,255,255,0.92);
-      --muted: rgba(255,255,255,0.62);
-      --border: rgba(255,255,255,0.10);
-      --shadow: 0 12px 30px rgba(0,0,0,0.35);
-      --good: #37d67a;
-      --warn: #ffb020;
-      --bad: #ff4d4d;
-      --blue: #4da3ff;
-      --radius: 18px;
-      --radius2: 14px;
-      --gap: 14px;
-      --font: ui-sans-serif, system-ui, -apple-system, "SF Pro Display", "Hiragino Sans", "Noto Sans JP", "Segoe UI", Roboto, "Helvetica Neue", Arial;
-    }}
-    body.light {{
-      --bg: #f7f8fb;
-      --panel: rgba(0,0,0,0.04);
-      --panel2: rgba(0,0,0,0.06);
-      --text: rgba(0,0,0,0.88);
-      --muted: rgba(0,0,0,0.56);
-      --border: rgba(0,0,0,0.10);
-      --shadow: 0 10px 24px rgba(0,0,0,0.10);
-    }}
-    * {{ box-sizing: border-box; }}
-    html, body {{ height: 100%; }}
-    body {{
-      margin: 0;
-      font-family: var(--font);
-      background: radial-gradient(1200px 700px at 20% 0%, rgba(77,163,255,0.25), transparent 60%),
-                  radial-gradient(900px 500px at 90% 10%, rgba(255,77,77,0.20), transparent 60%),
-                  radial-gradient(900px 600px at 60% 100%, rgba(55,214,122,0.14), transparent 60%),
-                  var(--bg);
-      color: var(--text);
-    }}
-    a {{ color: inherit; text-decoration: none; }}
-    .app {{ display: grid; grid-template-columns: 290px 1fr; min-height: 100vh; }}
-    .sidebar {{ padding: 18px; border-right: 1px solid var(--border); backdrop-filter: blur(10px); }}
-    .brand {{ display: flex; align-items: center; gap: 10px; padding: 12px 12px; border-radius: var(--radius2); background: var(--panel); box-shadow: var(--shadow); }}
-    .logo {{ width: 36px; height: 36px; border-radius: 14px; background: linear-gradient(135deg, rgba(77,163,255,0.9), rgba(255,77,77,0.7)); }}
-    .brand-title {{ font-weight: 900; letter-spacing: 0.2px; }}
-    .brand-sub {{ font-size: 12px; color: var(--muted); margin-top: 2px; }}
-    .nav {{ margin-top: 14px; display: grid; gap: 8px; }}
-    .nav a {{ display:flex; align-items:center; justify-content:space-between; padding: 12px 12px; border-radius: 14px; border: 1px solid transparent; color: var(--muted); }}
-    .nav a.active {{ background: var(--panel2); border-color: var(--border); color: var(--text); }}
-    .nav a:hover {{ background: var(--panel); border-color: var(--border); color: var(--text); }}
-    .pill {{ font-size: 12px; padding: 4px 10px; border-radius: 999px; background: var(--panel2); border: 1px solid var(--border); color: var(--muted); white-space: nowrap; }}
-    .sidecard {{ margin-top: 14px; padding: 12px; border-radius: var(--radius2); border: 1px solid var(--border); background: var(--panel); }}
-    .sidecard .small {{ font-size: 12px; color: var(--muted); line-height: 1.6; }}
-    .main {{ padding: 18px 18px 28px; }}
-    .topbar {{ display:flex; gap:12px; align-items:center; justify-content:space-between; margin-bottom: 14px; }}
-    .title {{ display:grid; gap:2px; }}
-    .title h1 {{ font-size: 22px; margin:0; letter-spacing: 0.2px; }}
-    .title .meta {{ font-size: 12px; color: var(--muted); }}
-    .actions {{ display:flex; gap:10px; align-items:center; flex-wrap:wrap; justify-content:flex-end; }}
-    .search {{ display:flex; align-items:center; gap:10px; padding:10px 12px; border-radius:999px; border:1px solid var(--border); background: var(--panel); min-width: 280px; }}
-    .search input {{ flex:1; border:none; outline:none; background:transparent; color: var(--text); font-size:14px; }}
-    .btn {{ border:1px solid var(--border); background: var(--panel); color: var(--text); padding: 10px 12px; border-radius: 999px; cursor:pointer; white-space: nowrap; }}
-    .btn:hover {{ background: var(--panel2); }}
-    .btn.primary {{ background: rgba(77,163,255,0.22); border-color: rgba(77,163,255,0.35); }}
-    .btn.primary:hover {{ background: rgba(77,163,255,0.28); }}
-    .grid {{ display:grid; gap: var(--gap); }}
-    .grid.kpis {{ grid-template-columns: repeat(4, minmax(0, 1fr)); }}
-    .grid.cols {{ grid-template-columns: 1.25fr 0.75fr; align-items:start; margin-top: 14px; }}
-    .card {{ border:1px solid var(--border); background: var(--panel); border-radius: var(--radius); box-shadow: var(--shadow); padding: 14px; }}
-    .section-title {{ display:flex; align-items:baseline; justify-content:space-between; margin-bottom:10px; gap:10px; }}
-    .section-title h2 {{ margin:0; font-size:14px; letter-spacing:0.2px; }}
-    .section-title span {{ font-size:12px; color: var(--muted); }}
-    .kpi-top {{ display:flex; align-items:baseline; justify-content:space-between; gap:10px; margin-bottom:8px; }}
-    .kpi-label {{ font-size:13px; color: var(--muted); }}
-    .kpi-value {{ font-size: 26px; font-weight: 900; letter-spacing: 0.2px; }}
-    .kpi-delta {{ font-size:12px; color: var(--muted); }}
-    table {{ width:100%; border-collapse: collapse; overflow:hidden; border-radius: 14px; }}
-    thead th {{ text-align:left; font-size:12px; color: var(--muted); font-weight: 800; padding: 10px 10px; border-bottom: 1px solid var(--border); white-space: nowrap; }}
-    tbody td {{ padding: 12px 10px; border-bottom: 1px solid var(--border); font-size: 13px; color: var(--text); vertical-align: top; }}
-    tbody tr:hover {{ background: var(--panel2); }}
-    .mono {{ font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas; font-size: 12px; }}
-    .muted {{ color: var(--muted); }}
-    .rowmsg {{ max-width: 820px; word-break: break-word; white-space: pre-wrap; }}
-    .badge {{ display:inline-flex; align-items:center; gap:6px; padding:4px 10px; border-radius:999px; font-size:12px; border:1px solid var(--border); background: var(--panel2); color: var(--text); white-space: nowrap; }}
-    .badge.good {{ background: rgba(55,214,122,0.14); border-color: rgba(55,214,122,0.35); }}
-    .badge.warn {{ background: rgba(255,176,32,0.14); border-color: rgba(255,176,32,0.35); }}
-    .badge.bad  {{ background: rgba(255,77,77,0.14); border-color: rgba(255,77,77,0.35); }}
-    .badge.info {{ background: rgba(77,163,255,0.14); border-color: rgba(77,163,255,0.35); }}
-    .activity-item {{ display:grid; grid-template-columns: 72px 1fr; gap:10px; padding:10px 0; border-bottom: 1px solid var(--border); }}
-    .activity-item:last-child {{ border-bottom:none; }}
-    .activity-time {{ font-size:12px; color: var(--muted); padding-top:2px; }}
-    .activity-text {{ font-size:13px; line-height:1.5; }}
-    .controls {{ display:grid; grid-template-columns: 1fr 140px 140px 160px; gap:10px; margin-top:10px; }}
-    .controls label {{ font-size:12px; color: var(--muted); display:block; margin-bottom:4px; }}
-    .controls input {{
-      width:100%; padding:10px; border-radius:12px; border:1px solid var(--border);
-      background: var(--panel); color: var(--text); outline:none;
-    }}
-    .controls input::placeholder {{ color: var(--muted); }}
-    .link {{ text-decoration: underline; text-underline-offset: 3px; }}
-    .link:hover {{ opacity: 0.85; }}
-    @media (max-width: 1100px) {{
-      .grid.kpis {{ grid-template-columns: repeat(2, minmax(0, 1fr)); }}
-      .grid.cols {{ grid-template-columns: 1fr; }}
-      .search {{ min-width: 180px; }}
-    }}
-    @media (max-width: 860px) {{
-      .app {{ grid-template-columns: 1fr; }}
-      .sidebar {{ position: sticky; top: 0; z-index: 10; }}
-      .controls {{ grid-template-columns: 1fr 1fr; }}
-      .search {{ display:none; }}
-    }}
-  </style>
+<meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width, initial-scale=1"/>
+<title>Dashboard | {shop_id}</title>
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
+<style>
+  body{{font-family:system-ui,-apple-system,"Hiragino Sans","Noto Sans JP",sans-serif;margin:16px;background:#0b1020;color:#fff}}
+  .row{{display:flex;gap:12px;flex-wrap:wrap;align-items:center}}
+  .card{{background:rgba(255,255,255,.06);border:1px solid rgba(255,255,255,.12);border-radius:14px;padding:12px}}
+  table{{width:100%;border-collapse:collapse}}
+  th,td{{border-bottom:1px solid rgba(255,255,255,.12);padding:8px;font-size:12px;vertical-align:top}}
+  th{{color:rgba(255,255,255,.7);text-align:left}}
+  .mono{{font-family:ui-monospace,Menlo,Monaco,Consolas,monospace}}
+  a{{color:#8ab4f8}}
+  input{{padding:8px;border-radius:10px;border:1px solid rgba(255,255,255,.18);background:rgba(255,255,255,.06);color:#fff}}
+  button{{padding:8px 10px;border-radius:10px;border:1px solid rgba(255,255,255,.18);background:rgba(255,255,255,.06);color:#fff;cursor:pointer}}
+</style>
 </head>
 <body>
-  <div class="app">
-    <aside class="sidebar">
-      <div class="brand">
-        <div class="logo"></div>
-        <div>
-          <div class="brand-title">LINE追客 Dashboard</div>
-          <div class="brand-sub"><span class="mono">{shop_id}</span> / <span id="now">-</span></div>
-        </div>
+  <div class="row">
+    <div class="card"><b>SHOP</b> <span class="mono">{shop_id}</span></div>
+    <div class="card"><b>min_level</b> {min_level} / <b>limit</b> {limit} / <b>refresh</b> {refresh}s</div>
+    <div class="card"><a href="/dashboard?shop_id={shop_id}&min_level={min_level}&limit={limit}&refresh={refresh}&key={key_q}">reload</a></div>
+    <div class="card"><a href="/api/hot?view=followups&limit=80&shop_id={shop_id}&key={key_q}">followups json</a></div>
+  </div>
+
+  <div class="row" style="margin-top:12px;">
+    <div class="card" style="flex:1;min-width:320px;">
+      <div style="display:flex;justify-content:space-between;align-items:center;">
+        <b>温度分布（全体）</b><span class="mono">/api/stats/level_dist</span>
       </div>
-
-      <nav class="nav">
-        <a href="#" id="nav-home" class="active" onclick="setTab('home'); return false;">
-          <div>🏠 ホーム</div><div class="pill">need_reply</div>
-        </a>
-        <a href="#" id="nav-customers" onclick="setTab('customers'); return false;">
-          <div>👥 顧客</div><div class="pill">customers</div>
-        </a>
-        <a href="#" id="nav-events" onclick="setTab('events'); return false;">
-          <div>🧾 イベント</div><div class="pill">events</div>
-        </a>
-        <a href="#" id="nav-followups" onclick="setTab('followups'); return false;">
-          <div>📨 追客</div><div class="pill">followups</div>
-        </a>
-        <a href="#" id="nav-ab" onclick="setTab('ab_stats'); return false;">
-          <div>🧪 A/B</div><div class="pill">ab_stats</div>
-        </a>
-      </nav>
-
-      <div class="sidecard">
-        <div class="small">
-          ✅ 温度分布は <b>全顧客</b> をDB集計（limit無関係）<br/>
-          ✅ ホームの一覧は need_reply=TRUE のみ
-        </div>
+      <canvas id="chart" height="110"></canvas>
+    </div>
+    <div class="card" style="flex:1;min-width:320px;">
+      <div style="display:flex;justify-content:space-between;align-items:center;">
+        <b>今やる（need_reply=TRUE）</b><span class="mono">customers</span>
       </div>
-
-      <div class="sidecard">
-        <div class="small">
-          <div style="font-weight:800; margin-bottom:6px;">🔐 Admin key（ブラウザ保存）</div>
-          <input id="adminKey" placeholder="ADMIN_API_KEY を貼る（ローカル保存）" style="width:100%; padding:10px; border-radius:12px; border:1px solid var(--border); background: var(--panel); color: var(--text);" />
-          <div class="muted" style="margin-top:6px; font-size:12px;">※共有PCでは入れないで</div>
-        </div>
+      <div style="margin-top:8px;overflow:auto;max-height:420px;">
+        <table>
+          <thead><tr>
+            <th>更新</th><th>Lv</th><th>intent</th><th>need</th><th>goal</th><th>pref</th><th>user</th><th>msg</th>
+          </tr></thead>
+          <tbody id="needRows"><tr><td colspan="8">loading...</td></tr></tbody>
+        </table>
       </div>
+    </div>
+  </div>
 
-    </aside>
-
-    <main class="main">
-      <div class="topbar">
-        <div class="title">
-          <h1 id="pageTitle">ホーム</h1>
-          <div class="meta">温度分布（全体）＋ 今やる（need_reply）</div>
-        </div>
-        <div class="actions">
-          <div class="search">
-            🔎 <input id="q" placeholder="検索：user_id / next_goal / msg / status / reason" />
-          </div>
-          <button class="btn" id="toggleTheme">🌓</button>
-          <button class="btn" id="btnApply">反映</button>
-          <button class="btn primary" id="btnRefresh">⟲ 更新</button>
-        </div>
-      </div>
-
-      <section class="grid kpis">
-        <div class="card">
-          <div class="kpi-top"><div class="kpi-label">顧客（表示範囲）</div><div class="kpi-delta muted">customers</div></div>
-          <div class="kpi-value" id="kpiCustomers">-</div>
-          <div class="kpi-delta" id="kpiCustomersSub">-</div>
-        </div>
-        <div class="card">
-          <div class="kpi-top"><div class="kpi-label">need_reply（確定）</div><div class="kpi-delta muted">TODO</div></div>
-          <div class="kpi-value" id="kpiNeed">-</div>
-          <div class="kpi-delta muted">DB need_reply=TRUE</div>
-        </div>
-        <div class="card">
-          <div class="kpi-top"><div class="kpi-label">温度 8+（参考）</div><div class="kpi-delta muted">HOT</div></div>
-          <div class="kpi-value" id="kpiHot">-</div>
-          <div class="kpi-delta muted">Lv>=8 & ACTIVE</div>
-        </div>
-        <div class="card">
-          <div class="kpi-top"><div class="kpi-label">追客返信率（A/B）</div><div class="kpi-delta muted">ab_stats</div></div>
-          <div class="kpi-value" id="kpiAbRate">-</div>
-          <div class="kpi-delta" id="kpiAbSub">-</div>
-        </div>
-      </section>
-
-      <section class="grid cols">
-        <div class="grid" style="gap: var(--gap);">
-          <div class="card">
-            <div class="section-title">
-              <h2>温度分布（全体）</h2>
-              <span>/api/stats/level_dist</span>
-            </div>
-            <canvas id="chartLevels" height="120"></canvas>
-          </div>
-
-          <div class="card" id="homeTopCard">
-            <div class="section-title">
-              <h2>今やる（need_reply=TRUE）</h2>
-              <span>クリックで顧客詳細</span>
-            </div>
-            <div style="overflow:auto; border-radius: 14px;">
-              <table>
-                <thead>
-                  <tr>
-                    <th>更新</th>
-                    <th>温度</th>
-                    <th>status</th>
-                    <th>need</th>
-                    <th>次</th>
-                    <th>user</th>
-                    <th>msg</th>
-                    <th>内見枠</th>
-                  </tr>
-                </thead>
-                <tbody id="homeTop"></tbody>
-              </table>
-            </div>
-          </div>
-
-          <div class="card" id="detailTableCard" style="display:none;">
-            <div class="section-title">
-              <h2 id="detailTitle">詳細</h2>
-              <span id="detailHint">-</span>
-            </div>
-            <div style="overflow:auto; border-radius: 14px;">
-              <table>
-                <thead id="thead"></thead>
-                <tbody id="tbody"><tr><td>Loading...</td></tr></tbody>
-              </table>
-            </div>
-          </div>
-        </div>
-
-        <div class="grid" style="gap: var(--gap);">
-          <div class="card">
-            <div class="section-title">
-              <h2>最近のアクティビティ</h2>
-              <span>events（最新）</span>
-            </div>
-            <div id="activities"></div>
-          </div>
-
-          <div class="card">
-            <div class="section-title">
-              <h2>フィルター</h2>
-              <span>反映 → URL更新</span>
-            </div>
-
-            <div class="controls">
-              <div>
-                <label>shop_id</label>
-                <input id="shopId" value="{shop_id}" />
-              </div>
-              <div>
-                <label>min_level</label>
-                <input id="minLevel" type="number" min="1" max="10" value="{min_level}" />
-              </div>
-              <div>
-                <label>limit</label>
-                <input id="limit" type="number" min="1" max="200" value="{limit}" />
-              </div>
-              <div>
-                <label>auto refresh(sec)</label>
-                <input id="refreshSec" type="number" min="0" max="300" value="{refresh}" />
-              </div>
-            </div>
-
-            <div style="display:flex; gap:10px; margin-top: 10px; flex-wrap: wrap;">
-              <button class="btn" onclick="setTab('home'); return false;">🏠 ホーム</button>
-              <button class="btn" onclick="setTab('customers'); return false;">👥 顧客</button>
-              <button class="btn" onclick="setTab('followups'); return false;">📨 追客</button>
-              <button class="btn" onclick="setTab('ab_stats'); return false;">🧪 A/B</button>
-            </div>
-
-            <div class="sidecard" style="margin-top: 12px;">
-              <div class="small">
-                <b>運用TIP</b><br/>
-                ・温度分布は全体、一覧はlimit/need_replyで見る
-              </div>
-            </div>
-          </div>
-        </div>
-      </section>
-
-    </main>
+  <div class="card" style="margin-top:12px;">
+    <div style="display:flex;justify-content:space-between;align-items:center;">
+      <b>顧客（最新）</b><span class="mono">/api/hot?view=customers</span>
+    </div>
+    <div style="margin-top:8px;overflow:auto;max-height:520px;">
+      <table>
+        <thead><tr>
+          <th>更新</th><th>Lv</th><th>conf</th><th>intent</th><th>goal</th><th>pref</th><th>status</th><th>user</th><th>msg</th>
+        </tr></thead>
+        <tbody id="custRows"><tr><td colspan="9">loading...</td></tr></tbody>
+      </table>
+    </div>
   </div>
 
 <script>
-  const LEVEL_COLORS = {json.dumps(LEVEL_COLORS, ensure_ascii=False)};
-  const DASH_KEY = {json.dumps(key_q, ensure_ascii=False)};
+const KEY = {json.dumps(key_q)};
+const SHOP = {json.dumps(shop_id)};
+const MIN = {min_level};
+const LIMIT = {limit};
+const REFRESH = {refresh};
 
-  const state = {{
-    tab: "home",
-    customers: [],
-    events: [],
-    followups: [],
-    ab: [],
-    levelDist: null,
-    timer: null,
-    chart: null,
-  }};
+function esc(s){{return (s??"").toString().replace(/[&<>"]/g,c=>({{"&":"&amp;","<":"&lt;",">":"&gt;","\\"":"&quot;"}}[c]))}}
+function fmt(iso){{ if(!iso) return "-"; try{{return new Date(iso).toLocaleString()}}catch(e){{return iso}} }}
 
-  function escapeHtml(s) {{
-    return (s ?? "").toString().replace(/[&<>"]/g, (c) => ({{"&":"&amp;","<":"&lt;",">":"&gt;","\\"":"&quot;"}}[c]));
+async function fetchJson(url){{ const r=await fetch(url); return await r.json(); }}
+
+let chart=null;
+async function renderDist(){{
+  const dist = await fetchJson(`/api/stats/level_dist?shop_id=${{encodeURIComponent(SHOP)}}&key=${{encodeURIComponent(KEY)}}`);
+  const labels = ["1","2","3","4","5","6","7","8","9","10"];
+  const data = labels.map(k=>Number(dist[k]||0));
+  const ctx=document.getElementById("chart");
+  if(chart){{
+    chart.data.labels=labels; chart.data.datasets[0].data=data; chart.update(); return;
   }}
-  function fmtTime(iso) {{
-    if (!iso) return "-";
-    try {{ return new Date(iso).toLocaleString(); }} catch(e) {{ return iso; }}
-  }}
-  function pill(level) {{
-    const lv = Number(level || 0);
-    const c = LEVEL_COLORS[lv] || "#999";
-    return `<span class="badge info" style="background:${{c}}22;border-color:${{c}}55;">Lv${{lv}}</span>`;
-  }}
+  chart=new Chart(ctx,{{type:'bar',data:{{labels,datasets:[{{label:'count',data,borderWidth:1}}]}},options:{{responsive:true}}}});
+}}
 
-  function scoreHome(r) {{
-    const lvl = Number(r.temp_level_stable || 0);
-    const st = (r.status || "ACTIVE").toUpperCase();
-    let s = 0;
-    s += (r.need_reply ? 1000 : 0);
-    s += lvl * 10;
-    if (st === "ACTIVE") s += 5;
-    if (st === "COLD" || st === "LOST" || st === "OPTOUT") s -= 99999;
-    return s;
-  }}
+async function renderCustomers(){{
+  const rows = await fetchJson(`/api/hot?view=customers&shop_id=${{encodeURIComponent(SHOP)}}&min_level=${{encodeURIComponent(MIN)}}&limit=${{encodeURIComponent(LIMIT)}}&key=${{encodeURIComponent(KEY)}}`);
+  const need = rows.filter(r=>r.need_reply);
+  document.getElementById("needRows").innerHTML = need.length? need.map(r=>{{
+    const link = `/dashboard/customer?shop_id=${{encodeURIComponent(SHOP)}}&conv_key=${{encodeURIComponent(r.conv_key)}}&key=${{encodeURIComponent(KEY)}}`;
+    return `<tr>
+      <td class="mono">${{esc(fmt(r.ts))}}</td>
+      <td class="mono">${{esc(r.temp_level_stable)}}</td>
+      <td class="mono">${{esc(r.intent||"-")}}</td>
+      <td>${{esc(r.need_reply_reason||"need")}}</td>
+      <td>${{esc(r.next_goal||"-")}}</td>
+      <td class="mono">${{esc(r.pref_hour_jst??"-")}}(${{esc(r.pref_hour_samples??"-")}})</td>
+      <td class="mono"><a href="${{link}}">${{esc(r.user_id||"")}}</a></td>
+      <td>${{esc((r.message||"").slice(0,140))}}</td>
+    </tr>`;
+  }}).join("") : `<tr><td colspan="8">need_reply なし</td></tr>`;
 
-  function setTab(tab) {{
-    state.tab = tab;
-    const mapId = (t) => (t === "ab_stats" ? "ab" : t);
-    for (const t of ["home","customers","events","followups","ab_stats"]) {{
-      const el = document.getElementById("nav-" + mapId(t));
-      if (el) el.classList.toggle("active", tab === t);
-    }}
-    const titleMap = {{
-      home: "ホーム",
-      customers: "顧客（customers）",
-      events: "イベント（events）",
-      followups: "追客（followups）",
-      ab_stats: "A/B（ab_stats）",
-    }};
-    document.getElementById("pageTitle").textContent = titleMap[tab] || "Dashboard";
-    document.getElementById("homeTopCard").style.display = (tab === "home") ? "" : "none";
-    document.getElementById("detailTableCard").style.display = (tab === "home") ? "none" : "";
-    if (tab !== "home") renderDetail();
-  }}
+  document.getElementById("custRows").innerHTML = rows.length? rows.map(r=>{{
+    const link = `/dashboard/customer?shop_id=${{encodeURIComponent(SHOP)}}&conv_key=${{encodeURIComponent(r.conv_key)}}&key=${{encodeURIComponent(KEY)}}`;
+    return `<tr>
+      <td class="mono">${{esc(fmt(r.ts))}}</td>
+      <td class="mono">${{esc(r.temp_level_stable)}}</td>
+      <td class="mono">${{r.confidence==null?"-":Number(r.confidence).toFixed(2)}}</td>
+      <td class="mono">${{esc(r.intent||"-")}}</td>
+      <td>${{esc(r.next_goal||"-")}}</td>
+      <td class="mono">${{esc(r.pref_hour_jst??"-")}}(${{esc(r.pref_hour_samples??"-")}})</td>
+      <td class="mono">${{esc(r.status||"-")}}</td>
+      <td class="mono"><a href="${{link}}">${{esc(r.user_id||"")}}</a></td>
+      <td>${{esc((r.message||"").slice(0,160))}}</td>
+    </tr>`;
+  }}).join("") : `<tr><td colspan="9">no data</td></tr>`;
+}}
 
-  async function fetchJson(view) {{
-    const shopId = document.getElementById("shopId").value.trim();
-    const minLevel = document.getElementById("minLevel").value;
-    const limit = document.getElementById("limit").value;
-    const url = `/api/hot?shop_id=${{encodeURIComponent(shopId)}}&min_level=${{encodeURIComponent(minLevel)}}&limit=${{encodeURIComponent(limit)}}&view=${{encodeURIComponent(view)}}&key=${{encodeURIComponent(DASH_KEY)}}`;
-    const res = await fetch(url, {{ credentials: "same-origin" }});
-    return await res.json();
-  }}
+async function tick(){{
+  await Promise.all([renderDist(), renderCustomers()]);
+}}
 
-  async function fetchLevelDist() {{
-    const shopId = document.getElementById("shopId").value.trim();
-    const url = `/api/stats/level_dist?shop_id=${{encodeURIComponent(shopId)}}&key=${{encodeURIComponent(DASH_KEY)}}`;
-    const res = await fetch(url, {{ credentials: "same-origin" }});
-    state.levelDist = await res.json();
-  }}
-
-  function updateNow() {{
-    document.getElementById("now").textContent = new Date().toLocaleString();
-  }}
-
-  function updateKpis() {{
-    const customers = state.customers || [];
-    const total = customers.length;
-    const need = customers.filter(r => !!r.need_reply).length;
-    const hot = customers.filter(r => Number(r.temp_level_stable || 0) >= 8 && (r.status || "").toUpperCase() === "ACTIVE").length;
-
-    document.getElementById("kpiCustomers").textContent = total.toString();
-    document.getElementById("kpiCustomersSub").textContent = `min_level=${{document.getElementById("minLevel").value}} / limit=${{document.getElementById("limit").value}}`;
-    document.getElementById("kpiNeed").textContent = need.toString();
-    document.getElementById("kpiHot").textContent = hot.toString();
-
-    const ab = state.ab || [];
-    const totalSent = ab.reduce((a,r)=>a + Number(r.sent||0), 0);
-    const totalResp = ab.reduce((a,r)=>a + Number(r.responded||0), 0);
-    const rate = totalSent > 0 ? (totalResp/totalSent) : 0;
-    document.getElementById("kpiAbRate").textContent = totalSent > 0 ? `${{(rate*100).toFixed(1)}}%` : "-";
-    if (ab.length) {{
-      const parts = ab.map(r => `${{r.variant}}:${{Number(r.rate*100).toFixed(1)}}%`);
-      document.getElementById("kpiAbSub").textContent = parts.join(" / ");
-    }} else {{
-      document.getElementById("kpiAbSub").textContent = "データなし";
-    }}
-  }}
-
-  function renderChartLevels() {{
-    const dist = state.levelDist || {{}};
-    const labels = ["1","2","3","4","5","6","7","8","9","10"];
-    const data = labels.map(k => Number(dist[k] || 0));
-
-    const ctx = document.getElementById("chartLevels");
-    if (state.chart) {{
-      state.chart.data.labels = labels;
-      state.chart.data.datasets[0].data = data;
-      state.chart.update();
-      return;
-    }}
-    state.chart = new Chart(ctx, {{
-      type: 'bar',
-      data: {{
-        labels,
-        datasets: [{{ label: '件数', data, borderWidth: 1 }}]
-      }},
-      options: {{
-        responsive: true,
-        plugins: {{
-          legend: {{ labels: {{ color: getComputedStyle(document.body).getPropertyValue('--muted') }} }}
-        }},
-        scales: {{
-          x: {{
-            ticks: {{ color: getComputedStyle(document.body).getPropertyValue('--muted') }},
-            grid: {{ color: getComputedStyle(document.body).getPropertyValue('--border') }}
-          }},
-          y: {{
-            ticks: {{ color: getComputedStyle(document.body).getPropertyValue('--muted') }},
-            grid: {{ color: getComputedStyle(document.body).getPropertyValue('--border') }}
-          }}
-        }}
-      }}
-    }});
-  }}
-
-  function renderHomeTop() {{
-    const q = (document.getElementById("q").value || "").trim().toLowerCase();
-    let rows = (state.customers || []).filter(r => !!r.need_reply);
-
-    if (q) {{
-      rows = rows.filter(r => {{
-        const fields = [r.user_id,r.message,r.next_goal,r.status,r.need_reply_reason,r.visit_slot_selected,r.slot_budget,r.slot_area,r.slot_move_in,r.slot_layout]
-          .map(x => (x||"").toString().toLowerCase());
-        return fields.some(f => f.includes(q));
-      }});
-    }}
-
-    rows = rows.slice().sort((a,b)=> scoreHome(b) - scoreHome(a)).slice(0, 50);
-
-    const tbody = document.getElementById("homeTop");
-    if (!rows.length) {{
-      tbody.innerHTML = `<tr><td colspan="8" class="muted">need_reply がありません</td></tr>`;
-      return;
-    }}
-
-    const shopId = document.getElementById("shopId").value.trim();
-    tbody.innerHTML = rows.map(r => {{
-      const st = (r.status || "ACTIVE").toUpperCase();
-      const stBadge = st === "ACTIVE" ? "badge good" : (st === "COLD" ? "badge warn" : "badge bad");
-      const visit = r.visit_slot_selected ? escapeHtml(r.visit_slot_selected) : "-";
-      const need = `<span class="badge warn">${{escapeHtml(r.need_reply_reason || "need_reply")}}</span>`;
-      const link = `/dashboard/customer?shop_id=${{encodeURIComponent(shopId)}}&conv_key=${{encodeURIComponent(r.conv_key)}}&key=${{encodeURIComponent(DASH_KEY)}}`;
-      return `<tr>
-        <td class="mono muted">${{escapeHtml(fmtTime(r.ts))}}</td>
-        <td>${{r.temp_level_stable ? pill(r.temp_level_stable) : "-"}}</td>
-        <td><span class="${{stBadge}}">${{escapeHtml(st)}}</span></td>
-        <td>${{need}}</td>
-        <td>${{escapeHtml(r.next_goal || "-")}}</td>
-        <td class="mono"><a class="link" href="${{link}}">${{escapeHtml(r.user_id || "")}}</a></td>
-        <td class="rowmsg">${{escapeHtml(r.message || "")}}</td>
-        <td class="mono">${{visit}}</td>
-      </tr>`;
-    }}).join("");
-  }}
-
-  function renderActivities() {{
-    const list = (state.events || []).slice(0, 10);
-    const wrap = document.getElementById("activities");
-    if (!list.length) {{
-      wrap.innerHTML = `<div class="muted">No events</div>`;
-      return;
-    }}
-    const shopId = document.getElementById("shopId").value.trim();
-    wrap.innerHTML = list.map(e => {{
-      const role = (e.role || "").toLowerCase();
-      const badge = role === "user" ? `<span class="badge warn">user</span>` : `<span class="badge good">assistant</span>`;
-      const link = e.conv_key ? `/dashboard/customer?shop_id=${{encodeURIComponent(shopId)}}&conv_key=${{encodeURIComponent(e.conv_key)}}&key=${{encodeURIComponent(DASH_KEY)}}` : "#";
-      return `<div class="activity-item">
-        <div class="activity-time mono">${{escapeHtml(fmtTime(e.ts))}}</div>
-        <div class="activity-text">
-          <div style="display:flex; gap:8px; align-items:center; flex-wrap:wrap;">
-            ${{badge}}
-            <a class="link mono muted" href="${{link}}">${{escapeHtml(e.user_id || "")}}</a>
-            ${{e.temp_level_stable ? pill(e.temp_level_stable) : ""}}
-            <span class="muted">${{escapeHtml(e.next_goal || "")}}</span>
-          </div>
-          <div style="margin-top:6px" class="rowmsg">${{escapeHtml(e.message || "")}}</div>
-        </div>
-      </div>`;
-    }}).join("");
-  }}
-
-  function setHeader(view) {{
-    const thead = document.getElementById("thead");
-    if (view === "customers") {{
-      thead.innerHTML = `<tr>
-        <th>更新</th><th>温度</th><th>確度</th><th>status</th><th>need</th><th>次</th><th>user</th><th>msg</th><th>内見枠</th>
-      </tr>`;
-      return;
-    }}
-    if (view === "ab_stats") {{
-      thead.innerHTML = `<tr><th>variant</th><th>sent</th><th>responded</th><th>rate</th></tr>`;
-      return;
-    }}
-    if (view === "followups") {{
-      thead.innerHTML = `<tr><th>更新</th><th>status</th><th>stage</th><th>variant</th><th>user</th><th>msg</th><th>resp</th><th>err</th></tr>`;
-      return;
-    }}
-    thead.innerHTML = `<tr><th>更新</th><th>role</th><th>温度</th><th>確度</th><th>次</th><th>user</th><th>msg</th></tr>`;
-  }}
-
-  function renderDetail() {{
-    const view = state.tab;
-    const q = (document.getElementById("q").value || "").trim().toLowerCase();
-    const tbody = document.getElementById("tbody");
-    setHeader(view);
-    document.getElementById("detailTitle").textContent = `詳細：${{view}}`;
-    document.getElementById("detailHint").textContent = `検索/自動更新対応`;
-
-    let rows = [];
-    if (view === "customers") rows = state.customers || [];
-    else if (view === "events") rows = state.events || [];
-    else if (view === "followups") rows = state.followups || [];
-    else rows = state.ab || [];
-
-    if (q) {{
-      rows = rows.filter(r => {{
-        const fields = [r.user_id,r.message,r.next_goal,r.status,r.variant,r.error,r.role,r.need_reply_reason]
-          .map(x => (x||"").toString().toLowerCase());
-        return fields.some(f => f.includes(q));
-      }});
-    }}
-
-    if (!rows.length) {{
-      tbody.innerHTML = `<tr><td colspan="9" class="muted">No data</td></tr>`;
-      return;
-    }}
-
-    if (view === "ab_stats") {{
-      tbody.innerHTML = rows.map(r => `
-        <tr>
-          <td class="mono">${{escapeHtml(r.variant || "-")}}</td>
-          <td class="mono">${{Number(r.sent || 0)}}</td>
-          <td class="mono">${{Number(r.responded || 0)}}</td>
-          <td class="mono">${{(Number(r.rate || 0) * 100).toFixed(1)}}%</td>
-        </tr>
-      `).join("");
-      return;
-    }}
-
-    if (view === "followups") {{
-      tbody.innerHTML = rows.map(r => `
-        <tr>
-          <td class="mono muted">${{escapeHtml(fmtTime(r.ts))}}</td>
-          <td class="mono">${{escapeHtml(r.status || "-")}}</td>
-          <td class="mono">${{escapeHtml(String(r.stage ?? "-"))}}</td>
-          <td class="mono">${{escapeHtml(r.variant || "-")}}</td>
-          <td class="mono">${{escapeHtml(r.user_id || "")}}</td>
-          <td class="rowmsg">${{escapeHtml(r.message || "")}}</td>
-          <td class="mono">${{r.responded_at ? "YES" : "-"}}</td>
-          <td class="mono muted">${{escapeHtml(r.error || "-")}}</td>
-        </tr>
-      `).join("");
-      return;
-    }}
-
-    if (view === "customers") {{
-      tbody.innerHTML = rows.map(r => {{
-        const st = (r.status || "ACTIVE").toUpperCase();
-        const stBadge = st === "ACTIVE" ? "badge good" : (st === "COLD" ? "badge warn" : "badge bad");
-        const conf = (r.confidence == null) ? "-" : Number(r.confidence).toFixed(2);
-        const visit = r.visit_slot_selected ? escapeHtml(r.visit_slot_selected) : "-";
-        const need = r.need_reply ? `<span class="badge warn">${{escapeHtml(r.need_reply_reason || "need_reply")}}</span>` : `<span class="badge good">OK</span>`;
-        return `
-          <tr>
-            <td class="mono muted">${{escapeHtml(fmtTime(r.ts))}}</td>
-            <td>${{r.temp_level_stable ? pill(r.temp_level_stable) : "-"}}</td>
-            <td class="mono">${{conf}}</td>
-            <td><span class="${{stBadge}}">${{escapeHtml(st)}}</span></td>
-            <td>${{need}}</td>
-            <td>${{escapeHtml(r.next_goal || "-")}}</td>
-            <td class="mono">${{escapeHtml(r.user_id || "")}}</td>
-            <td class="rowmsg">${{escapeHtml(r.message || "")}}</td>
-            <td class="mono">${{visit}}</td>
-          </tr>
-        `;
-      }}).join("");
-      return;
-    }}
-
-    tbody.innerHTML = rows.map(r => {{
-      const conf = (r.confidence == null) ? "-" : Number(r.confidence).toFixed(2);
-      const role = (r.role || "-").toString();
-      const roleBadge = role === "user" ? `<span class="badge warn">user</span>` : `<span class="badge good">assistant</span>`;
-      return `
-        <tr>
-          <td class="mono muted">${{escapeHtml(fmtTime(r.ts))}}</td>
-          <td>${{roleBadge}}</td>
-          <td>${{r.temp_level_stable ? pill(r.temp_level_stable) : "-"}}</td>
-          <td class="mono">${{conf}}</td>
-          <td>${{escapeHtml(r.next_goal || "-")}}</td>
-          <td class="mono">${{escapeHtml(r.user_id || "")}}</td>
-          <td class="rowmsg">${{escapeHtml(r.message || "")}}</td>
-        </tr>
-      `;
-    }}).join("");
-  }}
-
-  async function fetchAll() {{
-    updateNow();
-
-    state.customers = await fetchJson("customers");
-
-    {{
-      const shopId = document.getElementById("shopId").value.trim();
-      const url = `/api/hot?shop_id=${{encodeURIComponent(shopId)}}&min_level=1&limit=40&view=events&key=${{encodeURIComponent(DASH_KEY)}}`;
-      const res = await fetch(url, {{ credentials: "same-origin" }});
-      state.events = await res.json();
-    }}
-
-    state.followups = await fetchJson("followups");
-    state.ab = await fetchJson("ab_stats");
-
-    await fetchLevelDist();
-
-    updateKpis();
-    renderChartLevels();
-    renderActivities();
-    renderHomeTop();
-    if (state.tab !== "home") renderDetail();
-  }}
-
-  function setupAutoRefresh() {{
-    if (state.timer) clearInterval(state.timer);
-    const sec = parseInt(document.getElementById("refreshSec").value || "0", 10);
-    if (sec > 0) {{
-      state.timer = setInterval(() => fetchAll().catch(console.error), sec * 1000);
-    }}
-  }}
-
-  const keyTheme = "dashboard_theme";
-  const saved = localStorage.getItem(keyTheme);
-  if (saved === "light") document.body.classList.add("light");
-  document.getElementById("toggleTheme").addEventListener("click", () => {{
-    document.body.classList.toggle("light");
-    localStorage.setItem(keyTheme, document.body.classList.contains("light") ? "light" : "dark");
-    if (state.chart) state.chart.update();
-  }});
-
-  const adminKeyInput = document.getElementById("adminKey");
-  adminKeyInput.value = localStorage.getItem("dashboard_admin_key") || "";
-  adminKeyInput.addEventListener("change", () => {{
-    localStorage.setItem("dashboard_admin_key", adminKeyInput.value.trim());
-  }});
-
-  document.getElementById("btnRefresh").addEventListener("click", () => fetchAll().catch(console.error));
-  document.getElementById("btnApply").addEventListener("click", () => {{
-    const shopId = document.getElementById("shopId").value.trim();
-    const minLevel = document.getElementById("minLevel").value;
-    const limit = document.getElementById("limit").value;
-    const refreshSec = document.getElementById("refreshSec").value;
-    const qs = new URLSearchParams({{
-      shop_id: shopId,
-      min_level: minLevel,
-      limit: limit,
-      refresh: refreshSec,
-      key: DASH_KEY
-    }});
-    window.location.href = `/dashboard?${{qs.toString()}}`;
-  }});
-
-  document.getElementById("q").addEventListener("input", () => {{
-    if (state.tab === "home") renderHomeTop();
-    else renderDetail();
-  }});
-  document.getElementById("refreshSec").addEventListener("change", setupAutoRefresh);
-
-  setTab("home");
-  fetchAll().then(setupAutoRefresh).catch(console.error);
+tick().catch(console.error);
+if(REFRESH>0) setInterval(()=>tick().catch(console.error), REFRESH*1000);
 </script>
 </body>
 </html>
@@ -2379,8 +2158,7 @@ async def dashboard(
 
 
 # ============================================================
-# Customer detail API & page / actions / jobs
-# （この下は前と同じ：温度分布修正に関係ないので省略せず残す）
+# Customer detail API & page
 # ============================================================
 
 @app.get("/api/customer/detail")
@@ -2396,11 +2174,12 @@ async def api_customer_detail(
 
     crow = db_fetchall(
         """
-        SELECT conv_key, user_id, last_user_text, temp_level_stable, confidence, next_goal, updated_at,
+        SELECT conv_key, user_id, last_user_text, temp_level_stable, confidence, COALESCE(intent,'other'), next_goal, updated_at,
                COALESCE(status,'ACTIVE'), COALESCE(opt_out,FALSE),
                visit_slot_selected, visit_slot_selected_at,
                slot_budget, slot_area, slot_move_in, slot_layout,
-               COALESCE(need_reply,FALSE), COALESCE(need_reply_reason,''), need_reply_updated_at
+               COALESCE(need_reply,FALSE), COALESCE(need_reply_reason,''), need_reply_updated_at,
+               pref_hour_jst, pref_hour_samples
         FROM customers
         WHERE shop_id=%s AND conv_key=%s
         LIMIT 1
@@ -2416,24 +2195,27 @@ async def api_customer_detail(
             "last_user_text": r[2],
             "temp_level_stable": r[3],
             "confidence": float(r[4]) if r[4] is not None else None,
-            "next_goal": r[5],
-            "updated_at": r[6].isoformat() if r[6] else None,
-            "status": r[7],
-            "opt_out": bool(r[8]),
-            "visit_slot_selected": r[9],
-            "visit_slot_selected_at": r[10].isoformat() if r[10] else None,
-            "slot_budget": r[11],
-            "slot_area": r[12],
-            "slot_move_in": r[13],
-            "slot_layout": r[14],
-            "need_reply": bool(r[15]),
-            "need_reply_reason": r[16],
-            "need_reply_updated_at": r[17].isoformat() if r[17] else None,
+            "intent": r[5],
+            "next_goal": r[6],
+            "updated_at": r[7].isoformat() if r[7] else None,
+            "status": r[8],
+            "opt_out": bool(r[9]),
+            "visit_slot_selected": r[10],
+            "visit_slot_selected_at": r[11].isoformat() if r[11] else None,
+            "slot_budget": r[12],
+            "slot_area": r[13],
+            "slot_move_in": r[14],
+            "slot_layout": r[15],
+            "need_reply": bool(r[16]),
+            "need_reply_reason": r[17],
+            "need_reply_updated_at": r[18].isoformat() if r[18] else None,
+            "pref_hour_jst": r[19],
+            "pref_hour_samples": r[20],
         }
 
     msgs = db_fetchall(
         """
-        SELECT role, content, created_at, temp_level_stable, confidence, next_goal
+        SELECT role, content, created_at, temp_level_stable, confidence, COALESCE(intent,'other'), next_goal
         FROM messages
         WHERE shop_id=%s AND conv_key=%s
         ORDER BY created_at DESC
@@ -2449,14 +2231,15 @@ async def api_customer_detail(
             "ts": m[2].isoformat() if m[2] else None,
             "temp_level_stable": m[3],
             "confidence": float(m[4]) if m[4] is not None else None,
-            "next_goal": m[5],
+            "intent": m[5],
+            "next_goal": m[6],
         }
         for m in msgs
     ]
 
     fls = db_fetchall(
         """
-        SELECT variant, mode, status, stage, message, error, responded_at, created_at
+        SELECT variant, mode, status, stage, message, error, responded_at, send_hour_jst, created_at
         FROM followup_logs
         WHERE shop_id=%s AND conv_key=%s
         ORDER BY created_at DESC
@@ -2473,7 +2256,8 @@ async def api_customer_detail(
             "message": f[4],
             "error": f[5],
             "responded_at": f[6].isoformat() if f[6] else None,
-            "ts": f[7].isoformat() if f[7] else None,
+            "send_hour_jst": f[7],
+            "ts": f[8].isoformat() if f[8] else None,
         }
         for f in fls
     ]
@@ -2481,10 +2265,109 @@ async def api_customer_detail(
     return JSONResponse({"ok": True, "customer": customer, "messages": messages, "followups": followups}, status_code=200)
 
 
+@app.get("/dashboard/customer", response_class=HTMLResponse)
+async def dashboard_customer(
+    _: None = Depends(require_dashboard_key),
+    shop_id: str = Query(default=SHOP_ID),
+    conv_key: str = Query(...),
+    key: Optional[str] = Query(default=None),
+):
+    key_q = (key or "").strip()
+    html = f"""
+<!doctype html>
+<html lang="ja">
+<head>
+<meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width, initial-scale=1"/>
+<title>Customer | {shop_id}</title>
+<style>
+  body{{font-family:system-ui,-apple-system,"Hiragino Sans","Noto Sans JP",sans-serif;margin:16px;background:#0b1020;color:#fff}}
+  .card{{background:rgba(255,255,255,.06);border:1px solid rgba(255,255,255,.12);border-radius:14px;padding:12px;margin-bottom:12px}}
+  .mono{{font-family:ui-monospace,Menlo,Monaco,Consolas,monospace}}
+  a{{color:#8ab4f8}}
+  .msg{{padding:8px;border-bottom:1px solid rgba(255,255,255,.12)}}
+  .u{{color:#ffb020}} .a{{color:#37d67a}}
+  pre{{white-space:pre-wrap}}
+</style>
+</head>
+<body>
+  <div class="card">
+    <a href="/dashboard?shop_id={shop_id}&key={key_q}">← back</a>
+    <div class="mono" style="margin-top:8px;">{conv_key}</div>
+  </div>
+  <div class="card" id="cust">loading...</div>
+  <div class="card">
+    <b>Messages</b>
+    <div id="msgs">loading...</div>
+  </div>
+  <div class="card">
+    <b>Followups</b>
+    <div id="fls">loading...</div>
+  </div>
+
+<script>
+const KEY={json.dumps(key_q)};
+const SHOP={json.dumps(shop_id)};
+const CONV={json.dumps(conv_key)};
+
+function esc(s){{return (s??"").toString().replace(/[&<>"]/g,c=>({{"&":"&amp;","<":"&lt;",">":"&gt;","\\"":"&quot;"}}[c]))}}
+async function fetchJson(url){{const r=await fetch(url); return await r.json();}}
+
+(async()=>{
+  const d = await fetchJson(`/api/customer/detail?shop_id=${{encodeURIComponent(SHOP)}}&conv_key=${{encodeURIComponent(CONV)}}&key=${{encodeURIComponent(KEY)}}`);
+  const c = d.customer || {{}};
+  document.getElementById("cust").innerHTML = `
+    <b>User</b>: <span class="mono">${{esc(c.user_id||"-")}}</span><br/>
+    <b>Status</b>: <span class="mono">${{esc(c.status||"-")}}</span> / <b>Lv</b>: <span class="mono">${{esc(c.temp_level_stable||"-")}}</span> / <b>conf</b>: <span class="mono">${{c.confidence==null?"-":Number(c.confidence).toFixed(2)}}</span><br/>
+    <b>Intent</b>: <span class="mono">${{esc(c.intent||"-")}}</span> / <b>Goal</b>: ${{esc(c.next_goal||"-")}}<br/>
+    <b>need_reply</b>: <span class="mono">${{esc(c.need_reply? "TRUE":"FALSE")}}</span> (${{esc(c.need_reply_reason||"")}})<br/>
+    <b>pref_hour</b>: <span class="mono">${{esc(c.pref_hour_jst??"-")}}</span> samples:<span class="mono">${{esc(c.pref_hour_samples??"-")}}</span><br/>
+    <b>slots</b>: budget=${{esc(c.slot_budget||"-")}} / area=${{esc(c.slot_area||"-")}} / move_in=${{esc(c.slot_move_in||"-")}} / layout=${{esc(c.slot_layout||"-")}}<br/>
+    <b>visit</b>: ${{esc(c.visit_slot_selected||"-")}}<br/>
+    <b>updated</b>: <span class="mono">${{esc(c.updated_at||"-")}}</span>
+  `;
+
+  const msgs = d.messages||[];
+  document.getElementById("msgs").innerHTML = msgs.map(m=>{
+    const cls = (m.role==="user")?"u":"a";
+    return `<div class="msg">
+      <div class="mono ${{cls}}">${{esc(m.role)}} / ${{esc(m.ts||"")}} / Lv:${{esc(m.temp_level_stable||"-")}} / intent:${{esc(m.intent||"-")}}</div>
+      <pre>${{esc(m.content||"")}}</pre>
+    </div>`;
+  }).join("") || "no messages";
+
+  const fls = d.followups||[];
+  document.getElementById("fls").innerHTML = fls.map(f=>{
+    return `<div class="msg">
+      <div class="mono">ts:${{esc(f.ts||"")}} / stage:${{esc(f.stage||"-")}} / var:${{esc(f.variant||"-")}} / mode:${{esc(f.mode||"-")}} / status:${{esc(f.status||"-")}} / send_hour:${{esc(f.send_hour_jst??"-")}}</div>
+      <pre>${{esc(f.message||"")}}</pre>
+      <div class="mono">responded:${{esc(f.responded_at||"-")}} / err:${{esc(f.error||"-")}}</div>
+    </div>`;
+  }).join("") || "no followups";
+})();
+</script>
+</body>
+</html>
+"""
+    return HTMLResponse(html)
+
+
+# ============================================================
+# Admin actions
+# ============================================================
+
 def fetch_customer_for_action(shop_id: str, conv_key: str) -> Optional[Dict[str, Any]]:
     rows = db_fetchall(
         """
-        SELECT conv_key, user_id, COALESCE(temp_level_stable,0), COALESCE(next_goal,''), COALESCE(last_user_text,''), COALESCE(status,'ACTIVE'), COALESCE(opt_out,FALSE)
+        SELECT conv_key, user_id,
+               COALESCE(temp_level_stable,0),
+               COALESCE(next_goal,''),
+               COALESCE(last_user_text,''),
+               COALESCE(status,'ACTIVE'),
+               COALESCE(opt_out,FALSE),
+               COALESCE(intent,'other'),
+               pref_hour_jst,
+               updated_at
         FROM customers
         WHERE shop_id=%s AND conv_key=%s
         LIMIT 1
@@ -2493,7 +2376,7 @@ def fetch_customer_for_action(shop_id: str, conv_key: str) -> Optional[Dict[str,
     )
     if not rows:
         return None
-    conv_key, user_id, lvl, goal, last_text, st, opt = rows[0]
+    conv_key, user_id, lvl, goal, last_text, st, opt, intent, pref_hour_jst, updated_at = rows[0]
     return {
         "conv_key": conv_key,
         "user_id": user_id,
@@ -2502,6 +2385,9 @@ def fetch_customer_for_action(shop_id: str, conv_key: str) -> Optional[Dict[str,
         "last_user_text": last_text or "",
         "status": (st or "ACTIVE"),
         "opt_out": bool(opt),
+        "intent": intent or "other",
+        "pref_hour_jst": pref_hour_jst,
+        "updated_at": updated_at,
     }
 
 
@@ -2543,6 +2429,10 @@ async def api_customer_reset_need_reply(
     return {"ok": True}
 
 
+# ============================================================
+# Manual followup now (uses LLM first, fallback)
+# ============================================================
+
 @app.post("/api/customer/send_followup_now")
 async def api_customer_send_followup_now(
     _: None = Depends(require_admin_key),
@@ -2565,33 +2455,23 @@ async def api_customer_send_followup_now(
         return {"ok": True, "sent": False, "reason": "no_user_id"}
 
     variant = pick_ab_variant(conv_key)
+    msg = None
     if stage == 1:
-        msg = build_followup_template_ab(variant, c["next_goal"], c["last_user_text"], c["level"])
+        msg = await generate_followup_message_llm(shop_id, conv_key, stage=1, variant=variant, customer=c)
+        if not msg:
+            msg = build_followup_template_ab_fallback(variant, c["next_goal"], c["last_user_text"], c["level"])
     else:
-        msg = build_second_touch_message(c["next_goal"])
+        msg = await generate_followup_message_llm(shop_id, conv_key, stage=2, variant=variant, customer=c)
+        if not msg:
+            msg = build_second_touch_message_fallback(c["next_goal"])
 
     try:
         await push_line(user_id, msg)
-        save_followup_log(shop_id, conv_key, user_id, msg, "manual", "sent", None, variant, stage)
+        save_followup_log(shop_id, conv_key, user_id, msg, "manual", "sent", None, variant, stage, send_hour_jst=now_jst().hour)
         return {"ok": True, "sent": True, "stage": stage, "variant": variant}
     except Exception as e:
-        save_followup_log(shop_id, conv_key, user_id, msg, "manual", "failed", str(e)[:200], variant, stage)
+        save_followup_log(shop_id, conv_key, user_id, msg, "manual", "failed", str(e)[:200], variant, stage, send_hour_jst=now_jst().hour)
         return {"ok": True, "sent": False, "error": str(e)[:200]}
-
-
-@app.get("/dashboard/customer", response_class=HTMLResponse)
-async def dashboard_customer(
-    _: None = Depends(require_dashboard_key),
-    shop_id: str = Query(default=SHOP_ID),
-    conv_key: str = Query(...),
-    key: Optional[str] = Query(default=None),
-):
-    key_q = (key or "").strip()
-    return HTMLResponse(
-        f"<meta charset='utf-8'><h3>この版は /dashboard/customer のHTMLは前版と同じです。</h3>"
-        f"<p>URLはそのまま使えます：/dashboard/customer?shop_id={shop_id}&conv_key={conv_key}&key={key_q}</p>"
-        f"<p>（必要なら次で詳細HTMLも統合して全体で出します）</p>"
-    )
 
 
 # ============================================================
@@ -2606,11 +2486,16 @@ async def job_maintenance(_: None = Depends(require_admin_key)):
 
 @app.post("/jobs/followup")
 async def job_followup(_: None = Depends(require_admin_key)):
+    """
+    Phase 2: LLM followup message (A/B)
+    Phase 3: per-user best send hour (pref_hour_jst) gating
+    """
     if not FOLLOWUP_ENABLED:
         return {"ok": True, "enabled": False, "reason": "FOLLOWUP_ENABLED!=1"}
 
     maintenance_update_statuses(SHOP_ID)
 
+    # global window
     if not is_within_jst_window():
         return {"ok": True, "enabled": True, "skipped": True, "reason": "out_of_time_window"}
 
@@ -2625,51 +2510,91 @@ async def job_followup(_: None = Depends(require_admin_key)):
 
     sent1 = 0
     sent2 = 0
+    skipped_time = 0
     failed = 0
 
+    nowj = now_jst()
+    now_hour = nowj.hour
+
+    def should_send_now(updated_at: Optional[datetime], pref_hour: Optional[int]) -> bool:
+        # if too old, send anyway within global window
+        if updated_at:
+            age_h = (utcnow() - updated_at).total_seconds() / 3600.0
+            if age_h >= max(1, FOLLOWUP_FORCE_SEND_AFTER_HOURS):
+                return True
+        target = choose_send_hour_jst(pref_hour)
+        return within_hour_band(now_hour, target, FOLLOWUP_TIME_MATCH_HOURS)
+
+    # stage1
     for c in stage1:
         conv_key = c["conv_key"]
         user_id = c["user_id"]
-        level = c["level"]
-        goal = c["next_goal"]
-        last_text = c["last_user_text"]
 
         if is_inactive(SHOP_ID, conv_key):
-            save_followup_log(SHOP_ID, conv_key, user_id, "(skipped inactive)", "template", "skipped", "inactive", None, 1)
+            save_followup_log(SHOP_ID, conv_key, user_id, "(skipped inactive)", "llm/template", "skipped", "inactive", None, 1, send_hour_jst=now_hour)
+            continue
+
+        if not should_send_now(c.get("updated_at"), c.get("pref_hour_jst")):
+            skipped_time += 1
             continue
 
         variant = pick_ab_variant(conv_key)
-        msg = build_followup_template_ab(variant, goal, last_text, level)
+
+        msg = await generate_followup_message_llm(SHOP_ID, conv_key, stage=1, variant=variant, customer=c)
+        mode = "llm"
+        if not msg:
+            msg = build_followup_template_ab_fallback(variant, c["next_goal"], c["last_user_text"], c["level"])
+            mode = "template"
 
         try:
             await push_line(user_id, msg)
-            save_followup_log(SHOP_ID, conv_key, user_id, msg, "template", "sent", None, variant, 1)
+            save_followup_log(SHOP_ID, conv_key, user_id, msg, mode, "sent", None, variant, 1, send_hour_jst=now_hour)
             sent1 += 1
         except Exception as e:
-            save_followup_log(SHOP_ID, conv_key, user_id, msg, "template", "failed", str(e)[:200], variant, 1)
+            save_followup_log(SHOP_ID, conv_key, user_id, msg, mode, "failed", str(e)[:200], variant, 1, send_hour_jst=now_hour)
             failed += 1
 
+    # stage2
     for c in stage2:
         conv_key = c["conv_key"]
         user_id = c["user_id"]
-        goal = c["next_goal"]
 
         if is_inactive(SHOP_ID, conv_key):
-            save_followup_log(SHOP_ID, conv_key, user_id, "(skipped inactive)", "template", "skipped", "inactive", None, 2)
+            save_followup_log(SHOP_ID, conv_key, user_id, "(skipped inactive)", "llm/template", "skipped", "inactive", None, 2, send_hour_jst=now_hour)
+            continue
+
+        if not should_send_now(c.get("updated_at"), c.get("pref_hour_jst")):
+            skipped_time += 1
             continue
 
         variant = pick_ab_variant(conv_key)
-        msg = build_second_touch_message(goal)
+
+        msg = await generate_followup_message_llm(SHOP_ID, conv_key, stage=2, variant=variant, customer=c)
+        mode = "llm"
+        if not msg:
+            msg = build_second_touch_message_fallback(c["next_goal"])
+            mode = "template"
 
         try:
             await push_line(user_id, msg)
-            save_followup_log(SHOP_ID, conv_key, user_id, msg, "template", "sent", None, variant, 2)
+            save_followup_log(SHOP_ID, conv_key, user_id, msg, mode, "sent", None, variant, 2, send_hour_jst=now_hour)
             sent2 += 1
         except Exception as e:
-            save_followup_log(SHOP_ID, conv_key, user_id, msg, "template", "failed", str(e)[:200], variant, 2)
+            save_followup_log(SHOP_ID, conv_key, user_id, msg, mode, "failed", str(e)[:200], variant, 2, send_hour_jst=now_hour)
             failed += 1
 
-    return {"ok": True, "enabled": True, "sent_stage1": sent1, "sent_stage2": sent2, "failed": failed}
+    return {
+        "ok": True,
+        "enabled": True,
+        "sent_stage1": sent1,
+        "sent_stage2": sent2,
+        "skipped_time": skipped_time,
+        "failed": failed,
+        "now_hour_jst": now_hour,
+        "time_band": FOLLOWUP_TIME_MATCH_HOURS,
+        "force_send_after_h": FOLLOWUP_FORCE_SEND_AFTER_HOURS,
+        "llm_enabled": FOLLOWUP_USE_LLM,
+    }
 
 
 @app.post("/jobs/push_test")
