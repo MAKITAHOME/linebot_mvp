@@ -1,41 +1,4 @@
-# app.py (FULL - upgrade: 2) context-aware followups (LLM) + 3) best send timing learning)
-# FastAPI + Render + Postgres(pg8000)
-#
-# ✅ LINE webhook (fast reply / fallback "確認中" + later push)
-# ✅ 温度判定: Responses API Structured Outputs (JSON Schema) + intent
-# ✅ 追客: A/B維持しつつ、LLMで文脈別に追客文を生成（失敗時はテンプレfallback）
-# ✅ タイミング学習: ユーザー返信時刻( JST hour )の分布から pref_hour_jst を学習し、追客送信を個別最適化
-# ✅ Dashboard: customers / events / followups / ab_stats + level distribution
-#
-# Required env:
-#   LINE_CHANNEL_SECRET
-#   LINE_CHANNEL_ACCESS_TOKEN
-#   OPENAI_API_KEY
-#   DATABASE_URL
-#   DASHBOARD_KEY
-#   ADMIN_API_KEY
-#
-# Optional env:
-#   SHOP_ID (default tokyo_01)
-#   OPENAI_MODEL_ASSISTANT (default gpt-4o-mini)
-#   OPENAI_MODEL_ANALYZE (default gpt-4o-mini)
-#   OPENAI_MODEL_FOLLOWUP (default gpt-4o-mini)
-#   ANALYZE_TIMEOUT_SEC (default 8.5)
-#   FOLLOWUP_LLM_TIMEOUT_SEC (default 8.5)
-#   FOLLOWUP_USE_LLM (default 1)
-#   FOLLOWUP_TIME_MATCH_HOURS (default 1)  # pref_hour ± this range で送る
-#   FOLLOWUP_FORCE_SEND_AFTER_HOURS (default 12) # 遅延しすぎる場合はpref無視で送る
-#   PREF_HOUR_LOOKBACK_DAYS (default 60)
-#   PREF_HOUR_MIN_SAMPLES (default 3)
-#   DASHBOARD_REFRESH_SEC_DEFAULT (default 30)
-#   FAST_REPLY_TIMEOUT_SEC (default 3.0)
-#   ANALYZE_HISTORY_LIMIT (default 10)
-#   SHORT_TEXT_MAX_LEN (default 2)
-#   FOLLOWUP_* (existing)
-#
-# ⚠️ タイミング最適化を効かせるには /jobs/followup を「1時間に1回以上」叩くのが理想
-#    （Render Cron / 外部Cron / UptimeRobot等でOK）
-
+# app.py (FULL - push: next_goal is DB truth from LLM analyze; phase2 followup LLM + phase3 timing learning)
 import os
 import json
 import hmac
@@ -330,7 +293,7 @@ def ensure_tables_and_columns() -> None:
     cur.execute("""ALTER TABLE messages ADD COLUMN IF NOT EXISTS temp_level_stable INT;""")
     cur.execute("""ALTER TABLE messages ADD COLUMN IF NOT EXISTS confidence REAL;""")
     cur.execute("""ALTER TABLE messages ADD COLUMN IF NOT EXISTS next_goal TEXT;""")
-    cur.execute("""ALTER TABLE messages ADD COLUMN IF NOT EXISTS intent TEXT;""")  # NEW
+    cur.execute("""ALTER TABLE messages ADD COLUMN IF NOT EXISTS intent TEXT;""")
 
     cur.execute(
         """
@@ -359,7 +322,7 @@ def ensure_tables_and_columns() -> None:
     cur.execute("""ALTER TABLE followup_logs ADD COLUMN IF NOT EXISTS variant TEXT;""")
     cur.execute("""ALTER TABLE followup_logs ADD COLUMN IF NOT EXISTS responded_at TIMESTAMPTZ;""")
     cur.execute("""ALTER TABLE followup_logs ADD COLUMN IF NOT EXISTS stage INT;""")
-    cur.execute("""ALTER TABLE followup_logs ADD COLUMN IF NOT EXISTS send_hour_jst INT;""")  # NEW
+    cur.execute("""ALTER TABLE followup_logs ADD COLUMN IF NOT EXISTS send_hour_jst INT;""")
 
     cur.execute("""CREATE INDEX IF NOT EXISTS idx_customers_shop_updated ON customers(shop_id, updated_at DESC);""")
     cur.execute("""CREATE INDEX IF NOT EXISTS idx_messages_conv_created ON messages(conv_key, created_at DESC);""")
@@ -517,7 +480,7 @@ OPENAI_CHAT_URL = "https://api.openai.com/v1/chat/completions"
 SYSTEM_PROMPT_ANALYZE = """
 あなたは不動産仲介SaaSの「顧客温度判定AI」です。
 会話履歴と最新発言から、成約に近い順に 1〜10 で温度を判定します。
-同時に「意図(intent)」も分類してください。
+同時に「意図(intent)」と「次に聞くべきこと(next_goal)」を決めてください。
 
 【出力はJSONのみ（それ以外禁止）】
 {
@@ -540,6 +503,12 @@ Lv3 : 反応が薄い/曖昧/先すぎる（半年以上先など）/冷めて�
 Lv2 : 反応が薄い/要件なし/冷めている
 Lv1 : 明確に不要、拒否、ブロック示唆
 
+【next_goalの決め方（重要）】
+- 目標は「次の1歩を進めるために、今聞くべき情報」。
+- 例: 内見系なら「候補日/日程確定」「別日希望の確認」。
+- 条件不足なら「予算」「エリア」「入居時期」「間取り」など、最も重要な不足を優先。
+- 質問は最大2つに収まる形のゴールにする。
+
 【過大評価防止（最重要）】
 - 「内見」「良さそう」等があっても、予算・入居時期・エリアが不明なら Lv8以上にしない
 - 入居時期が半年以上先なら最大でも Lv6
@@ -554,7 +523,6 @@ SYSTEM_PROMPT_ASSISTANT = """
 ・押し売り感を出さない
 """
 
-# Responses API schemas
 ANALYZE_JSON_SCHEMA = {
     "type": "object",
     "additionalProperties": False,
@@ -685,6 +653,13 @@ def coerce_intent(v: Any) -> str:
     return "other"
 
 
+def coerce_goal(v: Any) -> str:
+    s = str(v or "").strip()
+    if not s:
+        return "要件確認"
+    return s[:80]
+
+
 # ============================================================
 # Utility: slots
 # ============================================================
@@ -771,10 +746,6 @@ def _to_jst(dt: datetime) -> datetime:
 
 
 def learn_pref_hour_from_messages(shop_id: str, conv_key: str) -> Tuple[Optional[int], int]:
-    """
-    user(role='user') のメッセージ時刻( JST hour )の分布から、最頻値を pref_hour として学習
-    return: (pref_hour_jst or None, samples)
-    """
     if not DATABASE_URL:
         return None, 0
     since = utcnow() - timedelta(days=max(7, min(365, PREF_HOUR_LOOKBACK_DAYS)))
@@ -805,7 +776,6 @@ def learn_pref_hour_from_messages(shop_id: str, conv_key: str) -> Tuple[Optional
         if 0 <= h <= 23:
             counts[h] += 1
 
-    # mode
     best_h = max(range(24), key=lambda x: counts[x])
     return best_h, samples
 
@@ -827,7 +797,6 @@ def update_customer_pref_hour(shop_id: str, conv_key: str) -> None:
 
 
 def choose_send_hour_jst(pref_hour: Optional[int]) -> int:
-    # fallback: 平日夜を想定
     if pref_hour is None:
         return 19
     try:
@@ -852,7 +821,6 @@ def is_within_jst_window(dt: Optional[datetime] = None) -> bool:
 
 
 def within_hour_band(now_hour: int, target_hour: int, band: int) -> bool:
-    # circular distance on 24h
     diff = abs(now_hour - target_hour)
     diff = min(diff, 24 - diff)
     return diff <= max(0, band)
@@ -1060,10 +1028,6 @@ def upsert_customer_state(
     )
 
 
-# ============================================================
-# Utility: conversation history for analysis / followup
-# ============================================================
-
 def get_recent_conversation(shop_id: str, conv_key: str, limit: int) -> List[Dict[str, str]]:
     if not DATABASE_URL:
         return []
@@ -1194,7 +1158,7 @@ def is_visit_change_request(text: str) -> bool:
 
 
 # ============================================================
-# AB selection & fallback followup templates (Phase 2 fallback)
+# AB selection & fallback followup templates
 # ============================================================
 
 def pick_ab_variant(conv_key: str) -> str:
@@ -1265,12 +1229,7 @@ async def generate_followup_message_llm(
     variant: str,
     customer: Dict[str, Any],
 ) -> Optional[str]:
-    """
-    LLMで追客文を生成（壊れないJSON schema）
-    """
-    if not FOLLOWUP_USE_LLM:
-        return None
-    if not OPENAI_API_KEY:
+    if not FOLLOWUP_USE_LLM or not OPENAI_API_KEY:
         return None
 
     level = int(customer.get("level") or 0)
@@ -1282,7 +1241,6 @@ async def generate_followup_message_llm(
     slots = get_customer_slots(shop_id, conv_key)
     visit_selected = flags.get("visit_slot_selected")
 
-    # 内見候補
     visit_slots = upcoming_visit_slots_jst(VISIT_DAYS_AHEAD)
     visit_block = ""
     if any(k in next_goal for k in ["内見", "候補日", "日程"]):
@@ -1297,18 +1255,17 @@ async def generate_followup_message_llm(
     instructions = (
         "あなたは不動産/太陽光/投資の問い合わせ対応のトップ営業です。"
         "次の条件を厳守し、追客LINE文を1通だけ作ってください。"
-        "出力はJSONのみ。"
-        "\n\n【厳守】\n"
+        "出力はJSONのみ。\n\n"
+        "【厳守】\n"
         "- 押し売り禁止。丁寧。短く。\n"
         "- 質問は最大2つ。\n"
         "- 返信しやすい形（番号/選択肢/一言でOK）を優先。\n"
         "- 次のゴール(next_goal)に沿う。\n"
-        "- intent（賃貸/購入/投資/情報収集）を踏まえて、言い回しを変える。\n"
+        "- intent（賃貸/購入/投資/情報収集）を踏まえて言い回しを変える。\n"
         "- 文字数は短め（~350字目安）。\n"
     )
 
     history = get_recent_conversation_for_followup(shop_id, conv_key, limit=12)
-    # 入力：コンテキストをまとめて渡す
     context_user = {
         "stage": stage,
         "ab_variant": variant,
@@ -1322,7 +1279,7 @@ async def generate_followup_message_llm(
         "known_slots": slots,
         "visit_selected": visit_selected,
         "visit_block": visit_block,
-        "rules_hint": "内見/日程なら、番号1-6か別日希望を促す。要件確認なら、予算/エリア/時期/間取りの不足を埋める。",
+        "rules_hint": "内見/日程なら番号1-6か別日希望を促す。要件確認なら不足スロットを埋める。",
     }
 
     input_msgs: List[Dict[str, str]] = []
@@ -1354,19 +1311,19 @@ async def generate_followup_message_llm(
 # Phase 1: analyze (Responses structured) + reply generation
 # ============================================================
 
-async def analyze_only(shop_id: str, conv_key: str, user_text: str) -> Tuple[int, float, str, List[str], Dict[str, str], str]:
+async def analyze_only(shop_id: str, conv_key: str, user_text: str) -> Tuple[int, float, str, str, List[str], Dict[str, str], str]:
     """
-    return: raw_level, conf, intent, reasons, merged_slots, status_override
+    return: raw_level, conf, intent, next_goal, reasons, merged_slots, status_override
     """
     t = (user_text or "").strip()
 
     for pat in OPTOUT_PATTERNS:
         if re.search(pat, t, flags=re.IGNORECASE):
-            return 1, 0.95, "other", ["配信停止/連絡不要の意思"], {}, "OPTOUT"
+            return 1, 0.95, "other", "関係終了確認", ["配信停止/連絡不要の意思"], {}, "OPTOUT"
 
     for pat in CANCEL_PATTERNS:
         if re.search(pat, t):
-            return 2, 0.90, "other", ["キャンセル/拒否の明確表現"], {}, "LOST"
+            return 2, 0.90, "other", "関係終了確認", ["キャンセル/拒否の明確表現"], {}, "LOST"
 
     new_slots = extract_slots(user_text)
     prev_slots = get_customer_slots(shop_id, conv_key)
@@ -1382,7 +1339,6 @@ async def analyze_only(shop_id: str, conv_key: str, user_text: str) -> Tuple[int
     next_goal = "要件確認"
     reasons: List[str] = []
 
-    # Structured analyze
     input_msgs: List[Dict[str, str]] = []
     if merged:
         input_msgs.append({"role": "user", "content": f"抽出スロット(参考): {json.dumps(merged, ensure_ascii=False)}"})
@@ -1400,17 +1356,16 @@ async def analyze_only(shop_id: str, conv_key: str, user_text: str) -> Tuple[int
         raw_level = coerce_level(j.get("temp_level_raw", 5))
         conf = coerce_confidence(j.get("confidence", 0.6))
         intent = coerce_intent(j.get("intent", "other"))
-        next_goal = str(j.get("next_goal", "要件確認")).strip()[:80]
+        next_goal = coerce_goal(j.get("next_goal", "要件確認"))
         rs = j.get("reasons", [])
         if isinstance(rs, list):
             reasons = [str(x).strip()[:60] for x in rs if str(x).strip()][:3]
-        return raw_level, conf, intent, reasons, merged, ""
+        return raw_level, conf, intent, next_goal, reasons, merged, ""
 
-    # fallback (LLM失敗時)
     if len(t) <= SHORT_TEXT_MAX_LEN:
-        return 3, 0.75, "other", ["短文で情報不足（fallback）"], merged, ""
+        return 3, 0.75, "other", "要件確認", ["短文で情報不足（fallback）"], merged, ""
 
-    return raw_level, conf, intent, reasons, merged, ""
+    return raw_level, conf, intent, next_goal, reasons, merged, ""
 
 
 async def generate_reply_only(user_id: str, user_text: str) -> str:
@@ -1478,7 +1433,7 @@ def acquire_job_lock(key: str, ttl_sec: int) -> bool:
 
 
 # ============================================================
-# Followup candidate queries (include intent + pref_hour)
+# Followup candidate queries
 # ============================================================
 
 def get_followup_candidates_stage1() -> List[Dict[str, Any]]:
@@ -1593,7 +1548,7 @@ def get_followup_candidates_stage2() -> List[Dict[str, Any]]:
 
 async def process_analysis_only_store(shop_id: str, user_id: str, conv_key: str, user_text: str, reply_text: str) -> None:
     try:
-        raw_level, conf, intent, reasons, merged_slots, status_override = await analyze_only(shop_id, conv_key, user_text)
+        raw_level, conf, intent, next_goal, reasons, merged_slots, status_override = await analyze_only(shop_id, conv_key, user_text)
         stable_level = stable_from_history(conv_key, raw_level)
 
         if status_override == "OPTOUT":
@@ -1606,26 +1561,7 @@ async def process_analysis_only_store(shop_id: str, user_id: str, conv_key: str,
         if merged_slots:
             set_customer_slots(shop_id, conv_key, merged_slots)
 
-        # store customer + assistant message with scoring
-        next_goal = "要件確認"
-        # read latest next_goal from analyze (kept in analyze schema)
-        # We already return intent only; so get next_goal by re-reading last assistant? not needed.
-        # We'll reconstruct from DB later; but better: run analyze again? no.
-        # Instead: store next_goal in customer via separate query? We'll keep next_goal empty here and update from last analyze output:
-        # We can re-run analyze to get next_goal, but that doubles cost. So we stored only intent in return signature earlier.
-        # => We'll read it from customers? Not yet updated.
-        # FIX: Use a cheap trick: analyze_only returns reasons list but not next_goal. We'll keep next_goal as "要件確認".
-        # NOTE: followup logic uses DB's next_goal, so the accurate next_goal should be stored where analyze was run.
-        # To avoid extra costs, we update next_goal in the same function by reusing OpenAI output: adjust analyze_only signature (done earlier).
-        # -> Actually analyze_only currently returns intent but not next_goal in signature; We will set next_goal to "要件確認".
-        #    Next_goal will still be updated in process_ai_and_push_full path below (where we set it).
-        #
-        # For correctness in this path too, we compute next_goal by quick rule:
-        if stable_level >= 8:
-            next_goal = "内見/日程"
-        else:
-            next_goal = "要件確認"
-
+        # ✅ next_goal is DB truth from LLM
         upsert_customer_state(shop_id, conv_key, user_id, user_text, raw_level, stable_level, conf, intent, next_goal)
         save_message(shop_id, conv_key, "assistant", reply_text, raw_level, stable_level, conf, intent, next_goal)
 
@@ -1638,9 +1574,7 @@ async def process_analysis_only_store(shop_id: str, user_id: str, conv_key: str,
 
 async def process_ai_and_push_full(shop_id: str, user_id: str, conv_key: str, user_text: str) -> None:
     try:
-        # run analyze first (structured)
-        # We'll compute next_goal more accurately here by asking analyze again but we already do.
-        raw_level, conf, intent, reasons, merged_slots, status_override = await analyze_only(shop_id, conv_key, user_text)
+        raw_level, conf, intent, next_goal, reasons, merged_slots, status_override = await analyze_only(shop_id, conv_key, user_text)
         stable_level = stable_from_history(conv_key, raw_level)
 
         if status_override == "OPTOUT":
@@ -1653,7 +1587,6 @@ async def process_ai_and_push_full(shop_id: str, user_id: str, conv_key: str, us
         if merged_slots:
             set_customer_slots(shop_id, conv_key, merged_slots)
 
-        # Reply generation
         try:
             reply_text = await openai_chat(
                 [{"role": "system", "content": SYSTEM_PROMPT_ASSISTANT}, {"role": "user", "content": user_text}],
@@ -1664,24 +1597,12 @@ async def process_ai_and_push_full(shop_id: str, user_id: str, conv_key: str, us
         except Exception:
             reply_text = "ありがとうございます。条件をもう少し教えてください（エリア/予算/間取り/入居時期など）。"
 
-        # Next goal heuristic (cheap, stable)
-        slots = get_customer_slots(shop_id, conv_key)
-        goal = "要件確認"
-        if stable_level >= 9 or ("内見" in user_text):
-            goal = "内見/日程"
-        else:
-            # missing slots → ask them
-            missing = [k for k in ["budget", "area", "move_in", "layout"] if not slots.get(k)]
-            if missing:
-                goal = "要件確認"
-            else:
-                goal = "内見/日程"
-
-        upsert_customer_state(shop_id, conv_key, user_id, user_text, raw_level, stable_level, conf, intent, goal)
-        save_message(shop_id, conv_key, "assistant", reply_text, raw_level, stable_level, conf, intent, goal)
+        # ✅ next_goal is DB truth from LLM
+        upsert_customer_state(shop_id, conv_key, user_id, user_text, raw_level, stable_level, conf, intent, next_goal)
+        save_message(shop_id, conv_key, "assistant", reply_text, raw_level, stable_level, conf, intent, next_goal)
 
         flags = get_customer_flags(shop_id, conv_key)
-        need, reason = compute_need_reply(goal, flags, assistant_text=reply_text)
+        need, reason = compute_need_reply(next_goal, flags, assistant_text=reply_text)
         set_need_reply(shop_id, conv_key, need, reason)
 
         if is_inactive(shop_id, conv_key):
@@ -1742,7 +1663,6 @@ async def line_webhook(
         except Exception as e:
             print("[DB] ensure_customer_row:", repr(e))
 
-        # user replied -> clear need_reply + attribution
         try:
             set_need_reply(SHOP_ID, conv_key, False, "user_replied")
         except Exception:
@@ -1758,13 +1678,11 @@ async def line_webhook(
         except Exception:
             pass
 
-        # Save inbound message
         try:
             save_message(SHOP_ID, conv_key, "user", user_text)
         except Exception as e:
             print("[DB] save user:", repr(e))
 
-        # Update preferred hour learning (Phase 3)
         try:
             update_customer_pref_hour(SHOP_ID, conv_key)
         except Exception as e:
@@ -1775,7 +1693,6 @@ async def line_webhook(
         except Exception:
             pass
 
-        # Slot merge
         try:
             prev = get_customer_slots(SHOP_ID, conv_key)
             merged = merge_slots(prev, extract_slots(user_text))
@@ -1784,7 +1701,6 @@ async def line_webhook(
         except Exception:
             pass
 
-        # Visit change
         if is_visit_change_request(user_text):
             set_visit_slot(SHOP_ID, conv_key, "REQUEST_CHANGE")
             try:
@@ -1794,7 +1710,6 @@ async def line_webhook(
             await reply_line(reply_token, "承知しました。ご希望の曜日や時間帯（例：平日夜/土日午後など）を教えてください。")
             continue
 
-        # Visit slot selection
         sel = parse_slot_selection(user_text)
         if sel is not None:
             slots = upcoming_visit_slots_jst(VISIT_DAYS_AHEAD)
@@ -1810,7 +1725,6 @@ async def line_webhook(
                 await reply_line(reply_token, "番号は 1〜6 の範囲でお願いします。")
             continue
 
-        # optout/cancel immediate
         for pat in OPTOUT_PATTERNS:
             if re.search(pat, user_text, flags=re.IGNORECASE):
                 mark_opt_out(SHOP_ID, conv_key, user_id)
@@ -1823,7 +1737,6 @@ async def line_webhook(
                 await reply_line(reply_token, "承知しました。必要になったらまたいつでもご連絡ください。")
                 return {"ok": True}
 
-        # fast reply
         fast_reply_text: Optional[str] = None
         try:
             fast_reply_text = await asyncio.wait_for(
@@ -1844,7 +1757,7 @@ async def line_webhook(
 
 
 # ============================================================
-# Dashboard API
+# Dashboard APIs
 # ============================================================
 
 @app.get("/api/hot")
@@ -1957,7 +1870,6 @@ async def api_hot(
             for r in rows
         ])
 
-    # ab_stats
     rows = db_fetchall(
         """
         SELECT
@@ -2039,16 +1951,12 @@ async def dashboard(
   th{{color:rgba(255,255,255,.7);text-align:left}}
   .mono{{font-family:ui-monospace,Menlo,Monaco,Consolas,monospace}}
   a{{color:#8ab4f8}}
-  input{{padding:8px;border-radius:10px;border:1px solid rgba(255,255,255,.18);background:rgba(255,255,255,.06);color:#fff}}
-  button{{padding:8px 10px;border-radius:10px;border:1px solid rgba(255,255,255,.18);background:rgba(255,255,255,.06);color:#fff;cursor:pointer}}
 </style>
 </head>
 <body>
   <div class="row">
     <div class="card"><b>SHOP</b> <span class="mono">{shop_id}</span></div>
     <div class="card"><b>min_level</b> {min_level} / <b>limit</b> {limit} / <b>refresh</b> {refresh}s</div>
-    <div class="card"><a href="/dashboard?shop_id={shop_id}&min_level={min_level}&limit={limit}&refresh={refresh}&key={key_q}">reload</a></div>
-    <div class="card"><a href="/api/hot?view=followups&limit=80&shop_id={shop_id}&key={key_q}">followups json</a></div>
   </div>
 
   <div class="row" style="margin-top:12px;">
@@ -2096,7 +2004,6 @@ const REFRESH = {refresh};
 
 function esc(s){{return (s??"").toString().replace(/[&<>"]/g,c=>({{"&":"&amp;","<":"&lt;",">":"&gt;","\\"":"&quot;"}}[c]))}}
 function fmt(iso){{ if(!iso) return "-"; try{{return new Date(iso).toLocaleString()}}catch(e){{return iso}} }}
-
 async function fetchJson(url){{ const r=await fetch(url); return await r.json(); }}
 
 let chart=null;
@@ -2105,9 +2012,7 @@ async function renderDist(){{
   const labels = ["1","2","3","4","5","6","7","8","9","10"];
   const data = labels.map(k=>Number(dist[k]||0));
   const ctx=document.getElementById("chart");
-  if(chart){{
-    chart.data.labels=labels; chart.data.datasets[0].data=data; chart.update(); return;
-  }}
+  if(chart){{ chart.data.labels=labels; chart.data.datasets[0].data=data; chart.update(); return; }}
   chart=new Chart(ctx,{{type:'bar',data:{{labels,datasets:[{{label:'count',data,borderWidth:1}}]}},options:{{responsive:true}}}});
 }}
 
@@ -2158,7 +2063,7 @@ if(REFRESH>0) setInterval(()=>tick().catch(console.error), REFRESH*1000);
 
 
 # ============================================================
-# Customer detail API & page
+# Customer detail
 # ============================================================
 
 @app.get("/api/customer/detail")
@@ -2331,7 +2236,7 @@ async function fetchJson(url){{const r=await fetch(url); return await r.json();}
   document.getElementById("msgs").innerHTML = msgs.map(m=>{
     const cls = (m.role==="user")?"u":"a";
     return `<div class="msg">
-      <div class="mono ${{cls}}">${{esc(m.role)}} / ${{esc(m.ts||"")}} / Lv:${{esc(m.temp_level_stable||"-")}} / intent:${{esc(m.intent||"-")}}</div>
+      <div class="mono ${{cls}}">${{esc(m.role)}} / ${{esc(m.ts||"")}} / Lv:${{esc(m.temp_level_stable||"-")}} / intent:${{esc(m.intent||"-")}} / goal:${{esc(m.next_goal||"-")}}</div>
       <pre>${{esc(m.content||"")}}</pre>
     </div>`;
   }).join("") || "no messages";
@@ -2353,7 +2258,7 @@ async function fetchJson(url){{const r=await fetch(url); return await r.json();}
 
 
 # ============================================================
-# Admin actions
+# Admin actions (minimal)
 # ============================================================
 
 def fetch_customer_for_action(shop_id: str, conv_key: str) -> Optional[Dict[str, Any]]:
@@ -2429,10 +2334,6 @@ async def api_customer_reset_need_reply(
     return {"ok": True}
 
 
-# ============================================================
-# Manual followup now (uses LLM first, fallback)
-# ============================================================
-
 @app.post("/api/customer/send_followup_now")
 async def api_customer_send_followup_now(
     _: None = Depends(require_admin_key),
@@ -2455,22 +2356,25 @@ async def api_customer_send_followup_now(
         return {"ok": True, "sent": False, "reason": "no_user_id"}
 
     variant = pick_ab_variant(conv_key)
+
     msg = None
     if stage == 1:
         msg = await generate_followup_message_llm(shop_id, conv_key, stage=1, variant=variant, customer=c)
         if not msg:
             msg = build_followup_template_ab_fallback(variant, c["next_goal"], c["last_user_text"], c["level"])
+        mode = "llm" if msg and FOLLOWUP_USE_LLM else "template"
     else:
         msg = await generate_followup_message_llm(shop_id, conv_key, stage=2, variant=variant, customer=c)
         if not msg:
             msg = build_second_touch_message_fallback(c["next_goal"])
+        mode = "llm" if msg and FOLLOWUP_USE_LLM else "template"
 
     try:
         await push_line(user_id, msg)
-        save_followup_log(shop_id, conv_key, user_id, msg, "manual", "sent", None, variant, stage, send_hour_jst=now_jst().hour)
+        save_followup_log(shop_id, conv_key, user_id, msg, mode, "sent", None, variant, stage, send_hour_jst=now_jst().hour)
         return {"ok": True, "sent": True, "stage": stage, "variant": variant}
     except Exception as e:
-        save_followup_log(shop_id, conv_key, user_id, msg, "manual", "failed", str(e)[:200], variant, stage, send_hour_jst=now_jst().hour)
+        save_followup_log(shop_id, conv_key, user_id, msg, mode, "failed", str(e)[:200], variant, stage, send_hour_jst=now_jst().hour)
         return {"ok": True, "sent": False, "error": str(e)[:200]}
 
 
@@ -2486,16 +2390,11 @@ async def job_maintenance(_: None = Depends(require_admin_key)):
 
 @app.post("/jobs/followup")
 async def job_followup(_: None = Depends(require_admin_key)):
-    """
-    Phase 2: LLM followup message (A/B)
-    Phase 3: per-user best send hour (pref_hour_jst) gating
-    """
     if not FOLLOWUP_ENABLED:
         return {"ok": True, "enabled": False, "reason": "FOLLOWUP_ENABLED!=1"}
 
     maintenance_update_statuses(SHOP_ID)
 
-    # global window
     if not is_within_jst_window():
         return {"ok": True, "enabled": True, "skipped": True, "reason": "out_of_time_window"}
 
@@ -2517,7 +2416,6 @@ async def job_followup(_: None = Depends(require_admin_key)):
     now_hour = nowj.hour
 
     def should_send_now(updated_at: Optional[datetime], pref_hour: Optional[int]) -> bool:
-        # if too old, send anyway within global window
         if updated_at:
             age_h = (utcnow() - updated_at).total_seconds() / 3600.0
             if age_h >= max(1, FOLLOWUP_FORCE_SEND_AFTER_HOURS):
@@ -2525,7 +2423,6 @@ async def job_followup(_: None = Depends(require_admin_key)):
         target = choose_send_hour_jst(pref_hour)
         return within_hour_band(now_hour, target, FOLLOWUP_TIME_MATCH_HOURS)
 
-    # stage1
     for c in stage1:
         conv_key = c["conv_key"]
         user_id = c["user_id"]
@@ -2539,7 +2436,6 @@ async def job_followup(_: None = Depends(require_admin_key)):
             continue
 
         variant = pick_ab_variant(conv_key)
-
         msg = await generate_followup_message_llm(SHOP_ID, conv_key, stage=1, variant=variant, customer=c)
         mode = "llm"
         if not msg:
@@ -2554,7 +2450,6 @@ async def job_followup(_: None = Depends(require_admin_key)):
             save_followup_log(SHOP_ID, conv_key, user_id, msg, mode, "failed", str(e)[:200], variant, 1, send_hour_jst=now_hour)
             failed += 1
 
-    # stage2
     for c in stage2:
         conv_key = c["conv_key"]
         user_id = c["user_id"]
@@ -2568,7 +2463,6 @@ async def job_followup(_: None = Depends(require_admin_key)):
             continue
 
         variant = pick_ab_variant(conv_key)
-
         msg = await generate_followup_message_llm(SHOP_ID, conv_key, stage=2, variant=variant, customer=c)
         mode = "llm"
         if not msg:
