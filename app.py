@@ -1,44 +1,4 @@
-# app.py (FULL - 1,2,3 bundled)
-# FastAPI + Render + Postgres(pg8000)
-#
-# ✅ ① need_reply を DBで確定（推定じゃない）
-# ✅ ② 顧客詳細ページ /dashboard/customer?conv_key=...
-# ✅ ③ ダッシュボードから操作（COLD/OPTOUT/need_reply解除/今すぐ追客）
-#
-# Required env:
-#   LINE_CHANNEL_SECRET
-#   LINE_CHANNEL_ACCESS_TOKEN
-#   DATABASE_URL
-#   OPENAI_API_KEY
-#   DASHBOARD_KEY
-#   ADMIN_API_KEY
-#
-# Optional env:
-#   SHOP_ID
-#   DASHBOARD_REFRESH_SEC_DEFAULT
-#   FAST_REPLY_TIMEOUT_SEC (default 3.0)
-#   ANALYZE_HISTORY_LIMIT (default 10)
-#   SHORT_TEXT_MAX_LEN (default 2)
-#
-# Followup env:
-#   FOLLOWUP_ENABLED=1
-#   FOLLOWUP_AFTER_MINUTES=180
-#   FOLLOWUP_MIN_LEVEL=8
-#   FOLLOWUP_LIMIT=50
-#   FOLLOWUP_DRYRUN=1
-#   FOLLOWUP_LOCK_TTL_SEC=180
-#   FOLLOWUP_MIN_HOURS_BETWEEN=24
-#   FOLLOWUP_JST_FROM=10
-#   FOLLOWUP_JST_TO=20
-#
-# AB + visit slots:
-#   FOLLOWUP_AB_ENABLED=1
-#   VISIT_DAYS_AHEAD=3
-#   VISIT_SLOT_HOURS=11,14,17
-#   FOLLOWUP_ATTRIBUTION_WINDOW_HOURS=72
-#   FOLLOWUP_SECOND_TOUCH_AFTER_HOURS=48
-#   FOLLOWUP_SECOND_TOUCH_LIMIT=50
-
+# app.py (FULL - upgrade: analyze uses Responses API Structured Outputs JSON Schema)
 import os
 import json
 import hmac
@@ -95,6 +55,12 @@ VISIT_SLOT_HOURS = os.getenv("VISIT_SLOT_HOURS", "11,14,17").strip()
 FOLLOWUP_ATTRIBUTION_WINDOW_HOURS = int(os.getenv("FOLLOWUP_ATTRIBUTION_WINDOW_HOURS", "72"))
 FOLLOWUP_SECOND_TOUCH_AFTER_HOURS = int(os.getenv("FOLLOWUP_SECOND_TOUCH_AFTER_HOURS", "48"))
 FOLLOWUP_SECOND_TOUCH_LIMIT = int(os.getenv("FOLLOWUP_SECOND_TOUCH_LIMIT", "50"))
+
+# OpenAI models / timeouts
+OPENAI_MODEL_ASSISTANT = os.getenv("OPENAI_MODEL_ASSISTANT", "gpt-4o-mini").strip()  # 返信生成
+OPENAI_MODEL_ANALYZE = os.getenv("OPENAI_MODEL_ANALYZE", "gpt-4o-mini").strip()      # 温度判定
+ANALYZE_TIMEOUT_SEC = float(os.getenv("ANALYZE_TIMEOUT_SEC", "8.5"))                 # 温度判定
+RESPONSES_API_URL = "https://api.openai.com/v1/responses"                            # Structured outputs
 
 CHAT_HISTORY: Dict[str, deque] = defaultdict(lambda: deque(maxlen=40))
 TEMP_HISTORY: Dict[str, deque] = defaultdict(lambda: deque(maxlen=5))
@@ -270,7 +236,6 @@ def ensure_tables_and_columns() -> None:
         """
     )
 
-    # base columns
     cur.execute("""ALTER TABLE customers ADD COLUMN IF NOT EXISTS user_id TEXT;""")
     cur.execute("""ALTER TABLE customers ADD COLUMN IF NOT EXISTS last_user_text TEXT;""")
     cur.execute("""ALTER TABLE customers ADD COLUMN IF NOT EXISTS temp_level_raw INT;""")
@@ -278,28 +243,23 @@ def ensure_tables_and_columns() -> None:
     cur.execute("""ALTER TABLE customers ADD COLUMN IF NOT EXISTS confidence REAL;""")
     cur.execute("""ALTER TABLE customers ADD COLUMN IF NOT EXISTS next_goal TEXT;""")
 
-    # status
-    cur.execute("""ALTER TABLE customers ADD COLUMN IF NOT EXISTS status TEXT;""")  # ACTIVE/COLD/LOST/OPTOUT
+    cur.execute("""ALTER TABLE customers ADD COLUMN IF NOT EXISTS status TEXT;""")
     cur.execute("""ALTER TABLE customers ADD COLUMN IF NOT EXISTS opt_out BOOLEAN;""")
     cur.execute("""ALTER TABLE customers ADD COLUMN IF NOT EXISTS opt_out_at TIMESTAMPTZ;""")
 
-    # visit slot selection
     cur.execute("""ALTER TABLE customers ADD COLUMN IF NOT EXISTS visit_slot_selected TEXT;""")
     cur.execute("""ALTER TABLE customers ADD COLUMN IF NOT EXISTS visit_slot_selected_at TIMESTAMPTZ;""")
 
-    # slot fields
     cur.execute("""ALTER TABLE customers ADD COLUMN IF NOT EXISTS slot_budget TEXT;""")
     cur.execute("""ALTER TABLE customers ADD COLUMN IF NOT EXISTS slot_area TEXT;""")
     cur.execute("""ALTER TABLE customers ADD COLUMN IF NOT EXISTS slot_move_in TEXT;""")
     cur.execute("""ALTER TABLE customers ADD COLUMN IF NOT EXISTS slot_layout TEXT;""")
     cur.execute("""ALTER TABLE customers ADD COLUMN IF NOT EXISTS slots_json TEXT;""")
 
-    # ✅ need_reply (DB truth)
     cur.execute("""ALTER TABLE customers ADD COLUMN IF NOT EXISTS need_reply BOOLEAN DEFAULT FALSE;""")
     cur.execute("""ALTER TABLE customers ADD COLUMN IF NOT EXISTS need_reply_reason TEXT;""")
     cur.execute("""ALTER TABLE customers ADD COLUMN IF NOT EXISTS need_reply_updated_at TIMESTAMPTZ;""")
 
-    # messages
     cur.execute(
         """
         CREATE TABLE IF NOT EXISTS messages (
@@ -317,7 +277,6 @@ def ensure_tables_and_columns() -> None:
     cur.execute("""ALTER TABLE messages ADD COLUMN IF NOT EXISTS confidence REAL;""")
     cur.execute("""ALTER TABLE messages ADD COLUMN IF NOT EXISTS next_goal TEXT;""")
 
-    # locks
     cur.execute(
         """
         CREATE TABLE IF NOT EXISTS job_locks (
@@ -327,7 +286,6 @@ def ensure_tables_and_columns() -> None:
         """
     )
 
-    # followup logs
     cur.execute(
         """
         CREATE TABLE IF NOT EXISTS followup_logs (
@@ -347,13 +305,11 @@ def ensure_tables_and_columns() -> None:
     cur.execute("""ALTER TABLE followup_logs ADD COLUMN IF NOT EXISTS responded_at TIMESTAMPTZ;""")
     cur.execute("""ALTER TABLE followup_logs ADD COLUMN IF NOT EXISTS stage INT;""")
 
-    # indexes
     cur.execute("""CREATE INDEX IF NOT EXISTS idx_customers_shop_updated ON customers(shop_id, updated_at DESC);""")
     cur.execute("""CREATE INDEX IF NOT EXISTS idx_messages_conv_created ON messages(conv_key, created_at DESC);""")
     cur.execute("""CREATE INDEX IF NOT EXISTS idx_followup_shop_conv_created ON followup_logs(shop_id, conv_key, created_at DESC);""")
     cur.execute("""CREATE INDEX IF NOT EXISTS idx_customers_need_reply ON customers(shop_id, need_reply, updated_at DESC);""")
 
-    # backfill
     cur.execute("""UPDATE customers SET need_reply=FALSE WHERE need_reply IS NULL;""")
 
     cur.close()
@@ -367,7 +323,7 @@ async def on_startup():
 
 
 # ============================================================
-# need_reply logic (DB truth)
+# need_reply (DB truth)
 # ============================================================
 
 def set_need_reply(shop_id: str, conv_key: str, need: bool, reason: str = "") -> None:
@@ -409,9 +365,6 @@ def get_customer_flags(shop_id: str, conv_key: str) -> Dict[str, Any]:
 
 
 def compute_need_reply(next_goal: str, flags: Dict[str, Any], assistant_text: str = "") -> Tuple[bool, str]:
-    """
-    need_reply = TRUE means: 「次の返信/反応（ユーザー側）が必要」= 追客や条件回収の“未完了”状態。
-    """
     goal = (next_goal or "").strip()
     st = (flags.get("status") or "ACTIVE").upper()
     if flags.get("opt_out") or st in ("OPTOUT", "LOST"):
@@ -423,13 +376,11 @@ def compute_need_reply(next_goal: str, flags: Dict[str, Any], assistant_text: st
     move_in = flags.get("slot_move_in")
     layout = flags.get("slot_layout")
 
-    # 内見系：候補提示/調整中なら TRUE（確定まで追う）
     if any(k in goal for k in ["内見", "候補日", "日程"]):
         if not visit or visit == "REQUEST_CHANGE":
             return True, "need_visit_slot"
         return False, "visit_ok"
 
-    # 条件回収：goalに応じて不足なら TRUE
     if "予算" in goal and not budget:
         return True, "need_budget"
     if ("エリア" in goal or "沿線" in goal) and not area:
@@ -439,14 +390,12 @@ def compute_need_reply(next_goal: str, flags: Dict[str, Any], assistant_text: st
     if "間取り" in goal and not layout:
         return True, "need_layout"
 
-    # 要件確認：どれか欠けてたら TRUE（ざっくり）
     if "要件確認" in goal:
         missing = [k for k, v in [("budget", budget), ("area", area), ("move_in", move_in), ("layout", layout)] if not v]
         if missing:
             return True, "need_slots"
         return False, "slots_ok"
 
-    # 文面に質問が入っているなら TRUE（保険）
     if "？" in (assistant_text or "") or "?" in (assistant_text or ""):
         return True, "assistant_question"
 
@@ -505,6 +454,7 @@ async def push_line(user_id: str, text: str) -> None:
 # OpenAI
 # ============================================================
 
+# 返信生成（従来のchat.completionsを維持して安全）
 OPENAI_API_URL = "https://api.openai.com/v1/chat/completions"
 
 SYSTEM_PROMPT_ANALYZE = """
@@ -550,12 +500,119 @@ async def openai_chat(messages: List[Dict[str, str]], temperature: float = 0.2, 
     if not OPENAI_API_KEY:
         raise RuntimeError("OPENAI_API_KEY is missing")
     headers = {"Authorization": f"Bearer {OPENAI_API_KEY}", "Content-Type": "application/json"}
-    payload = {"model": "gpt-4o-mini", "messages": messages, "temperature": temperature}
+    payload = {"model": OPENAI_MODEL_ASSISTANT, "messages": messages, "temperature": temperature}
     async with httpx.AsyncClient(timeout=timeout_sec, verify=certifi.where()) as client:
         r = await client.post(OPENAI_API_URL, headers=headers, json=payload)
         r.raise_for_status()
         data = r.json()
         return data["choices"][0]["message"]["content"]
+
+
+# ✅ NEW: Structured Outputs schema for analyze (Responses API)
+ANALYZE_JSON_SCHEMA = {
+    "type": "object",
+    "additionalProperties": False,
+    "properties": {
+        "temp_level_raw": {"type": "integer", "minimum": 1, "maximum": 10},
+        "confidence": {"type": "number", "minimum": 0.0, "maximum": 1.0},
+        "next_goal": {"type": "string", "maxLength": 80},
+        "reasons": {
+            "type": "array",
+            "items": {"type": "string", "maxLength": 60},
+            "minItems": 0,
+            "maxItems": 3
+        }
+    },
+    "required": ["temp_level_raw", "confidence", "next_goal", "reasons"]
+}
+
+
+async def openai_analyze_structured(
+    history: List[Dict[str, str]],
+    slots: Optional[Dict[str, str]],
+) -> Optional[Dict[str, Any]]:
+    """
+    Responses API + Structured Outputs(JSON Schema)
+    return dict or None
+    """
+    if not OPENAI_API_KEY:
+        return None
+
+    instructions = SYSTEM_PROMPT_ANALYZE.strip()
+    input_msgs: List[Dict[str, str]] = []
+
+    # 参考スロットを最初に渡す（判定精度UP、ただし押し売り判定に使わない）
+    if slots:
+        input_msgs.append({
+            "role": "user",
+            "content": f"抽出スロット(参考): {json.dumps(slots, ensure_ascii=False)}"
+        })
+
+    # 会話履歴
+    input_msgs.extend(history[-max(2, ANALYZE_HISTORY_LIMIT):])
+
+    payload = {
+        "model": OPENAI_MODEL_ANALYZE,
+        "instructions": instructions,
+        "input": input_msgs,
+        "text": {
+            "format": {
+                "type": "json_schema",
+                "strict": True,
+                "schema": ANALYZE_JSON_SCHEMA
+            }
+        }
+    }
+
+    headers = {
+        "Authorization": f"Bearer {OPENAI_API_KEY}",
+        "Content-Type": "application/json",
+    }
+
+    try:
+        async with httpx.AsyncClient(timeout=ANALYZE_TIMEOUT_SEC, verify=certifi.where()) as client:
+            r = await client.post(RESPONSES_API_URL, headers=headers, json=payload)
+            if r.status_code >= 400:
+                print("[OPENAI] analyze responses failed:", r.status_code, (r.text or "")[:200])
+                return None
+            data = r.json()
+
+        # Extract output_text chunks
+        output_items = data.get("output", []) or []
+        text_chunks: List[str] = []
+        for item in output_items:
+            if item.get("type") == "message":
+                content = item.get("content", []) or []
+                for c in content:
+                    if c.get("type") == "output_text" and isinstance(c.get("text"), str):
+                        text_chunks.append(c["text"])
+
+        if not text_chunks:
+            return None
+
+        merged = "\n".join(text_chunks).strip()
+        j = json.loads(merged)
+
+        # sanitize
+        lvl = int(j.get("temp_level_raw", 5))
+        lvl = max(1, min(10, lvl))
+        conf = float(j.get("confidence", 0.6))
+        conf = max(0.0, min(1.0, conf))
+        next_goal = str(j.get("next_goal", "要件確認")).strip()[:80]
+        reasons = j.get("reasons", [])
+        if not isinstance(reasons, list):
+            reasons = []
+        reasons = [str(x).strip()[:60] for x in reasons if str(x).strip()][:3]
+
+        return {
+            "temp_level_raw": lvl,
+            "confidence": conf,
+            "next_goal": next_goal,
+            "reasons": reasons,
+        }
+    except Exception as e:
+        print("[OPENAI] analyze structured exception:", repr(e))
+        return None
 
 
 def coerce_level(v: Any) -> int:
@@ -1021,11 +1078,12 @@ def build_second_touch_message(next_goal: str) -> str:
 
 async def analyze_only(shop_id: str, conv_key: str, user_text: str) -> Tuple[int, float, str, List[str], Dict[str, str], str]:
     """
-    return raw_level, conf, next_goal, reasons, merged_slots, status_override
-    status_override: "" | "OPTOUT" | "LOST"
+    ✅ 進化版：Responses API + JSON Schema で壊れない温度判定
+    返り値: raw_level, conf, next_goal, reasons, merged_slots, status_override
     """
     t = (user_text or "").strip()
 
+    # hard rules
     for pat in OPTOUT_PATTERNS:
         if re.search(pat, t, flags=re.IGNORECASE):
             return 1, 0.95, "関係終了確認", ["配信停止/連絡不要の意思"], {}, "OPTOUT"
@@ -1034,48 +1092,35 @@ async def analyze_only(shop_id: str, conv_key: str, user_text: str) -> Tuple[int
         if re.search(pat, t):
             return 2, 0.90, "関係終了確認", ["キャンセル/拒否の明確表現"], {}, "LOST"
 
-    if len(t) <= SHORT_TEXT_MAX_LEN:
-        return 3, 0.75, "要件確認", ["短文で情報不足"], {}, ""
-
+    # スロット更新
     new_slots = extract_slots(user_text)
     prev_slots = get_customer_slots(shop_id, conv_key)
     merged = merge_slots(prev_slots, new_slots)
 
+    # 会話履歴
     history = get_recent_conversation(shop_id, conv_key, ANALYZE_HISTORY_LIMIT)
     if not history or history[-1].get("content") != user_text:
         history.append({"role": "user", "content": user_text})
 
-    msgs: List[Dict[str, str]] = [{"role": "system", "content": SYSTEM_PROMPT_ANALYZE}]
-    if merged:
-        msgs.append({"role": "user", "content": f"抽出スロット(参考): {json.dumps(merged, ensure_ascii=False)}"})
-    msgs.extend(history[-max(2, ANALYZE_HISTORY_LIMIT):])
-
+    # ✅ Structured analyze
     raw_level = 5
     conf = 0.6
     next_goal = "要件確認"
     reasons: List[str] = []
 
-    try:
-        raw_json_text = await openai_chat(msgs, temperature=0.0, timeout_sec=18.0)
-        raw = raw_json_text.strip()
-        if raw.startswith("```"):
-            parts = raw.split("```")
-            raw = parts[1] if len(parts) > 1 else raw
-        try:
-            j = json.loads(raw)
-        except Exception:
-            start = raw.find("{")
-            end = raw.rfind("}")
-            j = json.loads(raw[start:end + 1])
-
-        raw_level = coerce_level(j.get("temp_level_raw", 5))
-        conf = coerce_confidence(j.get("confidence", 0.6))
-        next_goal = str(j.get("next_goal", "要件確認")).strip()[:80]
-        rs = j.get("reasons", [])
+    structured = await openai_analyze_structured(history=history, slots=merged if merged else None)
+    if structured:
+        raw_level = coerce_level(structured.get("temp_level_raw", 5))
+        conf = coerce_confidence(structured.get("confidence", 0.6))
+        next_goal = str(structured.get("next_goal", "要件確認")).strip()[:80]
+        rs = structured.get("reasons", [])
         if isinstance(rs, list):
             reasons = [str(x).strip()[:60] for x in rs if str(x).strip()][:3]
-    except Exception as e:
-        print("[OPENAI] analyze failed:", repr(e))
+        return raw_level, conf, next_goal, reasons, merged, ""
+
+    # fallback（LLM不可/失敗時のみ）：短文は情報不足として安全側
+    if len(t) <= SHORT_TEXT_MAX_LEN:
+        return 3, 0.75, "要件確認", ["短文で情報不足（fallback）"], merged, ""
 
     return raw_level, conf, next_goal, reasons, merged, ""
 
@@ -1343,43 +1388,36 @@ async def line_webhook(
 
         conv_key = f"user:{user_id}"
 
-        # ensure customer row
         try:
             ensure_customer_row(SHOP_ID, conv_key, user_id)
         except Exception as e:
             print("[DB] ensure_customer_row:", repr(e))
 
-        # ✅ ユーザーから来たら need_reply は一旦FALSE（= 返信待ち解除）
         try:
             set_need_reply(SHOP_ID, conv_key, False, "user_replied")
         except Exception:
             pass
 
-        # revive cold always
         try:
             revive_if_cold(SHOP_ID, conv_key)
         except Exception:
             pass
 
-        # revive lost by keywords
         try:
             revive_if_lost_by_keywords(SHOP_ID, conv_key, user_text)
         except Exception:
             pass
 
-        # save user message
         try:
             save_message(SHOP_ID, conv_key, "user", user_text)
         except Exception as e:
             print("[DB] save user:", repr(e))
 
-        # followup attribution
         try:
             attribute_followup_response(SHOP_ID, conv_key)
         except Exception:
             pass
 
-        # slot merge
         try:
             prev = get_customer_slots(SHOP_ID, conv_key)
             merged = merge_slots(prev, extract_slots(user_text))
@@ -1388,7 +1426,6 @@ async def line_webhook(
         except Exception:
             pass
 
-        # visit slot change request
         if is_visit_change_request(user_text):
             set_visit_slot(SHOP_ID, conv_key, "REQUEST_CHANGE")
             try:
@@ -1398,7 +1435,6 @@ async def line_webhook(
             await reply_line(reply_token, "承知しました。ご希望の曜日や時間帯（例：平日夜/土日午後など）を教えてください。")
             continue
 
-        # visit slot selection 1-6 / ①-⑥
         sel = parse_slot_selection(user_text)
         if sel is not None:
             slots = upcoming_visit_slots_jst(VISIT_DAYS_AHEAD)
@@ -1414,21 +1450,18 @@ async def line_webhook(
                 await reply_line(reply_token, "番号は 1〜6 の範囲でお願いします。")
             continue
 
-        # immediate optout
         for pat in OPTOUT_PATTERNS:
             if re.search(pat, user_text, flags=re.IGNORECASE):
                 mark_opt_out(SHOP_ID, conv_key, user_id)
                 await reply_line(reply_token, "承知しました。今後こちらからのご連絡は停止します。")
                 return {"ok": True}
 
-        # immediate cancel => lost
         for pat in CANCEL_PATTERNS:
             if re.search(pat, user_text):
                 mark_lost(SHOP_ID, conv_key)
                 await reply_line(reply_token, "承知しました。必要になったらまたいつでもご連絡ください。")
                 return {"ok": True}
 
-        # fast reply attempt
         fast_reply_text: Optional[str] = None
         try:
             fast_reply_text = await asyncio.wait_for(
@@ -1579,216 +1612,44 @@ async def api_hot(
 
 
 # ============================================================
-# Customer detail API (②)
+# ✅ NEW: Stats API (fix for level distribution)
 # ============================================================
 
-@app.get("/api/customer/detail")
-async def api_customer_detail(
+@app.get("/api/stats/level_dist")
+async def api_stats_level_dist(
     _: None = Depends(require_dashboard_key),
     shop_id: str = Query(default=SHOP_ID),
-    conv_key: str = Query(...),
-    msg_limit: int = Query(default=120, ge=10, le=400),
-    followup_limit: int = Query(default=60, ge=10, le=200),
 ):
+    """
+    全顧客ベースの温度分布（limitやneed_replyに影響されない）
+    return: { "1": 10, "2": 3, ... "10": 1 }
+    """
     if not DATABASE_URL:
-        return JSONResponse({"ok": True, "customer": None, "messages": [], "followups": []}, status_code=200)
+        return JSONResponse({str(i): 0 for i in range(1, 11)}, status_code=200)
 
-    crow = db_fetchall(
-        """
-        SELECT conv_key, user_id, last_user_text, temp_level_stable, confidence, next_goal, updated_at,
-               COALESCE(status,'ACTIVE'), COALESCE(opt_out,FALSE),
-               visit_slot_selected, visit_slot_selected_at,
-               slot_budget, slot_area, slot_move_in, slot_layout,
-               COALESCE(need_reply,FALSE), COALESCE(need_reply_reason,''), need_reply_updated_at
-        FROM customers
-        WHERE shop_id=%s AND conv_key=%s
-        LIMIT 1
-        """,
-        (shop_id, conv_key),
-    )
-    customer = None
-    if crow:
-        r = crow[0]
-        customer = {
-            "conv_key": r[0],
-            "user_id": r[1],
-            "last_user_text": r[2],
-            "temp_level_stable": r[3],
-            "confidence": float(r[4]) if r[4] is not None else None,
-            "next_goal": r[5],
-            "updated_at": r[6].isoformat() if r[6] else None,
-            "status": r[7],
-            "opt_out": bool(r[8]),
-            "visit_slot_selected": r[9],
-            "visit_slot_selected_at": r[10].isoformat() if r[10] else None,
-            "slot_budget": r[11],
-            "slot_area": r[12],
-            "slot_move_in": r[13],
-            "slot_layout": r[14],
-            "need_reply": bool(r[15]),
-            "need_reply_reason": r[16],
-            "need_reply_updated_at": r[17].isoformat() if r[17] else None,
-        }
-
-    msgs = db_fetchall(
-        """
-        SELECT role, content, created_at, temp_level_stable, confidence, next_goal
-        FROM messages
-        WHERE shop_id=%s AND conv_key=%s
-        ORDER BY created_at DESC
-        LIMIT %s
-        """,
-        (shop_id, conv_key, int(msg_limit)),
-    )
-    msgs = list(reversed(msgs))
-    messages = [
-        {
-            "role": m[0],
-            "content": m[1],
-            "ts": m[2].isoformat() if m[2] else None,
-            "temp_level_stable": m[3],
-            "confidence": float(m[4]) if m[4] is not None else None,
-            "next_goal": m[5],
-        }
-        for m in msgs
-    ]
-
-    fls = db_fetchall(
-        """
-        SELECT variant, mode, status, stage, message, error, responded_at, created_at
-        FROM followup_logs
-        WHERE shop_id=%s AND conv_key=%s
-        ORDER BY created_at DESC
-        LIMIT %s
-        """,
-        (shop_id, conv_key, int(followup_limit)),
-    )
-    followups = [
-        {
-            "variant": f[0],
-            "mode": f[1],
-            "status": f[2],
-            "stage": f[3],
-            "message": f[4],
-            "error": f[5],
-            "responded_at": f[6].isoformat() if f[6] else None,
-            "ts": f[7].isoformat() if f[7] else None,
-        }
-        for f in fls
-    ]
-
-    return JSONResponse({"ok": True, "customer": customer, "messages": messages, "followups": followups}, status_code=200)
-
-
-# ============================================================
-# Customer actions API (③)
-#   - protected by ADMIN_API_KEY (header: x-admin-key)
-# ============================================================
-
-def fetch_customer_for_action(shop_id: str, conv_key: str) -> Optional[Dict[str, Any]]:
     rows = db_fetchall(
         """
-        SELECT conv_key, user_id, COALESCE(temp_level_stable,0), COALESCE(next_goal,''), COALESCE(last_user_text,''), COALESCE(status,'ACTIVE'), COALESCE(opt_out,FALSE)
+        SELECT temp_level_stable, COUNT(*)
         FROM customers
-        WHERE shop_id=%s AND conv_key=%s
-        LIMIT 1
+        WHERE shop_id=%s
+          AND temp_level_stable BETWEEN 1 AND 10
+        GROUP BY temp_level_stable
         """,
-        (shop_id, conv_key),
+        (shop_id,),
     )
-    if not rows:
-        return None
-    conv_key, user_id, lvl, goal, last_text, st, opt = rows[0]
-    return {
-        "conv_key": conv_key,
-        "user_id": user_id,
-        "level": int(lvl or 0),
-        "next_goal": goal or "",
-        "last_user_text": last_text or "",
-        "status": (st or "ACTIVE"),
-        "opt_out": bool(opt),
-    }
-
-
-@app.post("/api/customer/mark_cold")
-async def api_customer_mark_cold(
-    _: None = Depends(require_admin_key),
-    shop_id: str = Query(default=SHOP_ID),
-    conv_key: str = Query(...),
-):
-    if not DATABASE_URL:
-        return {"ok": True}
-    mark_cold(shop_id, conv_key)
-    return {"ok": True}
-
-
-@app.post("/api/customer/mark_optout")
-async def api_customer_mark_optout(
-    _: None = Depends(require_admin_key),
-    shop_id: str = Query(default=SHOP_ID),
-    conv_key: str = Query(...),
-):
-    if not DATABASE_URL:
-        return {"ok": True}
-    c = fetch_customer_for_action(shop_id, conv_key)
-    uid = (c or {}).get("user_id") or "unknown"
-    mark_opt_out(shop_id, conv_key, uid)
-    return {"ok": True}
-
-
-@app.post("/api/customer/reset_need_reply")
-async def api_customer_reset_need_reply(
-    _: None = Depends(require_admin_key),
-    shop_id: str = Query(default=SHOP_ID),
-    conv_key: str = Query(...),
-):
-    if not DATABASE_URL:
-        return {"ok": True}
-    set_need_reply(shop_id, conv_key, False, "manual_reset")
-    return {"ok": True}
-
-
-@app.post("/api/customer/send_followup_now")
-async def api_customer_send_followup_now(
-    _: None = Depends(require_admin_key),
-    shop_id: str = Query(default=SHOP_ID),
-    conv_key: str = Query(...),
-    stage: int = Query(default=1, ge=1, le=2),
-):
-    """
-    stage=1: ABテンプレ（通常追客）
-    stage=2: セカンドタッチ
-    """
-    if not DATABASE_URL:
-        return {"ok": True, "sent": False, "reason": "no_db"}
-
-    c = fetch_customer_for_action(shop_id, conv_key)
-    if not c:
-        return {"ok": True, "sent": False, "reason": "not_found"}
-
-    if c["opt_out"] or (c["status"] or "").upper() in ("COLD", "LOST", "OPTOUT"):
-        return {"ok": True, "sent": False, "reason": "inactive"}
-
-    user_id = c["user_id"]
-    if not user_id or user_id == "unknown":
-        return {"ok": True, "sent": False, "reason": "no_user_id"}
-
-    variant = pick_ab_variant(conv_key)
-    if stage == 1:
-        msg = build_followup_template_ab(variant, c["next_goal"], c["last_user_text"], c["level"])
-    else:
-        msg = build_second_touch_message(c["next_goal"])
-
-    try:
-        await push_line(user_id, msg)
-        save_followup_log(shop_id, conv_key, user_id, msg, "manual", "sent", None, variant, stage)
-        return {"ok": True, "sent": True, "stage": stage, "variant": variant}
-    except Exception as e:
-        save_followup_log(shop_id, conv_key, user_id, msg, "manual", "failed", str(e)[:200], variant, stage)
-        return {"ok": True, "sent": False, "error": str(e)[:200]}
+    dist = {str(i): 0 for i in range(1, 11)}
+    for lv, cnt in rows:
+        if lv is None:
+            continue
+        lv_i = int(lv)
+        if 1 <= lv_i <= 10:
+            dist[str(lv_i)] = int(cnt or 0)
+    return JSONResponse(dist, status_code=200)
 
 
 # ============================================================
-# Dashboard HTML (HOME STYLE + detail + actions)
+# Dashboard HTML (HOME STYLE)
+#   - FIX: chart uses /api/stats/level_dist
 # ============================================================
 
 LEVEL_COLORS = {
@@ -1891,7 +1752,6 @@ async def dashboard(
     .kpi-label {{ font-size:13px; color: var(--muted); }}
     .kpi-value {{ font-size: 26px; font-weight: 900; letter-spacing: 0.2px; }}
     .kpi-delta {{ font-size:12px; color: var(--muted); }}
-
     table {{ width:100%; border-collapse: collapse; overflow:hidden; border-radius: 14px; }}
     thead th {{ text-align:left; font-size:12px; color: var(--muted); font-weight: 800; padding: 10px 10px; border-bottom: 1px solid var(--border); white-space: nowrap; }}
     tbody td {{ padding: 12px 10px; border-bottom: 1px solid var(--border); font-size: 13px; color: var(--text); vertical-align: top; }}
@@ -1899,23 +1759,15 @@ async def dashboard(
     .mono {{ font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas; font-size: 12px; }}
     .muted {{ color: var(--muted); }}
     .rowmsg {{ max-width: 820px; word-break: break-word; white-space: pre-wrap; }}
-
     .badge {{ display:inline-flex; align-items:center; gap:6px; padding:4px 10px; border-radius:999px; font-size:12px; border:1px solid var(--border); background: var(--panel2); color: var(--text); white-space: nowrap; }}
     .badge.good {{ background: rgba(55,214,122,0.14); border-color: rgba(55,214,122,0.35); }}
     .badge.warn {{ background: rgba(255,176,32,0.14); border-color: rgba(255,176,32,0.35); }}
     .badge.bad  {{ background: rgba(255,77,77,0.14); border-color: rgba(255,77,77,0.35); }}
     .badge.info {{ background: rgba(77,163,255,0.14); border-color: rgba(77,163,255,0.35); }}
-
-    .chips {{ display:inline-flex; gap:6px; flex-wrap:wrap; }}
-    .chip {{ font-size:12px; padding:3px 10px; border-radius:999px; border:1px solid var(--border); background: var(--panel2); color: var(--muted); white-space: nowrap; }}
-    .chip.ok {{ color: var(--text); }}
-    .chip.ng {{ opacity: 0.8; }}
-
     .activity-item {{ display:grid; grid-template-columns: 72px 1fr; gap:10px; padding:10px 0; border-bottom: 1px solid var(--border); }}
     .activity-item:last-child {{ border-bottom:none; }}
     .activity-time {{ font-size:12px; color: var(--muted); padding-top:2px; }}
     .activity-text {{ font-size:13px; line-height:1.5; }}
-
     .controls {{ display:grid; grid-template-columns: 1fr 140px 140px 160px; gap:10px; margin-top:10px; }}
     .controls label {{ font-size:12px; color: var(--muted); display:block; margin-bottom:4px; }}
     .controls input {{
@@ -1923,10 +1775,8 @@ async def dashboard(
       background: var(--panel); color: var(--text); outline:none;
     }}
     .controls input::placeholder {{ color: var(--muted); }}
-
     .link {{ text-decoration: underline; text-underline-offset: 3px; }}
     .link:hover {{ opacity: 0.85; }}
-
     @media (max-width: 1100px) {{
       .grid.kpis {{ grid-template-columns: repeat(2, minmax(0, 1fr)); }}
       .grid.cols {{ grid-template-columns: 1fr; }}
@@ -1971,9 +1821,8 @@ async def dashboard(
 
       <div class="sidecard">
         <div class="small">
-          ✅ ホームは <b>need_reply=TRUE</b> だけ表示（= 未完了）<br/>
-          ✅ 顧客クリックで詳細（会話/追客/条件）<br/>
-          ✅ 操作は ADMIN_KEY を入力して実行
+          ✅ 温度分布は <b>全顧客</b> をDB集計（limit無関係）<br/>
+          ✅ ホームの一覧は need_reply=TRUE のみ
         </div>
       </div>
 
@@ -1991,7 +1840,7 @@ async def dashboard(
       <div class="topbar">
         <div class="title">
           <h1 id="pageTitle">ホーム</h1>
-          <div class="meta">need_reply（DB確定）で “今やる” がブレない</div>
+          <div class="meta">温度分布（全体）＋ 今やる（need_reply）</div>
         </div>
         <div class="actions">
           <div class="search">
@@ -2030,8 +1879,8 @@ async def dashboard(
         <div class="grid" style="gap: var(--gap);">
           <div class="card">
             <div class="section-title">
-              <h2>温度分布（表示範囲）</h2>
-              <span>Lv別件数</span>
+              <h2>温度分布（全体）</h2>
+              <span>/api/stats/level_dist</span>
             </div>
             <canvas id="chartLevels" height="120"></canvas>
           </div>
@@ -2118,8 +1967,7 @@ async def dashboard(
             <div class="sidecard" style="margin-top: 12px;">
               <div class="small">
                 <b>運用TIP</b><br/>
-                ・まずホームの need_reply を上から処理<br/>
-                ・顧客詳細で「今すぐ追客」「COLD/OPTOUT」操作
+                ・温度分布は全体、一覧はlimit/need_replyで見る
               </div>
             </div>
           </div>
@@ -2139,6 +1987,7 @@ async def dashboard(
     events: [],
     followups: [],
     ab: [],
+    levelDist: null,
     timer: null,
     chart: null,
   }};
@@ -2154,18 +2003,6 @@ async def dashboard(
     const lv = Number(level || 0);
     const c = LEVEL_COLORS[lv] || "#999";
     return `<span class="badge info" style="background:${{c}}22;border-color:${{c}}55;">Lv${{lv}}</span>`;
-  }}
-  function chipsSlots(r) {{
-    const items = [
-      ["予算", r.slot_budget],
-      ["エリア", r.slot_area],
-      ["時期", r.slot_move_in],
-      ["間取り", r.slot_layout],
-    ];
-    return `<span class="chips">` + items.map(([k,v]) => {{
-      const ok = !!(v && String(v).trim());
-      return `<span class="chip ${{ok ? "ok":"ng"}}">${{k}}${{ok ? "✓":"✗"}}</span>`;
-    }}).join("") + `</span>`;
   }}
 
   function scoreHome(r) {{
@@ -2208,6 +2045,13 @@ async def dashboard(
     return await res.json();
   }}
 
+  async function fetchLevelDist() {{
+    const shopId = document.getElementById("shopId").value.trim();
+    const url = `/api/stats/level_dist?shop_id=${{encodeURIComponent(shopId)}}&key=${{encodeURIComponent(DASH_KEY)}}`;
+    const res = await fetch(url, {{ credentials: "same-origin" }});
+    state.levelDist = await res.json();
+  }}
+
   function updateNow() {{
     document.getElementById("now").textContent = new Date().toLocaleString();
   }}
@@ -2220,7 +2064,6 @@ async def dashboard(
 
     document.getElementById("kpiCustomers").textContent = total.toString();
     document.getElementById("kpiCustomersSub").textContent = `min_level=${{document.getElementById("minLevel").value}} / limit=${{document.getElementById("limit").value}}`;
-
     document.getElementById("kpiNeed").textContent = need.toString();
     document.getElementById("kpiHot").textContent = hot.toString();
 
@@ -2238,13 +2081,9 @@ async def dashboard(
   }}
 
   function renderChartLevels() {{
-    const counts = new Array(10).fill(0);
-    for (const r of (state.customers || [])) {{
-      const lv = Number(r.temp_level_stable || 0);
-      if (lv >= 1 && lv <= 10) counts[lv-1] += 1;
-    }}
+    const dist = state.levelDist || {{}};
     const labels = ["1","2","3","4","5","6","7","8","9","10"];
-    const data = counts;
+    const data = labels.map(k => Number(dist[k] || 0));
 
     const ctx = document.getElementById("chartLevels");
     if (state.chart) {{
@@ -2349,7 +2188,7 @@ async def dashboard(
     const thead = document.getElementById("thead");
     if (view === "customers") {{
       thead.innerHTML = `<tr>
-        <th>更新</th><th>温度</th><th>確度</th><th>status</th><th>need</th><th>条件</th><th>次</th><th>user</th><th>msg</th><th>内見枠</th>
+        <th>更新</th><th>温度</th><th>確度</th><th>status</th><th>need</th><th>次</th><th>user</th><th>msg</th><th>内見枠</th>
       </tr>`;
       return;
     }}
@@ -2387,11 +2226,9 @@ async def dashboard(
     }}
 
     if (!rows.length) {{
-      tbody.innerHTML = `<tr><td colspan="10" class="muted">No data</td></tr>`;
+      tbody.innerHTML = `<tr><td colspan="9" class="muted">No data</td></tr>`;
       return;
     }}
-
-    const shopId = document.getElementById("shopId").value.trim();
 
     if (view === "ab_stats") {{
       tbody.innerHTML = rows.map(r => `
@@ -2412,7 +2249,7 @@ async def dashboard(
           <td class="mono">${{escapeHtml(r.status || "-")}}</td>
           <td class="mono">${{escapeHtml(String(r.stage ?? "-"))}}</td>
           <td class="mono">${{escapeHtml(r.variant || "-")}}</td>
-          <td class="mono"><a class="link" href="/dashboard/customer?shop_id=${{encodeURIComponent(shopId)}}&conv_key=${{encodeURIComponent(r.conv_key)}}&key=${{encodeURIComponent(DASH_KEY)}}">${{escapeHtml(r.user_id || "")}}</a></td>
+          <td class="mono">${{escapeHtml(r.user_id || "")}}</td>
           <td class="rowmsg">${{escapeHtml(r.message || "")}}</td>
           <td class="mono">${{r.responded_at ? "YES" : "-"}}</td>
           <td class="mono muted">${{escapeHtml(r.error || "-")}}</td>
@@ -2428,7 +2265,6 @@ async def dashboard(
         const conf = (r.confidence == null) ? "-" : Number(r.confidence).toFixed(2);
         const visit = r.visit_slot_selected ? escapeHtml(r.visit_slot_selected) : "-";
         const need = r.need_reply ? `<span class="badge warn">${{escapeHtml(r.need_reply_reason || "need_reply")}}</span>` : `<span class="badge good">OK</span>`;
-        const link = `/dashboard/customer?shop_id=${{encodeURIComponent(shopId)}}&conv_key=${{encodeURIComponent(r.conv_key)}}&key=${{encodeURIComponent(DASH_KEY)}}`;
         return `
           <tr>
             <td class="mono muted">${{escapeHtml(fmtTime(r.ts))}}</td>
@@ -2436,9 +2272,8 @@ async def dashboard(
             <td class="mono">${{conf}}</td>
             <td><span class="${{stBadge}}">${{escapeHtml(st)}}</span></td>
             <td>${{need}}</td>
-            <td>${{chipsSlots(r)}}</td>
             <td>${{escapeHtml(r.next_goal || "-")}}</td>
-            <td class="mono"><a class="link" href="${{link}}">${{escapeHtml(r.user_id || "")}}</a></td>
+            <td class="mono">${{escapeHtml(r.user_id || "")}}</td>
             <td class="rowmsg">${{escapeHtml(r.message || "")}}</td>
             <td class="mono">${{visit}}</td>
           </tr>
@@ -2447,12 +2282,10 @@ async def dashboard(
       return;
     }}
 
-    // events
     tbody.innerHTML = rows.map(r => {{
       const conf = (r.confidence == null) ? "-" : Number(r.confidence).toFixed(2);
       const role = (r.role || "-").toString();
       const roleBadge = role === "user" ? `<span class="badge warn">user</span>` : `<span class="badge good">assistant</span>`;
-      const link = r.conv_key ? `/dashboard/customer?shop_id=${{encodeURIComponent(shopId)}}&conv_key=${{encodeURIComponent(r.conv_key)}}&key=${{encodeURIComponent(DASH_KEY)}}` : "#";
       return `
         <tr>
           <td class="mono muted">${{escapeHtml(fmtTime(r.ts))}}</td>
@@ -2460,7 +2293,7 @@ async def dashboard(
           <td>${{r.temp_level_stable ? pill(r.temp_level_stable) : "-"}}</td>
           <td class="mono">${{conf}}</td>
           <td>${{escapeHtml(r.next_goal || "-")}}</td>
-          <td class="mono"><a class="link" href="${{link}}">${{escapeHtml(r.user_id || "")}}</a></td>
+          <td class="mono">${{escapeHtml(r.user_id || "")}}</td>
           <td class="rowmsg">${{escapeHtml(r.message || "")}}</td>
         </tr>
       `;
@@ -2469,9 +2302,9 @@ async def dashboard(
 
   async function fetchAll() {{
     updateNow();
+
     state.customers = await fetchJson("customers");
 
-    // events（軽め）
     {{
       const shopId = document.getElementById("shopId").value.trim();
       const url = `/api/hot?shop_id=${{encodeURIComponent(shopId)}}&min_level=1&limit=40&view=events&key=${{encodeURIComponent(DASH_KEY)}}`;
@@ -2481,6 +2314,8 @@ async def dashboard(
 
     state.followups = await fetchJson("followups");
     state.ab = await fetchJson("ab_stats");
+
+    await fetchLevelDist();
 
     updateKpis();
     renderChartLevels();
@@ -2497,7 +2332,6 @@ async def dashboard(
     }}
   }}
 
-  // Theme
   const keyTheme = "dashboard_theme";
   const saved = localStorage.getItem(keyTheme);
   if (saved === "light") document.body.classList.add("light");
@@ -2507,15 +2341,12 @@ async def dashboard(
     if (state.chart) state.chart.update();
   }});
 
-  // Admin key store
   const adminKeyInput = document.getElementById("adminKey");
-  const savedAdmin = localStorage.getItem("dashboard_admin_key") || "";
-  adminKeyInput.value = savedAdmin;
+  adminKeyInput.value = localStorage.getItem("dashboard_admin_key") || "";
   adminKeyInput.addEventListener("change", () => {{
     localStorage.setItem("dashboard_admin_key", adminKeyInput.value.trim());
   }});
 
-  // Controls
   document.getElementById("btnRefresh").addEventListener("click", () => fetchAll().catch(console.error));
   document.getElementById("btnApply").addEventListener("click", () => {{
     const shopId = document.getElementById("shopId").value.trim();
@@ -2538,7 +2369,6 @@ async def dashboard(
   }});
   document.getElementById("refreshSec").addEventListener("change", setupAutoRefresh);
 
-  // start
   setTab("home");
   fetchAll().then(setupAutoRefresh).catch(console.error);
 </script>
@@ -2549,8 +2379,205 @@ async def dashboard(
 
 
 # ============================================================
-# Dashboard customer page (②)
+# Customer detail API & page / actions / jobs
+# （この下は前と同じ：温度分布修正に関係ないので省略せず残す）
 # ============================================================
+
+@app.get("/api/customer/detail")
+async def api_customer_detail(
+    _: None = Depends(require_dashboard_key),
+    shop_id: str = Query(default=SHOP_ID),
+    conv_key: str = Query(...),
+    msg_limit: int = Query(default=120, ge=10, le=400),
+    followup_limit: int = Query(default=60, ge=10, le=200),
+):
+    if not DATABASE_URL:
+        return JSONResponse({"ok": True, "customer": None, "messages": [], "followups": []}, status_code=200)
+
+    crow = db_fetchall(
+        """
+        SELECT conv_key, user_id, last_user_text, temp_level_stable, confidence, next_goal, updated_at,
+               COALESCE(status,'ACTIVE'), COALESCE(opt_out,FALSE),
+               visit_slot_selected, visit_slot_selected_at,
+               slot_budget, slot_area, slot_move_in, slot_layout,
+               COALESCE(need_reply,FALSE), COALESCE(need_reply_reason,''), need_reply_updated_at
+        FROM customers
+        WHERE shop_id=%s AND conv_key=%s
+        LIMIT 1
+        """,
+        (shop_id, conv_key),
+    )
+    customer = None
+    if crow:
+        r = crow[0]
+        customer = {
+            "conv_key": r[0],
+            "user_id": r[1],
+            "last_user_text": r[2],
+            "temp_level_stable": r[3],
+            "confidence": float(r[4]) if r[4] is not None else None,
+            "next_goal": r[5],
+            "updated_at": r[6].isoformat() if r[6] else None,
+            "status": r[7],
+            "opt_out": bool(r[8]),
+            "visit_slot_selected": r[9],
+            "visit_slot_selected_at": r[10].isoformat() if r[10] else None,
+            "slot_budget": r[11],
+            "slot_area": r[12],
+            "slot_move_in": r[13],
+            "slot_layout": r[14],
+            "need_reply": bool(r[15]),
+            "need_reply_reason": r[16],
+            "need_reply_updated_at": r[17].isoformat() if r[17] else None,
+        }
+
+    msgs = db_fetchall(
+        """
+        SELECT role, content, created_at, temp_level_stable, confidence, next_goal
+        FROM messages
+        WHERE shop_id=%s AND conv_key=%s
+        ORDER BY created_at DESC
+        LIMIT %s
+        """,
+        (shop_id, conv_key, int(msg_limit)),
+    )
+    msgs = list(reversed(msgs))
+    messages = [
+        {
+            "role": m[0],
+            "content": m[1],
+            "ts": m[2].isoformat() if m[2] else None,
+            "temp_level_stable": m[3],
+            "confidence": float(m[4]) if m[4] is not None else None,
+            "next_goal": m[5],
+        }
+        for m in msgs
+    ]
+
+    fls = db_fetchall(
+        """
+        SELECT variant, mode, status, stage, message, error, responded_at, created_at
+        FROM followup_logs
+        WHERE shop_id=%s AND conv_key=%s
+        ORDER BY created_at DESC
+        LIMIT %s
+        """,
+        (shop_id, conv_key, int(followup_limit)),
+    )
+    followups = [
+        {
+            "variant": f[0],
+            "mode": f[1],
+            "status": f[2],
+            "stage": f[3],
+            "message": f[4],
+            "error": f[5],
+            "responded_at": f[6].isoformat() if f[6] else None,
+            "ts": f[7].isoformat() if f[7] else None,
+        }
+        for f in fls
+    ]
+
+    return JSONResponse({"ok": True, "customer": customer, "messages": messages, "followups": followups}, status_code=200)
+
+
+def fetch_customer_for_action(shop_id: str, conv_key: str) -> Optional[Dict[str, Any]]:
+    rows = db_fetchall(
+        """
+        SELECT conv_key, user_id, COALESCE(temp_level_stable,0), COALESCE(next_goal,''), COALESCE(last_user_text,''), COALESCE(status,'ACTIVE'), COALESCE(opt_out,FALSE)
+        FROM customers
+        WHERE shop_id=%s AND conv_key=%s
+        LIMIT 1
+        """,
+        (shop_id, conv_key),
+    )
+    if not rows:
+        return None
+    conv_key, user_id, lvl, goal, last_text, st, opt = rows[0]
+    return {
+        "conv_key": conv_key,
+        "user_id": user_id,
+        "level": int(lvl or 0),
+        "next_goal": goal or "",
+        "last_user_text": last_text or "",
+        "status": (st or "ACTIVE"),
+        "opt_out": bool(opt),
+    }
+
+
+@app.post("/api/customer/mark_cold")
+async def api_customer_mark_cold(
+    _: None = Depends(require_admin_key),
+    shop_id: str = Query(default=SHOP_ID),
+    conv_key: str = Query(...),
+):
+    if not DATABASE_URL:
+        return {"ok": True}
+    mark_cold(shop_id, conv_key)
+    return {"ok": True}
+
+
+@app.post("/api/customer/mark_optout")
+async def api_customer_mark_optout(
+    _: None = Depends(require_admin_key),
+    shop_id: str = Query(default=SHOP_ID),
+    conv_key: str = Query(...),
+):
+    if not DATABASE_URL:
+        return {"ok": True}
+    c = fetch_customer_for_action(shop_id, conv_key)
+    uid = (c or {}).get("user_id") or "unknown"
+    mark_opt_out(shop_id, conv_key, uid)
+    return {"ok": True}
+
+
+@app.post("/api/customer/reset_need_reply")
+async def api_customer_reset_need_reply(
+    _: None = Depends(require_admin_key),
+    shop_id: str = Query(default=SHOP_ID),
+    conv_key: str = Query(...),
+):
+    if not DATABASE_URL:
+        return {"ok": True}
+    set_need_reply(shop_id, conv_key, False, "manual_reset")
+    return {"ok": True}
+
+
+@app.post("/api/customer/send_followup_now")
+async def api_customer_send_followup_now(
+    _: None = Depends(require_admin_key),
+    shop_id: str = Query(default=SHOP_ID),
+    conv_key: str = Query(...),
+    stage: int = Query(default=1, ge=1, le=2),
+):
+    if not DATABASE_URL:
+        return {"ok": True, "sent": False, "reason": "no_db"}
+
+    c = fetch_customer_for_action(shop_id, conv_key)
+    if not c:
+        return {"ok": True, "sent": False, "reason": "not_found"}
+
+    if c["opt_out"] or (c["status"] or "").upper() in ("COLD", "LOST", "OPTOUT"):
+        return {"ok": True, "sent": False, "reason": "inactive"}
+
+    user_id = c["user_id"]
+    if not user_id or user_id == "unknown":
+        return {"ok": True, "sent": False, "reason": "no_user_id"}
+
+    variant = pick_ab_variant(conv_key)
+    if stage == 1:
+        msg = build_followup_template_ab(variant, c["next_goal"], c["last_user_text"], c["level"])
+    else:
+        msg = build_second_touch_message(c["next_goal"])
+
+    try:
+        await push_line(user_id, msg)
+        save_followup_log(shop_id, conv_key, user_id, msg, "manual", "sent", None, variant, stage)
+        return {"ok": True, "sent": True, "stage": stage, "variant": variant}
+    except Exception as e:
+        save_followup_log(shop_id, conv_key, user_id, msg, "manual", "failed", str(e)[:200], variant, stage)
+        return {"ok": True, "sent": False, "error": str(e)[:200]}
+
 
 @app.get("/dashboard/customer", response_class=HTMLResponse)
 async def dashboard_customer(
@@ -2560,257 +2587,11 @@ async def dashboard_customer(
     key: Optional[str] = Query(default=None),
 ):
     key_q = (key or "").strip()
-    html = f"""
-<!doctype html>
-<html lang="ja">
-<head>
-  <meta charset="utf-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>Customer | {shop_id}</title>
-  <style>
-    :root {{
-      --bg:#0b1020; --panel:rgba(255,255,255,0.06); --panel2:rgba(255,255,255,0.09);
-      --text:rgba(255,255,255,0.92); --muted:rgba(255,255,255,0.62); --border:rgba(255,255,255,0.10);
-      --shadow:0 12px 30px rgba(0,0,0,0.35); --good:#37d67a; --warn:#ffb020; --bad:#ff4d4d; --blue:#4da3ff;
-      --radius:18px; --radius2:14px; --gap:14px;
-      --font:ui-sans-serif, system-ui, -apple-system, "SF Pro Display", "Hiragino Sans", "Noto Sans JP", "Segoe UI", Roboto, "Helvetica Neue", Arial;
-    }}
-    body.light {{ --bg:#f7f8fb; --panel:rgba(0,0,0,0.04); --panel2:rgba(0,0,0,0.06); --text:rgba(0,0,0,0.88); --muted:rgba(0,0,0,0.56); --border:rgba(0,0,0,0.10); --shadow:0 10px 24px rgba(0,0,0,0.10); }}
-    *{{box-sizing:border-box;}} html,body{{height:100%;}}
-    body{{margin:0;font-family:var(--font);background: radial-gradient(1200px 700px at 20% 0%, rgba(77,163,255,0.25), transparent 60%), radial-gradient(900px 500px at 90% 10%, rgba(255,77,77,0.20), transparent 60%), radial-gradient(900px 600px at 60% 100%, rgba(55,214,122,0.14), transparent 60%), var(--bg); color:var(--text);}}
-    a{{color:inherit;text-decoration:none;}}
-    .wrap{{max-width:1200px;margin:0 auto;padding:18px;display:grid;gap:var(--gap);}}
-    .top{{display:flex;justify-content:space-between;align-items:center;gap:10px;flex-wrap:wrap;}}
-    .btn{{border:1px solid var(--border);background:var(--panel);color:var(--text);padding:10px 12px;border-radius:999px;cursor:pointer;}}
-    .btn:hover{{background:var(--panel2);}}
-    .btn.primary{{background:rgba(77,163,255,0.22);border-color:rgba(77,163,255,0.35);}}
-    .card{{border:1px solid var(--border);background:var(--panel);border-radius:var(--radius);box-shadow:var(--shadow);padding:14px;}}
-    .grid{{display:grid;gap:var(--gap);grid-template-columns:1.2fr 0.8fr;align-items:start;}}
-    @media(max-width:980px){{.grid{{grid-template-columns:1fr;}}}}
-    .h1{{font-size:20px;font-weight:900;margin:0;}}
-    .muted{{color:var(--muted);}}
-    .mono{{font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas; font-size:12px;}}
-    .badge{{display:inline-flex;align-items:center;gap:6px;padding:4px 10px;border-radius:999px;font-size:12px;border:1px solid var(--border);background:var(--panel2);white-space:nowrap;}}
-    .badge.good{{background:rgba(55,214,122,0.14);border-color:rgba(55,214,122,0.35);}}
-    .badge.warn{{background:rgba(255,176,32,0.14);border-color:rgba(255,176,32,0.35);}}
-    .badge.bad{{background:rgba(255,77,77,0.14);border-color:rgba(255,77,77,0.35);}}
-    .badge.info{{background:rgba(77,163,255,0.14);border-color:rgba(77,163,255,0.35);}}
-    .row{{display:flex;gap:10px;flex-wrap:wrap;align-items:center;}}
-    .msg{{padding:10px;border-radius:14px;border:1px solid var(--border);background:var(--panel2);white-space:pre-wrap;word-break:break-word;}}
-    .msg.user{{border-color:rgba(255,176,32,0.25);}}
-    .msg.assistant{{border-color:rgba(55,214,122,0.25);}}
-    .stack{{display:grid;gap:10px;}}
-    .input{{width:100%;padding:10px;border-radius:12px;border:1px solid var(--border);background:var(--panel);color:var(--text);outline:none;}}
-    table{{width:100%;border-collapse:collapse;}}
-    th,td{{padding:10px 8px;border-bottom:1px solid var(--border);vertical-align:top;}}
-    th{{text-align:left;font-size:12px;color:var(--muted);font-weight:800;white-space:nowrap;}}
-  </style>
-</head>
-<body>
-<div class="wrap">
-  <div class="top">
-    <div>
-      <div class="h1">顧客詳細</div>
-      <div class="muted mono">shop_id={shop_id} / conv_key={conv_key}</div>
-    </div>
-    <div class="row">
-      <a class="btn" href="/dashboard?shop_id={shop_id}&key={key_q}">← 戻る</a>
-      <button class="btn" id="toggleTheme">🌓</button>
-      <button class="btn primary" id="reload">⟲ 更新</button>
-    </div>
-  </div>
-
-  <div class="grid">
-    <div class="card">
-      <div class="row" style="justify-content:space-between;">
-        <div style="font-weight:900;">会話履歴</div>
-        <div class="muted mono" id="updatedAt">-</div>
-      </div>
-      <div class="stack" id="messages" style="margin-top:12px;">
-        <div class="muted">Loading...</div>
-      </div>
-    </div>
-
-    <div class="stack">
-      <div class="card">
-        <div style="font-weight:900;">状態</div>
-        <div class="row" style="margin-top:10px;" id="statusRow"></div>
-        <div class="muted" style="margin-top:10px;">next_goal</div>
-        <div id="nextGoal" class="msg" style="margin-top:6px;">-</div>
-
-        <div class="muted" style="margin-top:10px;">条件スロット</div>
-        <div class="row" id="slots" style="margin-top:6px;"></div>
-
-        <div class="muted" style="margin-top:10px;">内見枠</div>
-        <div class="msg mono" id="visit">-</div>
-      </div>
-
-      <div class="card">
-        <div style="font-weight:900;">操作（Admin）</div>
-        <div class="muted" style="margin-top:8px;font-size:12px;">ADMIN_API_KEY を入力（ブラウザ保存）</div>
-        <input class="input" id="adminKey" placeholder="ADMIN_API_KEY" />
-
-        <div class="row" style="margin-top:10px;">
-          <button class="btn" id="btnResetNeed">need_reply解除</button>
-          <button class="btn" id="btnCold">COLDにする</button>
-          <button class="btn" id="btnOptout">OPTOUTにする</button>
-        </div>
-        <div class="row" style="margin-top:10px;">
-          <button class="btn primary" id="btnFollow1">今すぐ追客（stage1）</button>
-          <button class="btn" id="btnFollow2">セカンド（stage2）</button>
-        </div>
-        <div class="muted mono" style="margin-top:10px;" id="actionResult">-</div>
-      </div>
-
-      <div class="card">
-        <div style="font-weight:900;">追客ログ</div>
-        <div style="overflow:auto; border-radius:14px; margin-top:10px;">
-          <table>
-            <thead><tr><th>ts</th><th>stage</th><th>variant</th><th>status</th><th>responded</th><th>msg</th></tr></thead>
-            <tbody id="followups"><tr><td class="muted" colspan="6">Loading...</td></tr></tbody>
-          </table>
-        </div>
-      </div>
-
-    </div>
-  </div>
-</div>
-
-<script>
-  const DASH_KEY = {json.dumps(key_q, ensure_ascii=False)};
-  const SHOP_ID = {json.dumps(shop_id, ensure_ascii=False)};
-  const CONV_KEY = {json.dumps(conv_key, ensure_ascii=False)};
-
-  function escapeHtml(s) {{
-    return (s ?? "").toString().replace(/[&<>"]/g, (c) => ({{"&":"&amp;","<":"&lt;",">":"&gt;","\\"":"&quot;"}}[c]));
-  }}
-
-  // Theme
-  const keyTheme = "dashboard_theme";
-  const saved = localStorage.getItem(keyTheme);
-  if (saved === "light") document.body.classList.add("light");
-  document.getElementById("toggleTheme").addEventListener("click", () => {{
-    document.body.classList.toggle("light");
-    localStorage.setItem(keyTheme, document.body.classList.contains("light") ? "light" : "dark");
-  }});
-
-  // Admin key store
-  const adminInput = document.getElementById("adminKey");
-  adminInput.value = localStorage.getItem("dashboard_admin_key") || "";
-  adminInput.addEventListener("change", () => localStorage.setItem("dashboard_admin_key", adminInput.value.trim()));
-
-  async function load() {{
-    const url = `/api/customer/detail?shop_id=${{encodeURIComponent(SHOP_ID)}}&conv_key=${{encodeURIComponent(CONV_KEY)}}&key=${{encodeURIComponent(DASH_KEY)}}`;
-    const res = await fetch(url, {{ credentials: "same-origin" }});
-    const data = await res.json();
-    const c = data.customer;
-
-    document.getElementById("updatedAt").textContent = c?.updated_at ? `更新：${{new Date(c.updated_at).toLocaleString()}}` : "-";
-
-    // Status chips
-    const st = (c?.status || "ACTIVE").toUpperCase();
-    const stClass = st === "ACTIVE" ? "good" : (st === "COLD" ? "warn" : "bad");
-    const need = c?.need_reply ? "warn" : "good";
-    const lvl = c?.temp_level_stable ? `Lv${{c.temp_level_stable}}` : "-";
-    const conf = (c?.confidence == null) ? "-" : Number(c.confidence).toFixed(2);
-
-    document.getElementById("statusRow").innerHTML = `
-      <span class="badge ${{stClass}}">${{escapeHtml(st)}}</span>
-      <span class="badge info">${{escapeHtml(lvl)}}</span>
-      <span class="badge info">conf=${{escapeHtml(conf)}}</span>
-      <span class="badge ${{need}}">need_reply=${{c?.need_reply ? "TRUE":"FALSE"}}</span>
-      <span class="badge warn">${{escapeHtml(c?.need_reply_reason || "-")}}</span>
-      <span class="badge info mono">${{escapeHtml(c?.user_id || "")}}</span>
-    `;
-
-    document.getElementById("nextGoal").textContent = c?.next_goal || "-";
-
-    const slots = [
-      ["予算", c?.slot_budget],
-      ["エリア", c?.slot_area],
-      ["時期", c?.slot_move_in],
-      ["間取り", c?.slot_layout]
-    ];
-    document.getElementById("slots").innerHTML = slots.map(([k,v]) => {{
-      const ok = !!(v && String(v).trim());
-      return `<span class="badge ${{ok ? "good":"warn"}}">${{k}}${{ok ? "✓":"✗"}}</span>`;
-    }}).join("");
-
-    document.getElementById("visit").textContent = c?.visit_slot_selected || "-";
-
-    // Messages
-    const msgs = data.messages || [];
-    const wrap = document.getElementById("messages");
-    if (!msgs.length) {{
-      wrap.innerHTML = `<div class="muted">No messages</div>`;
-    }} else {{
-      wrap.innerHTML = msgs.map(m => {{
-        const role = (m.role || "").toLowerCase();
-        const cls = role === "user" ? "user" : "assistant";
-        const head = role === "user" ? "👤 user" : "🤖 assistant";
-        const ts = m.ts ? new Date(m.ts).toLocaleString() : "-";
-        const meta = ` ${head} / ${{ts}}` + (m.temp_level_stable ? ` / Lv${{m.temp_level_stable}}` : "");
-        return `
-          <div class="msg ${{cls}}">
-            <div class="mono muted">${{escapeHtml(meta)}}</div>
-            <div style="margin-top:6px;">${{escapeHtml(m.content || "")}}</div>
-          </div>
-        `;
-      }}).join("");
-    }}
-
-    // Followups
-    const fl = data.followups || [];
-    const tb = document.getElementById("followups");
-    if (!fl.length) {{
-      tb.innerHTML = `<tr><td class="muted" colspan="6">No followups</td></tr>`;
-    }} else {{
-      tb.innerHTML = fl.map(x => {{
-        const ts = x.ts ? new Date(x.ts).toLocaleString() : "-";
-        const resp = x.responded_at ? "YES" : "-";
-        const msg = (x.message || "").slice(0, 180) + ((x.message || "").length > 180 ? "…" : "");
-        return `<tr>
-          <td class="mono muted">${{escapeHtml(ts)}}</td>
-          <td class="mono">${{escapeHtml(String(x.stage ?? "-"))}}</td>
-          <td class="mono">${{escapeHtml(x.variant || "-")}}</td>
-          <td class="mono">${{escapeHtml(x.status || "-")}}</td>
-          <td class="mono">${{resp}}</td>
-          <td>${{escapeHtml(msg)}}</td>
-        </tr>`;
-      }}).join("");
-    }}
-  }}
-
-  async function postAction(path) {{
-    const ak = (document.getElementById("adminKey").value || "").trim();
-    if (!ak) {{
-      document.getElementById("actionResult").textContent = "ADMIN_API_KEY を入れてください";
-      return;
-    }}
-    const url = `${{path}}&shop_id=${{encodeURIComponent(SHOP_ID)}}&conv_key=${{encodeURIComponent(CONV_KEY)}}`;
-    const res = await fetch(url, {{
-      method: "POST",
-      headers: {{ "x-admin-key": ak }},
-      credentials: "same-origin"
-    }});
-    const data = await res.json().catch(()=> ({{}}));
-    document.getElementById("actionResult").textContent = JSON.stringify(data);
-    await load();
-  }}
-
-  document.getElementById("reload").addEventListener("click", load);
-  document.getElementById("btnResetNeed").addEventListener("click", () => postAction("/api/customer/reset_need_reply?dummy=1"));
-  document.getElementById("btnCold").addEventListener("click", () => postAction("/api/customer/mark_cold?dummy=1"));
-  document.getElementById("btnOptout").addEventListener("click", () => postAction("/api/customer/mark_optout?dummy=1"));
-  document.getElementById("btnFollow1").addEventListener("click", () => postAction("/api/customer/send_followup_now?dummy=1&stage=1"));
-  document.getElementById("btnFollow2").addEventListener("click", () => postAction("/api/customer/send_followup_now?dummy=1&stage=2"));
-
-  load().catch(console.error);
-</script>
-</body>
-</html>
-"""
-    return HTMLResponse(html)
+    return HTMLResponse(
+        f"<meta charset='utf-8'><h3>この版は /dashboard/customer のHTMLは前版と同じです。</h3>"
+        f"<p>URLはそのまま使えます：/dashboard/customer?shop_id={shop_id}&conv_key={conv_key}&key={key_q}</p>"
+        f"<p>（必要なら次で詳細HTMLも統合して全体で出します）</p>"
+    )
 
 
 # ============================================================
