@@ -2219,7 +2219,12 @@ function esc(s){{return (s??"").toString().replace(/[&<>"]/g,c=>({{"&":"&amp;","
 async function fetchJson(url){{const r=await fetch(url); return await r.json();}}
 
 (async()=>{
-  const d = await fetchJson(`/api/customer/detail?shop_id=${{encodeURIComponent(SHOP)}}&conv_key=${{encodeURIComponent(CONV)}}&key=${{encodeURIComponent(KEY)}}`);
+    const d = await fetchJson(
+  "/api/customer/detail?shop_id=" + encodeURIComponent(SHOP)
+  + "&conv_key=" + encodeURIComponent(CONV)
+  + "&key=" + encodeURIComponent(KEY)
+);
+
   const c = d.customer || {{}};
   document.getElementById("cust").innerHTML = `
     <b>User</b>: <span class="mono">${{esc(c.user_id||"-")}}</span><br/>
