@@ -1,8 +1,9 @@
-# app.py (FULL - clean & stable)
-# - next_goal is DB truth from LLM analyze (Responses API + JSON Schema)
-# - phase2: followup message by LLM (fallback templates)
-# - phase3: per-user preferred send hour learning (pref_hour_jst)
-# - dashboard JS uses ONLY string concatenation (NO template literals) to avoid f-string syntax errors
+# app.py (FULL - EVOLVED)
+# Based on "clean & stable" version, evolved with:
+# - Manual WIN (C) + Executive KPI
+# - perma_cold + silence_score + auto_cold job
+# - Dashboard customer page includes WIN buttons
+# - JS uses NO template literals (no `${}`) to avoid f-string pitfalls
 
 import os
 import json
@@ -62,12 +63,14 @@ FOLLOWUP_SECOND_TOUCH_AFTER_HOURS = int(os.getenv("FOLLOWUP_SECOND_TOUCH_AFTER_H
 FOLLOWUP_SECOND_TOUCH_LIMIT = int(os.getenv("FOLLOWUP_SECOND_TOUCH_LIMIT", "50"))
 
 # OpenAI models / timeouts
-OPENAI_MODEL_ASSISTANT = os.getenv("OPENAI_MODEL_ASSISTANT", "gpt-4o-mini").strip()  # reply generation
-OPENAI_MODEL_ANALYZE = os.getenv("OPENAI_MODEL_ANALYZE", "gpt-4o-mini").strip()      # analyze scoring
-OPENAI_MODEL_FOLLOWUP = os.getenv("OPENAI_MODEL_FOLLOWUP", "gpt-4o-mini").strip()    # followup generation
+OPENAI_MODEL_ASSISTANT = os.getenv("OPENAI_MODEL_ASSISTANT", "gpt-4o-mini").strip()
+OPENAI_MODEL_ANALYZE = os.getenv("OPENAI_MODEL_ANALYZE", "gpt-4o-mini").strip()
+OPENAI_MODEL_FOLLOWUP = os.getenv("OPENAI_MODEL_FOLLOWUP", "gpt-4o-mini").strip()
+OPENAI_MODEL_COLD = os.getenv("OPENAI_MODEL_COLD", "gpt-4o-mini").strip()
 
 ANALYZE_TIMEOUT_SEC = float(os.getenv("ANALYZE_TIMEOUT_SEC", "8.5"))
 FOLLOWUP_LLM_TIMEOUT_SEC = float(os.getenv("FOLLOWUP_LLM_TIMEOUT_SEC", "8.5"))
+AUTO_COLD_LLM_TIMEOUT_SEC = float(os.getenv("AUTO_COLD_LLM_TIMEOUT_SEC", "8.5"))
 
 RESPONSES_API_URL = "https://api.openai.com/v1/responses"
 OPENAI_CHAT_URL = "https://api.openai.com/v1/chat/completions"
@@ -81,12 +84,16 @@ FOLLOWUP_FORCE_SEND_AFTER_HOURS = int(os.getenv("FOLLOWUP_FORCE_SEND_AFTER_HOURS
 PREF_HOUR_LOOKBACK_DAYS = int(os.getenv("PREF_HOUR_LOOKBACK_DAYS", "60"))
 PREF_HOUR_MIN_SAMPLES = int(os.getenv("PREF_HOUR_MIN_SAMPLES", "3"))
 
+# auto cold
+AUTO_COLD_USE_LLM = os.getenv("AUTO_COLD_USE_LLM", "1").strip() != "0"
+AUTO_COLD_LIMIT = int(os.getenv("AUTO_COLD_LIMIT", "80"))
+
 CHAT_HISTORY: Dict[str, deque] = defaultdict(lambda: deque(maxlen=40))
 TEMP_HISTORY: Dict[str, deque] = defaultdict(lambda: deque(maxlen=5))
 
 JST = timezone(timedelta(hours=9))
 
-app = FastAPI(title="linebot_mvp", version="1.0.0")
+app = FastAPI(title="linebot_mvp", version="2.0.0")
 
 
 # ============================================================
@@ -193,10 +200,7 @@ def create_db_ssl_context(verify: bool = True) -> ssl.SSLContext:
 
 def connect_db(verify_ssl: bool = True):
     cfg = parse_database_url(DATABASE_URL)
-    sslmode = (cfg["params"].get("sslmode", "") or "").lower()
-    use_ssl = sslmode in ("require", "verify-full", "verify-ca") or True
-    ssl_context = create_db_ssl_context(verify=verify_ssl) if use_ssl else None
-
+    ssl_context = create_db_ssl_context(verify=verify_ssl)
     conn = pg8000.connect(
         user=cfg["user"],
         password=cfg["password"],
@@ -292,6 +296,15 @@ def ensure_tables_and_columns() -> None:
     cur.execute("ALTER TABLE customers ADD COLUMN IF NOT EXISTS pref_hour_samples INT;")
     cur.execute("ALTER TABLE customers ADD COLUMN IF NOT EXISTS pref_hour_updated_at TIMESTAMPTZ;")
 
+    # EVOLUTION: perma_cold / silence_score
+    cur.execute("ALTER TABLE customers ADD COLUMN IF NOT EXISTS silence_score INT DEFAULT 0;")
+    cur.execute("ALTER TABLE customers ADD COLUMN IF NOT EXISTS perma_cold BOOLEAN DEFAULT FALSE;")
+
+    # EVOLUTION: manual WIN (C)
+    cur.execute("ALTER TABLE customers ADD COLUMN IF NOT EXISTS won BOOLEAN DEFAULT FALSE;")
+    cur.execute("ALTER TABLE customers ADD COLUMN IF NOT EXISTS won_at TIMESTAMPTZ;")
+    cur.execute("ALTER TABLE customers ADD COLUMN IF NOT EXISTS won_by TEXT;")
+
     # messages
     cur.execute(
         """
@@ -345,7 +358,6 @@ def ensure_tables_and_columns() -> None:
     # indexes
     cur.execute("CREATE INDEX IF NOT EXISTS idx_customers_shop_updated ON customers(shop_id, updated_at DESC);")
     cur.execute("CREATE INDEX IF NOT EXISTS idx_customers_need_reply ON customers(shop_id, need_reply, updated_at DESC);")
-    cur.execute("CREATE INDEX IF NOT EXISTS idx_messages_conv_created ON messages(conv_key, created_at DESC);")
     cur.execute("CREATE INDEX IF NOT EXISTS idx_messages_shop_conv_role_created ON messages(shop_id, conv_key, role, created_at DESC);")
     cur.execute("CREATE INDEX IF NOT EXISTS idx_followup_shop_conv_created ON followup_logs(shop_id, conv_key, created_at DESC);")
 
@@ -363,12 +375,162 @@ async def on_startup():
 
 
 # ============================================================
-# need_reply helpers
+# WIN (C方式) - manual
 # ============================================================
 
+def mark_won(shop_id: str, conv_key: str, by: str = "admin") -> None:
+    db_execute(
+        """
+        UPDATE customers
+        SET won=TRUE, won_at=now(), won_by=%s,
+            status='WON',
+            perma_cold=TRUE,
+            need_reply=FALSE,
+            updated_at=now()
+        WHERE shop_id=%s AND conv_key=%s
+        """,
+        (by, shop_id, conv_key),
+    )
+
+
+def unmark_won(shop_id: str, conv_key: str) -> None:
+    db_execute(
+        """
+        UPDATE customers
+        SET won=FALSE, won_at=NULL, won_by=NULL,
+            status='ACTIVE',
+            perma_cold=FALSE,
+            updated_at=now()
+        WHERE shop_id=%s AND conv_key=%s
+        """,
+        (shop_id, conv_key),
+    )
+
+
+# ============================================================
+# core helpers
+# ============================================================
+
+def utcnow() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+def now_jst() -> datetime:
+    return datetime.now(JST)
+
+
+def stable_from_history(conv_key: str, raw: int) -> int:
+    h = TEMP_HISTORY[conv_key]
+    h.append(raw)
+    s = sorted(h)
+    return s[len(s) // 2]
+
+
+def ensure_customer_row(shop_id: str, conv_key: str, user_id: str) -> None:
+    db_execute(
+        """
+        INSERT INTO customers (shop_id, conv_key, user_id, updated_at, status, need_reply, need_reply_reason, need_reply_updated_at)
+        VALUES (%s, %s, %s, now(), 'ACTIVE', FALSE, '', now())
+        ON CONFLICT (shop_id, conv_key)
+        DO UPDATE SET user_id=EXCLUDED.user_id, updated_at=now()
+        """,
+        (shop_id, conv_key, user_id),
+    )
+
+
+def is_inactive(shop_id: str, conv_key: str) -> bool:
+    rows = db_fetchall(
+        """
+        SELECT COALESCE(opt_out,FALSE), COALESCE(status,'ACTIVE'),
+               COALESCE(won,FALSE), COALESCE(perma_cold,FALSE)
+        FROM customers
+        WHERE shop_id=%s AND conv_key=%s
+        """,
+        (shop_id, conv_key),
+    )
+    if not rows:
+        return False
+    opt, st, won, cold = rows[0]
+    if bool(opt) or bool(won) or bool(cold):
+        return True
+    st = (st or "ACTIVE").upper()
+    return st in ("COLD", "LOST", "OPTOUT", "WON")
+
+
+def save_message(
+    shop_id: str,
+    conv_key: str,
+    role: str,
+    content: str,
+    temp_level_raw: Optional[int] = None,
+    temp_level_stable: Optional[int] = None,
+    confidence: Optional[float] = None,
+    intent: Optional[str] = None,
+    next_goal: Optional[str] = None,
+) -> None:
+    db_execute(
+        """
+        INSERT INTO messages (shop_id, conv_key, role, content, temp_level_raw, temp_level_stable, confidence, intent, next_goal)
+        VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s)
+        """,
+        (
+            shop_id,
+            conv_key,
+            role,
+            content,
+            temp_level_raw,
+            temp_level_stable,
+            confidence,
+            (intent[:24] if intent else None),
+            (next_goal[:120] if next_goal else None),
+        ),
+    )
+
+
+def get_recent_conversation(shop_id: str, conv_key: str, limit: int) -> List[Dict[str, str]]:
+    rows = db_fetchall(
+        """
+        SELECT role, content
+        FROM messages
+        WHERE shop_id=%s AND conv_key=%s AND role IN ('user','assistant')
+        ORDER BY created_at DESC
+        LIMIT %s
+        """,
+        (shop_id, conv_key, max(1, min(30, int(limit)))),
+    )
+    rows = list(reversed(rows))
+    return [{"role": r[0], "content": (r[1] or "")[:1200]} for r in rows]
+
+
+def upsert_customer_state(
+    shop_id: str,
+    conv_key: str,
+    user_id: str,
+    last_user_text: str,
+    raw_level: int,
+    stable_level: int,
+    confidence: float,
+    intent: str,
+    next_goal: str,
+) -> None:
+    db_execute(
+        """
+        UPDATE customers
+        SET user_id=%s,
+            last_user_text=%s,
+            temp_level_raw=%s,
+            temp_level_stable=%s,
+            confidence=%s,
+            intent=%s,
+            next_goal=%s,
+            updated_at=now()
+        WHERE shop_id=%s AND conv_key=%s
+        """,
+        (user_id, last_user_text, raw_level, stable_level, confidence, intent, next_goal, shop_id, conv_key),
+    )
+
+
 def set_need_reply(shop_id: str, conv_key: str, need: bool, reason: str = "") -> None:
-    if not DATABASE_URL:
-        return
     db_execute(
         """
         UPDATE customers
@@ -379,16 +541,15 @@ def set_need_reply(shop_id: str, conv_key: str, need: bool, reason: str = "") ->
     )
 
 
+# ============================================================
+# need_reply based on goal + slots
+# ============================================================
+
 def get_customer_flags(shop_id: str, conv_key: str) -> Dict[str, Any]:
-    if not DATABASE_URL:
-        return {}
     rows = db_fetchall(
         """
-        SELECT
-          visit_slot_selected,
-          slot_budget, slot_area, slot_move_in, slot_layout,
-          COALESCE(status,'ACTIVE'),
-          COALESCE(opt_out,FALSE)
+        SELECT visit_slot_selected, slot_budget, slot_area, slot_move_in, slot_layout,
+               COALESCE(status,'ACTIVE'), COALESCE(opt_out,FALSE), COALESCE(won,FALSE), COALESCE(perma_cold,FALSE)
         FROM customers
         WHERE shop_id=%s AND conv_key=%s
         """,
@@ -396,7 +557,7 @@ def get_customer_flags(shop_id: str, conv_key: str) -> Dict[str, Any]:
     )
     if not rows:
         return {}
-    vsel, b, a, m, l, st, opt = rows[0]
+    vsel, b, a, m, l, st, opt, won, cold = rows[0]
     return {
         "visit_slot_selected": vsel,
         "slot_budget": b,
@@ -405,13 +566,15 @@ def get_customer_flags(shop_id: str, conv_key: str) -> Dict[str, Any]:
         "slot_layout": l,
         "status": (st or "ACTIVE"),
         "opt_out": bool(opt),
+        "won": bool(won),
+        "perma_cold": bool(cold),
     }
 
 
 def compute_need_reply(next_goal: str, flags: Dict[str, Any], assistant_text: str = "") -> Tuple[bool, str]:
     goal = (next_goal or "").strip()
     st = (flags.get("status") or "ACTIVE").upper()
-    if flags.get("opt_out") or st in ("OPTOUT", "LOST"):
+    if flags.get("opt_out") or flags.get("won") or flags.get("perma_cold") or st in ("OPTOUT", "LOST", "WON"):
         return False, "inactive"
 
     visit = flags.get("visit_slot_selected")
@@ -447,7 +610,209 @@ def compute_need_reply(next_goal: str, flags: Dict[str, Any], assistant_text: st
 
 
 # ============================================================
-# LINE signature verify
+# Slots
+# ============================================================
+
+def extract_slots(text: str) -> Dict[str, str]:
+    t = text or ""
+    slots: Dict[str, str] = {}
+
+    m = re.search(r"(\d{1,3})(?:\.(\d))?\s*(?:万円|万)", t)
+    if m:
+        slots["budget"] = m.group(0)
+
+    m = re.search(r"(ワンルーム|1R|\d\s*(?:LDK|DK|K))", t, re.IGNORECASE)
+    if m:
+        slots["layout"] = m.group(1)
+
+    for kw in ["今月", "来月", "再来月", "すぐ", "早め", "急ぎ", "春", "夏", "秋", "冬"]:
+        if kw in t:
+            slots["move_in"] = kw
+            break
+    m = re.search(r"(\d{1,2})\s*月", t)
+    if m:
+        slots.setdefault("move_in", m.group(0))
+
+    for kw in ["渋谷", "新宿", "品川", "池袋", "目黒", "中目黒", "恵比寿", "吉祥寺", "横浜", "川崎", "浦和"]:
+        if kw in t:
+            slots["area"] = kw
+            break
+
+    return slots
+
+
+def merge_slots(prev: Dict[str, str], new: Dict[str, str]) -> Dict[str, str]:
+    out = dict(prev or {})
+    for k, v in (new or {}).items():
+        if v and (k not in out or not out[k]):
+            out[k] = v
+    return out
+
+
+def get_customer_slots(shop_id: str, conv_key: str) -> Dict[str, str]:
+    rows = db_fetchall("SELECT slots_json FROM customers WHERE shop_id=%s AND conv_key=%s", (shop_id, conv_key))
+    if not rows or not rows[0][0]:
+        return {}
+    try:
+        return json.loads(rows[0][0])
+    except Exception:
+        return {}
+
+
+def set_customer_slots(shop_id: str, conv_key: str, slots: Dict[str, str]) -> None:
+    sj = json.dumps(slots, ensure_ascii=False)
+    db_execute(
+        """
+        UPDATE customers
+        SET slot_budget=%s, slot_area=%s, slot_move_in=%s, slot_layout=%s, slots_json=%s, updated_at=now()
+        WHERE shop_id=%s AND conv_key=%s
+        """,
+        (slots.get("budget"), slots.get("area"), slots.get("move_in"), slots.get("layout"), sj, shop_id, conv_key),
+    )
+
+
+# ============================================================
+# Preferred hour learning (Phase3)
+# ============================================================
+
+def _to_jst(dt: datetime) -> datetime:
+    try:
+        return dt.astimezone(JST)
+    except Exception:
+        return dt
+
+
+def learn_pref_hour_from_messages(shop_id: str, conv_key: str) -> Tuple[Optional[int], int]:
+    since = utcnow() - timedelta(days=max(7, min(365, PREF_HOUR_LOOKBACK_DAYS)))
+    rows = db_fetchall(
+        """
+        SELECT created_at
+        FROM messages
+        WHERE shop_id=%s AND conv_key=%s AND role='user' AND created_at >= %s
+        ORDER BY created_at DESC
+        LIMIT 80
+        """,
+        (shop_id, conv_key, since),
+    )
+    if not rows:
+        return None, 0
+
+    hours: List[int] = []
+    for (dt,) in rows:
+        if not dt:
+            continue
+        hours.append(int(_to_jst(dt).hour))
+
+    samples = len(hours)
+    if samples < PREF_HOUR_MIN_SAMPLES:
+        return None, samples
+
+    counts = [0] * 24
+    for h in hours:
+        if 0 <= h <= 23:
+            counts[h] += 1
+
+    best_h = max(range(24), key=lambda x: counts[x])
+    return best_h, samples
+
+
+def update_customer_pref_hour(shop_id: str, conv_key: str) -> None:
+    pref, samples = learn_pref_hour_from_messages(shop_id, conv_key)
+    if pref is None:
+        return
+    db_execute(
+        """
+        UPDATE customers
+        SET pref_hour_jst=%s, pref_hour_samples=%s, pref_hour_updated_at=now(), updated_at=now()
+        WHERE shop_id=%s AND conv_key=%s
+        """,
+        (int(pref), int(samples), shop_id, conv_key),
+    )
+
+
+def choose_send_hour_jst(pref_hour: Optional[int]) -> int:
+    if pref_hour is None:
+        return 19
+    try:
+        h = int(pref_hour)
+        return h if 0 <= h <= 23 else 19
+    except Exception:
+        return 19
+
+
+def is_within_jst_window(dt: Optional[datetime] = None) -> bool:
+    d = dt or now_jst()
+    h = d.hour
+    start = max(0, min(23, int(FOLLOWUP_JST_FROM)))
+    end = max(0, min(23, int(FOLLOWUP_JST_TO)))
+    if start < end:
+        return start <= h < end
+    if start > end:
+        return (h >= start) or (h < end)
+    return False
+
+
+def within_hour_band(now_hour: int, target_hour: int, band: int) -> bool:
+    diff = abs(now_hour - target_hour)
+    diff = min(diff, 24 - diff)
+    return diff <= max(0, band)
+
+
+# ============================================================
+# Status ops
+# ============================================================
+
+def mark_opt_out(shop_id: str, conv_key: str, user_id: str) -> None:
+    db_execute(
+        """
+        UPDATE customers
+        SET opt_out=TRUE, opt_out_at=now(), status='OPTOUT', user_id=%s,
+            need_reply=FALSE, need_reply_reason='optout', need_reply_updated_at=now(),
+            updated_at=now()
+        WHERE shop_id=%s AND conv_key=%s
+        """,
+        (user_id, shop_id, conv_key),
+    )
+
+
+def mark_lost(shop_id: str, conv_key: str) -> None:
+    db_execute(
+        """
+        UPDATE customers
+        SET status='LOST',
+            need_reply=FALSE, need_reply_reason='lost', need_reply_updated_at=now(),
+            updated_at=now(),
+            perma_cold=TRUE
+        WHERE shop_id=%s AND conv_key=%s
+        """,
+        (shop_id, conv_key),
+    )
+
+
+def revive_if_lost_by_keywords(shop_id: str, conv_key: str, text: str) -> bool:
+    rows = db_fetchall(
+        "SELECT COALESCE(opt_out,FALSE), COALESCE(status,'ACTIVE'), COALESCE(won,FALSE) FROM customers WHERE shop_id=%s AND conv_key=%s",
+        (shop_id, conv_key),
+    )
+    if not rows:
+        return False
+    if bool(rows[0][0]) or bool(rows[0][2]):
+        return False
+    if (rows[0][1] or "ACTIVE").upper() != "LOST":
+        return False
+
+    for pat in LOST_REVIVE_PATTERNS:
+        if re.search(pat, text or ""):
+            db_execute(
+                "UPDATE customers SET status='ACTIVE', perma_cold=FALSE, updated_at=now() WHERE shop_id=%s AND conv_key=%s",
+                (shop_id, conv_key),
+            )
+            return True
+    return False
+
+
+# ============================================================
+# LINE helpers
 # ============================================================
 
 def verify_signature(body: bytes, signature: str) -> bool:
@@ -457,10 +822,6 @@ def verify_signature(body: bytes, signature: str) -> bool:
     expected = base64.b64encode(mac).decode("utf-8")
     return hmac.compare_digest(expected, signature or "")
 
-
-# ============================================================
-# LINE send
-# ============================================================
 
 async def reply_line(reply_token: str, text: str) -> None:
     if not LINE_CHANNEL_ACCESS_TOKEN or not reply_token:
@@ -494,6 +855,10 @@ async def push_line(user_id: str, text: str) -> None:
         print("[LINE] push exception:", repr(e))
 
 
+def is_visit_change_request(text: str) -> bool:
+    return any(re.search(p, text or "") for p in VISIT_CHANGE_PATTERNS)
+
+
 # ============================================================
 # OpenAI prompts + schemas
 # ============================================================
@@ -512,28 +877,9 @@ SYSTEM_PROMPT_ANALYZE = """
   "reasons": ["根拠1","根拠2","根拠3"]
 }
 
-【重要：レベル基準（厳守）】
-Lv10: 申込/審査/契約の話が明確、または内見日程が具体的に確定
-Lv9 : 内見したい＋日程調整に入っている（候補日が出ている等）
-Lv8 : 条件がほぼ確定（エリア/予算/入居時期が揃う）＋内見意思が強い
-Lv7 : 条件がかなり具体（エリアor沿線、予算、入居時期のうち2つ以上）＋前向きな質問
-Lv6 : 条件が一部具体（上のうち1つ）＋検討継続が明確
-Lv5 : 一般質問中心、条件が曖昧、温度不明
-Lv4 : 情報収集段階が明確（比較中/とりあえず）で条件未確定
-Lv3 : 反応が薄い/曖昧/先すぎる（半年以上先など）/冷めている
-Lv2 : 反応が薄い/要件なし/冷めている
-Lv1 : 明確に不要、拒否、ブロック示唆
-
-【next_goalの決め方（重要）】
-- 目標は「次の1歩を進めるために、今聞くべき情報」。
-- 内見系なら「候補日/日程確定」「別日希望の確認」。
-- 条件不足なら「予算」「エリア」「入居時期」「間取り」など、最重要の不足を優先。
-- 質問は最大2つに収まる形のゴールにする。
-
-【過大評価防止（最重要）】
-- 「内見」「良さそう」等があっても、予算・入居時期・エリアが不明なら Lv8以上にしない
-- 入居時期が半年以上先なら最大でも Lv6
+【過大評価防止】
 - 条件が全く出ていない場合は最大でも Lv5
+- 入居時期が半年以上先なら最大でも Lv6
 - 返信が短い/曖昧な場合はLvを上げすぎない
 """.strip()
 
@@ -569,10 +915,17 @@ FOLLOWUP_JSON_SCHEMA = {
     "required": ["message"]
 }
 
+AUTO_COLD_JSON_SCHEMA = {
+    "type": "object",
+    "additionalProperties": False,
+    "properties": {
+        "perma_cold": {"type": "boolean"},
+        "silence_score_delta": {"type": "integer", "minimum": -2, "maximum": 5},
+        "reason": {"type": "string", "maxLength": 120}
+    },
+    "required": ["perma_cold", "silence_score_delta", "reason"]
+}
 
-# ============================================================
-# OpenAI clients
-# ============================================================
 
 async def openai_chat(messages: List[Dict[str, str]], temperature: float = 0.2, timeout_sec: float = 25.0) -> str:
     if not OPENAI_API_KEY:
@@ -632,10 +985,6 @@ async def openai_responses_json(
         return None
 
 
-# ============================================================
-# Coercers
-# ============================================================
-
 def coerce_level(v: Any) -> int:
     try:
         iv = int(float(str(v).strip()))
@@ -652,17 +1001,8 @@ def coerce_confidence(v: Any) -> float:
         if 1.0 < fv <= 100.0:
             fv = fv / 100.0
         return max(0.0, min(1.0, fv))
-    s = str(v).strip().lower()
-    if s.endswith("%"):
-        try:
-            return max(0.0, min(1.0, float(s[:-1]) / 100.0))
-        except Exception:
-            return 0.6
     try:
-        fv = float(s)
-        if 1.0 < fv <= 100.0:
-            fv = fv / 100.0
-        return max(0.0, min(1.0, fv))
+        return max(0.0, min(1.0, float(str(v).strip())))
     except Exception:
         return 0.6
 
@@ -678,386 +1018,175 @@ def coerce_goal(v: Any) -> str:
 
 
 # ============================================================
-# Slots
+# Followup / auto_cold LLM
 # ============================================================
 
-def extract_slots(text: str) -> Dict[str, str]:
-    t = text or ""
-    slots: Dict[str, str] = {}
-
-    m = re.search(r"(\d{1,3})(?:\.(\d))?\s*(?:万円|万)", t)
-    if m:
-        slots["budget"] = m.group(0)
-
-    m = re.search(r"(ワンルーム|1R|\d\s*(?:LDK|DK|K))", t, re.IGNORECASE)
-    if m:
-        slots["layout"] = m.group(1)
-
-    for kw in ["今月", "来月", "再来月", "すぐ", "早め", "急ぎ", "春", "夏", "秋", "冬"]:
-        if kw in t:
-            slots["move_in"] = kw
-            break
-    m = re.search(r"(\d{1,2})\s*月", t)
-    if m:
-        slots.setdefault("move_in", m.group(0))
-
-    for kw in ["渋谷", "新宿", "品川", "池袋", "目黒", "中目黒", "恵比寿", "吉祥寺", "横浜", "川崎", "浦和"]:
-        if kw in t:
-            slots["area"] = kw
-            break
-
-    return slots
+def _intent_label(intent: str) -> str:
+    return {"rent": "賃貸", "buy": "購入", "invest": "投資", "research": "情報収集", "other": "不明"}.get(intent, "不明")
 
 
-def merge_slots(prev: Dict[str, str], new: Dict[str, str]) -> Dict[str, str]:
-    out = dict(prev or {})
-    for k, v in (new or {}).items():
-        if v and (k not in out or not out[k]):
-            out[k] = v
-    return out
-
-
-def get_customer_slots(shop_id: str, conv_key: str) -> Dict[str, str]:
-    if not DATABASE_URL:
-        return {}
-    rows = db_fetchall("SELECT slots_json FROM customers WHERE shop_id=%s AND conv_key=%s", (shop_id, conv_key))
-    if not rows or not rows[0][0]:
-        return {}
-    try:
-        return json.loads(rows[0][0])
-    except Exception:
-        return {}
-
-
-def set_customer_slots(shop_id: str, conv_key: str, slots: Dict[str, str]) -> None:
-    if not DATABASE_URL:
-        return
-    sj = json.dumps(slots, ensure_ascii=False)
-    db_execute(
-        """
-        UPDATE customers
-        SET slot_budget=%s, slot_area=%s, slot_move_in=%s, slot_layout=%s, slots_json=%s, updated_at=now()
-        WHERE shop_id=%s AND conv_key=%s
-        """,
-        (slots.get("budget"), slots.get("area"), slots.get("move_in"), slots.get("layout"), sj, shop_id, conv_key),
-    )
-
-
-# ============================================================
-# Preferred send hour learning (phase3)
-# ============================================================
-
-def utcnow() -> datetime:
-    return datetime.now(timezone.utc)
-
-
-def now_jst() -> datetime:
-    return datetime.now(JST)
-
-
-def _to_jst(dt: datetime) -> datetime:
-    try:
-        return dt.astimezone(JST)
-    except Exception:
-        return dt
-
-
-def learn_pref_hour_from_messages(shop_id: str, conv_key: str) -> Tuple[Optional[int], int]:
-    if not DATABASE_URL:
-        return None, 0
-    since = utcnow() - timedelta(days=max(7, min(365, PREF_HOUR_LOOKBACK_DAYS)))
-    rows = db_fetchall(
-        """
-        SELECT created_at
-        FROM messages
-        WHERE shop_id=%s AND conv_key=%s AND role='user' AND created_at >= %s
-        ORDER BY created_at DESC
-        LIMIT 80
-        """,
-        (shop_id, conv_key, since),
-    )
-    if not rows:
-        return None, 0
-
-    hours: List[int] = []
-    for (dt,) in rows:
-        if not dt:
-            continue
-        hours.append(int(_to_jst(dt).hour))
-
-    samples = len(hours)
-    if samples < PREF_HOUR_MIN_SAMPLES:
-        return None, samples
-
-    counts = [0] * 24
-    for h in hours:
-        if 0 <= h <= 23:
-            counts[h] += 1
-
-    best_h = max(range(24), key=lambda x: counts[x])
-    return best_h, samples
-
-
-def update_customer_pref_hour(shop_id: str, conv_key: str) -> None:
-    if not DATABASE_URL:
-        return
-    pref, samples = learn_pref_hour_from_messages(shop_id, conv_key)
-    if pref is None:
-        return
-    db_execute(
-        """
-        UPDATE customers
-        SET pref_hour_jst=%s, pref_hour_samples=%s, pref_hour_updated_at=now(), updated_at=now()
-        WHERE shop_id=%s AND conv_key=%s
-        """,
-        (int(pref), int(samples), shop_id, conv_key),
-    )
-
-
-def choose_send_hour_jst(pref_hour: Optional[int]) -> int:
-    if pref_hour is None:
-        return 19
-    try:
-        h = int(pref_hour)
-        if 0 <= h <= 23:
-            return h
-    except Exception:
-        pass
-    return 19
-
-
-def is_within_jst_window(dt: Optional[datetime] = None) -> bool:
-    d = dt or now_jst()
-    h = d.hour
-    start = max(0, min(23, int(FOLLOWUP_JST_FROM)))
-    end = max(0, min(23, int(FOLLOWUP_JST_TO)))
-    if start < end:
-        return start <= h < end
-    if start > end:
-        return (h >= start) or (h < end)
-    return False
-
-
-def within_hour_band(now_hour: int, target_hour: int, band: int) -> bool:
-    diff = abs(now_hour - target_hour)
-    diff = min(diff, 24 - diff)
-    return diff <= max(0, band)
-
-
-# ============================================================
-# Status helpers
-# ============================================================
-
-def ensure_customer_row(shop_id: str, conv_key: str, user_id: str) -> None:
-    if not DATABASE_URL:
-        return
-    db_execute(
-        """
-        INSERT INTO customers (shop_id, conv_key, user_id, updated_at, status, need_reply, need_reply_reason, need_reply_updated_at)
-        VALUES (%s, %s, %s, now(), 'ACTIVE', FALSE, '', now())
-        ON CONFLICT (shop_id, conv_key)
-        DO UPDATE SET user_id=EXCLUDED.user_id, updated_at=now()
-        """,
-        (shop_id, conv_key, user_id),
-    )
-
-
-def mark_opt_out(shop_id: str, conv_key: str, user_id: str) -> None:
-    if not DATABASE_URL:
-        return
-    db_execute(
-        """
-        UPDATE customers
-        SET opt_out=TRUE, opt_out_at=now(), status='OPTOUT', user_id=%s,
-            need_reply=FALSE, need_reply_reason='optout', need_reply_updated_at=now(),
-            updated_at=now()
-        WHERE shop_id=%s AND conv_key=%s
-        """,
-        (user_id, shop_id, conv_key),
-    )
-
-
-def mark_lost(shop_id: str, conv_key: str) -> None:
-    if not DATABASE_URL:
-        return
-    db_execute(
-        """
-        UPDATE customers
-        SET status='LOST',
-            need_reply=FALSE, need_reply_reason='lost', need_reply_updated_at=now(),
-            updated_at=now()
-        WHERE shop_id=%s AND conv_key=%s
-        """,
-        (shop_id, conv_key),
-    )
-
-
-def revive_if_cold(shop_id: str, conv_key: str) -> None:
-    if not DATABASE_URL:
-        return
-    db_execute(
-        """
-        UPDATE customers
-        SET status='ACTIVE', updated_at=now()
-        WHERE shop_id=%s AND conv_key=%s
-          AND COALESCE(status,'ACTIVE')='COLD'
-          AND COALESCE(opt_out,FALSE)=FALSE
-        """,
-        (shop_id, conv_key),
-    )
-
-
-def revive_if_lost_by_keywords(shop_id: str, conv_key: str, text: str) -> bool:
-    if not DATABASE_URL:
-        return False
-    rows = db_fetchall(
-        """
-        SELECT COALESCE(opt_out,FALSE), COALESCE(status,'ACTIVE')
-        FROM customers
-        WHERE shop_id=%s AND conv_key=%s
-        """,
-        (shop_id, conv_key),
-    )
-    if not rows:
-        return False
-    if bool(rows[0][0]):
-        return False
-    if (rows[0][1] or "ACTIVE").upper() != "LOST":
-        return False
-
-    for pat in LOST_REVIVE_PATTERNS:
-        if re.search(pat, text or ""):
-            db_execute(
-                "UPDATE customers SET status='ACTIVE', updated_at=now() WHERE shop_id=%s AND conv_key=%s",
-                (shop_id, conv_key),
-            )
-            return True
-    return False
-
-
-def is_inactive(shop_id: str, conv_key: str) -> bool:
-    if not DATABASE_URL:
-        return False
-    rows = db_fetchall(
-        """
-        SELECT COALESCE(opt_out,FALSE), COALESCE(status,'ACTIVE')
-        FROM customers
-        WHERE shop_id=%s AND conv_key=%s
-        """,
-        (shop_id, conv_key),
-    )
-    if not rows:
-        return False
-    opt_out = bool(rows[0][0])
-    st = (rows[0][1] or "ACTIVE").upper()
-    return opt_out or st in ("COLD", "LOST", "OPTOUT")
-
-
-def set_visit_slot(shop_id: str, conv_key: str, slot_text: str) -> None:
-    if not DATABASE_URL:
-        return
-    db_execute(
-        "UPDATE customers SET visit_slot_selected=%s, visit_slot_selected_at=now(), updated_at=now() WHERE shop_id=%s AND conv_key=%s",
-        (slot_text, shop_id, conv_key),
-    )
-
-
-# ============================================================
-# Message persistence
-# ============================================================
-
-def save_message(
+async def generate_followup_message_llm(
     shop_id: str,
     conv_key: str,
-    role: str,
-    content: str,
-    temp_level_raw: Optional[int] = None,
-    temp_level_stable: Optional[int] = None,
-    confidence: Optional[float] = None,
-    intent: Optional[str] = None,
-    next_goal: Optional[str] = None,
-) -> None:
-    if not DATABASE_URL:
-        return
+    stage: int,
+    variant: str,
+    customer: Dict[str, Any],
+) -> Optional[str]:
+    if not FOLLOWUP_USE_LLM or not OPENAI_API_KEY:
+        return None
+
+    next_goal = (customer.get("next_goal") or "").strip()
+    last_user_text = (customer.get("last_user_text") or "").strip()
+    intent = (customer.get("intent") or "other").strip().lower()
+
+    instructions = (
+        "あなたは不動産/投資のトップ営業です。追客LINE文を1通だけ作ってください。"
+        "押し売り禁止。質問は最大2つ。返信しやすい形。短め。出力はJSONのみ。"
+    )
+
+    tone = "やさしく丁寧" if variant == "A" else "短く選択肢"
+    stage_rule = "初回追客" if stage == 1 else "2回目追客（しつこくしない）"
+    ctx = {
+        "tone": tone,
+        "stage_rule": stage_rule,
+        "intent": intent,
+        "intent_label": _intent_label(intent),
+        "next_goal": next_goal,
+        "last_user_text": last_user_text[:200],
+    }
+
+    history = get_recent_conversation_for_followup(shop_id, conv_key, limit=12)
+    input_msgs: List[Dict[str, str]] = [
+        {"role": "user", "content": "条件: " + json.dumps(ctx, ensure_ascii=False)},
+        {"role": "user", "content": "会話:"},
+    ]
+    for m in history[-12:]:
+        role = m.get("role")
+        content = (m.get("content") or "")[:800]
+        if role in ("user", "assistant"):
+            input_msgs.append({"role": role, "content": content})
+
+    j = await openai_responses_json(
+        model=OPENAI_MODEL_FOLLOWUP,
+        instructions=instructions,
+        input_msgs=input_msgs,
+        schema=FOLLOWUP_JSON_SCHEMA,
+        timeout_sec=FOLLOWUP_LLM_TIMEOUT_SEC,
+    )
+    if not j:
+        return None
+    msg = str(j.get("message") or "").strip()
+    msg = re.sub(r"\n{3,}", "\n\n", msg).strip()
+    return msg[:900] if msg else None
+
+
+def followup_fallback(stage: int, intent: str, goal: str) -> str:
+    if stage == 2:
+        return "その後いかがでしょうか？急ぎでなければ大丈夫です。必要なら一言だけ返信ください🙂"
+    if intent == "research":
+        return "参考資料のご希望ありますか？必要になったら一言だけで大丈夫です🙂"
+    if any(k in (goal or "") for k in ["内見", "日程", "候補日"]):
+        return "内見希望でしたら、希望の曜日や時間帯（例：土日午後/平日夜など）を教えてください。"
+    return "その後いかがでしょうか？ご希望条件（エリア・予算・入居時期）だけでも教えてください。"
+
+
+async def auto_cold_judge(shop_id: str, conv_key: str, history: List[Dict[str, str]]) -> Optional[Dict[str, Any]]:
+    if not AUTO_COLD_USE_LLM or not OPENAI_API_KEY:
+        return None
+    instructions = (
+        "あなたは営業責任者。追客を継続すべきか判断する。"
+        "perma_cold=true なら追客停止。silence_score_deltaは-2〜+5。出力はJSONのみ。"
+    )
+    input_msgs = [{"role": "user", "content": "会話履歴:"}]
+    for m in history[-12:]:
+        input_msgs.append({"role": m["role"], "content": m["content"]})
+
+    return await openai_responses_json(
+        model=OPENAI_MODEL_COLD,
+        instructions=instructions,
+        input_msgs=input_msgs,
+        schema=AUTO_COLD_JSON_SCHEMA,
+        timeout_sec=AUTO_COLD_LLM_TIMEOUT_SEC,
+    )
+
+
+def apply_silence_update(shop_id: str, conv_key: str, delta: int, perma: bool) -> None:
+    rows = db_fetchall("SELECT COALESCE(silence_score,0) FROM customers WHERE shop_id=%s AND conv_key=%s", (shop_id, conv_key))
+    cur = int(rows[0][0] or 0) if rows else 0
+    nxt = max(0, min(999, cur + int(delta)))
     db_execute(
         """
-        INSERT INTO messages (shop_id, conv_key, role, content, temp_level_raw, temp_level_stable, confidence, intent, next_goal)
-        VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s)
+        UPDATE customers
+        SET silence_score=%s, perma_cold=%s, updated_at=now()
+        WHERE shop_id=%s AND conv_key=%s
         """,
-        (
-            shop_id,
-            conv_key,
-            role,
-            content,
-            temp_level_raw,
-            temp_level_stable,
-            confidence,
-            (intent[:24] if intent else None),
-            (next_goal[:120] if next_goal else None),
-        ),
+        (nxt, bool(perma), shop_id, conv_key),
     )
 
 
-def stable_from_history(conv_key: str, raw_level: int) -> int:
-    hist = TEMP_HISTORY[conv_key]
-    hist.append(raw_level)
-    s = sorted(hist)
-    return s[len(s) // 2]
+# ============================================================
+# Analyze + reply generation
+# ============================================================
 
+async def analyze_only(shop_id: str, conv_key: str, user_text: str) -> Tuple[int, float, str, str, List[str], str]:
+    t = (user_text or "").strip()
 
-def upsert_customer_state(
-    shop_id: str,
-    conv_key: str,
-    user_id: str,
-    last_user_text: str,
-    raw_level: int,
-    stable_level: int,
-    confidence: float,
-    intent: str,
-    next_goal: str,
-) -> None:
-    if not DATABASE_URL:
-        return
-    db_execute(
-        """
-        INSERT INTO customers
-          (shop_id, conv_key, user_id, last_user_text, temp_level_raw, temp_level_stable, confidence, intent, next_goal, updated_at, status)
-        VALUES
-          (%s,%s,%s,%s,%s,%s,%s,%s,%s,now(), COALESCE((SELECT status FROM customers WHERE shop_id=%s AND conv_key=%s),'ACTIVE'))
-        ON CONFLICT (shop_id, conv_key)
-        DO UPDATE SET
-          user_id=EXCLUDED.user_id,
-          last_user_text=EXCLUDED.last_user_text,
-          temp_level_raw=EXCLUDED.temp_level_raw,
-          temp_level_stable=EXCLUDED.temp_level_stable,
-          confidence=EXCLUDED.confidence,
-          intent=EXCLUDED.intent,
-          next_goal=EXCLUDED.next_goal,
-          updated_at=now()
-        """,
-        (shop_id, conv_key, user_id, last_user_text, raw_level, stable_level, confidence, intent, next_goal, shop_id, conv_key),
+    for pat in OPTOUT_PATTERNS:
+        if re.search(pat, t, flags=re.IGNORECASE):
+            return 1, 0.95, "other", "関係終了確認", ["optout"], "OPTOUT"
+
+    for pat in CANCEL_PATTERNS:
+        if re.search(pat, t):
+            return 2, 0.90, "other", "関係終了確認", ["lost"], "LOST"
+
+    hist = get_recent_conversation(shop_id, conv_key, ANALYZE_HISTORY_LIMIT)
+    if not hist or hist[-1].get("content") != user_text:
+        hist.append({"role": "user", "content": user_text})
+
+    j = await openai_responses_json(
+        model=OPENAI_MODEL_ANALYZE,
+        instructions=SYSTEM_PROMPT_ANALYZE,
+        input_msgs=hist[-max(2, ANALYZE_HISTORY_LIMIT):],
+        schema=ANALYZE_JSON_SCHEMA,
+        timeout_sec=ANALYZE_TIMEOUT_SEC,
     )
 
+    if j:
+        lvl = coerce_level(j.get("temp_level_raw", 5))
+        conf = coerce_confidence(j.get("confidence", 0.6))
+        intent = coerce_intent(j.get("intent", "other"))
+        goal = coerce_goal(j.get("next_goal", "要件確認"))
+        reasons = j.get("reasons", [])
+        if not isinstance(reasons, list):
+            reasons = []
+        reasons = [str(x).strip()[:60] for x in reasons][:3]
+        return lvl, conf, intent, goal, reasons, ""
 
-def get_recent_conversation(shop_id: str, conv_key: str, limit: int) -> List[Dict[str, str]]:
-    if not DATABASE_URL:
-        return []
-    rows = db_fetchall(
-        """
-        SELECT role, content
-        FROM messages
-        WHERE shop_id=%s AND conv_key=%s AND role IN ('user','assistant')
-        ORDER BY created_at DESC
-        LIMIT %s
-        """,
-        (shop_id, conv_key, max(1, min(30, int(limit)))),
-    )
-    rows = list(reversed(rows))
-    return [{"role": r[0], "content": (r[1] or "")[:1200]} for r in rows]
+    if len(t) <= SHORT_TEXT_MAX_LEN:
+        return 3, 0.75, "other", "要件確認", ["短文"], ""
+
+    return 5, 0.6, "other", "要件確認", ["fallback"], ""
 
 
-def get_recent_conversation_for_followup(shop_id: str, conv_key: str, limit: int = 12) -> List[Dict[str, str]]:
-    return get_recent_conversation(shop_id, conv_key, limit=max(6, min(20, int(limit))))
+async def generate_reply_only(user_id: str, user_text: str) -> str:
+    history = CHAT_HISTORY[user_id]
+    ctx = [{"role": "system", "content": SYSTEM_PROMPT_ASSISTANT}]
+    for role, content in list(history)[-10:]:
+        ctx.append({"role": role, "content": content})
+    ctx.append({"role": "user", "content": user_text})
+
+    try:
+        reply_text = await openai_chat(ctx, temperature=0.35, timeout_sec=FAST_REPLY_TIMEOUT_SEC)
+        reply_text = (reply_text or "").strip()
+    except Exception:
+        reply_text = ""
+
+    if not reply_text:
+        reply_text = "ありがとうございます。条件をもう少し教えてください（エリア/予算/間取り/入居時期など）。"
+
+    history.append(("user", user_text))
+    history.append(("assistant", reply_text))
+    return reply_text
 
 
 # ============================================================
@@ -1076,8 +1205,6 @@ def save_followup_log(
     stage: Optional[int] = None,
     send_hour_jst: Optional[int] = None,
 ) -> None:
-    if not DATABASE_URL:
-        return
     db_execute(
         """
         INSERT INTO followup_logs (shop_id, conv_key, user_id, message, mode, status, error, variant, stage, send_hour_jst)
@@ -1099,9 +1226,7 @@ def save_followup_log(
 
 
 def attribute_followup_response(shop_id: str, conv_key: str) -> None:
-    if not DATABASE_URL:
-        return
-    window_since = datetime.now(timezone.utc) - timedelta(hours=FOLLOWUP_ATTRIBUTION_WINDOW_HOURS)
+    window_since = utcnow() - timedelta(hours=FOLLOWUP_ATTRIBUTION_WINDOW_HOURS)
     rows = db_fetchall(
         """
         SELECT id
@@ -1122,512 +1247,7 @@ def attribute_followup_response(shop_id: str, conv_key: str) -> None:
 
 
 # ============================================================
-# Visit slots & parsing
-# ============================================================
-
-def parse_slot_hours() -> List[int]:
-    out: List[int] = []
-    for part in (VISIT_SLOT_HOURS or "").split(","):
-        part = part.strip()
-        if not part:
-            continue
-        try:
-            h = int(part)
-            if 0 <= h <= 23:
-                out.append(h)
-        except Exception:
-            pass
-    return out or [11, 14, 17]
-
-
-def upcoming_visit_slots_jst(days_ahead: int = 3) -> List[str]:
-    hours = parse_slot_hours()
-    slots: List[str] = []
-    for d in range(1, max(1, min(14, days_ahead)) + 1):
-        label = "明日" if d == 1 else ("明後日" if d == 2 else f"{d}日後")
-        for h in hours:
-            slots.append(f"{label} {h:02d}:00-{(h+1)%24:02d}:00")
-    return slots[:6]
-
-
-def parse_slot_selection(text: str) -> Optional[int]:
-    t = (text or "").strip()
-    circ_map = {"①": 1, "②": 2, "③": 3, "④": 4, "⑤": 5, "⑥": 6}
-    if t in circ_map:
-        return circ_map[t]
-    m = re.match(r"^\s*([1-6])\s*$", t)
-    if m:
-        return int(m.group(1))
-    m2 = re.search(r"([1-6])\s*(?:番|で|がいい|希望|お願いします)?", t)
-    if m2:
-        return int(m2.group(1))
-    return None
-
-
-def is_visit_change_request(text: str) -> bool:
-    return any(re.search(p, text or "") for p in VISIT_CHANGE_PATTERNS)
-
-
-# ============================================================
-# AB & followup fallback templates
-# ============================================================
-
-def pick_ab_variant(conv_key: str) -> str:
-    if not FOLLOWUP_AB_ENABLED:
-        return "A"
-    h = hashlib.sha256(conv_key.encode("utf-8")).hexdigest()
-    return "A" if (int(h[:2], 16) % 2 == 0) else "B"
-
-
-def build_followup_template_ab_fallback(variant: str, next_goal: str, last_user_text: str, level: int) -> str:
-    goal = (next_goal or "").strip()
-    last = (last_user_text or "").strip()
-
-    is_visit = any(k in goal for k in ["内見", "候補日", "日程"])
-    slots = upcoming_visit_slots_jst(VISIT_DAYS_AHEAD) if is_visit else []
-    slot_lines = ""
-    if slots:
-        slot_lines = "候補：\n" + "\n".join([f"{i+1}. {s}" for i, s in enumerate(slots)]) + "\n"
-
-    if is_visit:
-        q = "上の候補で合う番号（1〜6）を返信ください。別日/別時間ならそのまま書いてOKです。"
-    elif "予算" in goal:
-        q = "ご予算の上限だけ教えていただけますか？"
-    elif "入居" in goal or "時期" in goal:
-        q = "ご入居希望はいつ頃ですか？"
-    elif "エリア" in goal or "沿線" in goal:
-        q = "希望エリア（沿線/駅）はどのあたりが良いですか？"
-    else:
-        q = "条件を少し整理したいので、希望があれば教えてください。"
-
-    trimmed = last[:40] + ("…" if len(last) > 40 else "") if last else ""
-
-    if variant == "A":
-        lead = "その後いかがでしょうか？"
-        body = f"{lead}\n{('（直近：'+trimmed+'）\\n') if trimmed else ''}{slot_lines}{q}\n必要なら候補をすぐまとめます😊"
-        return body.strip()[:900]
-
-    lead = "少しだけ確認です。"
-    yn = "①番号でOK ②別日希望 ③一旦ストップ" if is_visit else "①このまま探す ②一旦ストップ ③条件変更"
-    body = f"{lead}\n{slot_lines}{q}\n返信は「{yn}」のどれでもOKです。"
-    return body.strip()[:900]
-
-
-def build_second_touch_message_fallback(next_goal: str) -> str:
-    if any(k in (next_goal or "") for k in ["内見", "候補日", "日程"]):
-        return (
-            "その後いかがでしょうか？\n"
-            "ご都合が合う時で大丈夫なので、内見希望なら「1〜6」か「別日」とだけ返信ください。"
-        )[:900]
-    return (
-        "その後いかがでしょうか？\n"
-        "急ぎでなければ大丈夫です。必要になったら一言だけ返信ください🙂"
-    )[:900]
-
-
-# ============================================================
-# Phase2: LLM followup generation
-# ============================================================
-
-def _intent_label(intent: str) -> str:
-    return {"rent": "賃貸", "buy": "購入", "invest": "投資", "research": "情報収集", "other": "不明"}.get(intent, "不明")
-
-
-async def generate_followup_message_llm(
-    shop_id: str,
-    conv_key: str,
-    stage: int,
-    variant: str,
-    customer: Dict[str, Any],
-) -> Optional[str]:
-    if not FOLLOWUP_USE_LLM or not OPENAI_API_KEY:
-        return None
-
-    level = int(customer.get("level") or 0)
-    next_goal = (customer.get("next_goal") or "").strip()
-    last_user_text = (customer.get("last_user_text") or "").strip()
-    intent = (customer.get("intent") or "other").strip().lower()
-
-    flags = get_customer_flags(shop_id, conv_key)
-    slots = get_customer_slots(shop_id, conv_key)
-    visit_selected = flags.get("visit_slot_selected")
-
-    visit_slots = upcoming_visit_slots_jst(VISIT_DAYS_AHEAD)
-    visit_block = ""
-    if any(k in next_goal for k in ["内見", "候補日", "日程"]):
-        if visit_selected == "REQUEST_CHANGE":
-            visit_block = "ユーザーは『別日/別時間』希望。候補番号ではなく希望の曜日/時間帯を聞く。"
-        else:
-            visit_block = "内見候補(1〜6): " + " / ".join([f"{i+1}:{s}" for i, s in enumerate(visit_slots)])
-
-    style = "丁寧でやさしく、少しフレンドリー" if variant == "A" else "短く、選択肢形式で迷わせない"
-    stage_rule = "初回追客（距離感は近すぎない）" if stage == 1 else "2回目追客（しつこくならない・一言で終える）"
-
-    instructions = (
-        "あなたは不動産/太陽光/投資の問い合わせ対応のトップ営業です。"
-        "次の条件を厳守し、追客LINE文を1通だけ作ってください。"
-        "出力はJSONのみ。\n\n"
-        "【厳守】\n"
-        "- 押し売り禁止。丁寧。短く。\n"
-        "- 質問は最大2つ。\n"
-        "- 返信しやすい形（番号/選択肢/一言でOK）を優先。\n"
-        "- 次のゴール(next_goal)に沿う。\n"
-        "- intent（賃貸/購入/投資/情報収集）を踏まえて言い回しを変える。\n"
-        "- 文字数は短め（~350字目安）。\n"
-    )
-
-    history = get_recent_conversation_for_followup(shop_id, conv_key, limit=12)
-    context_user = {
-        "stage": stage,
-        "ab_variant": variant,
-        "style": style,
-        "stage_rule": stage_rule,
-        "intent": intent,
-        "intent_label": _intent_label(intent),
-        "level": level,
-        "next_goal": next_goal,
-        "last_user_text": last_user_text[:200],
-        "known_slots": slots,
-        "visit_selected": visit_selected,
-        "visit_block": visit_block,
-        "rules_hint": "内見/日程なら番号1-6か別日希望を促す。要件確認なら不足スロットを埋める。",
-    }
-
-    input_msgs: List[Dict[str, str]] = [
-        {"role": "user", "content": "コンテキスト: " + json.dumps(context_user, ensure_ascii=False)},
-        {"role": "user", "content": "直近の会話（古い→新しい）:"},
-    ]
-    for m in history[-12:]:
-        role = m.get("role")
-        content = (m.get("content") or "")[:800]
-        if role in ("user", "assistant"):
-            input_msgs.append({"role": role, "content": content})
-
-    j = await openai_responses_json(
-        model=OPENAI_MODEL_FOLLOWUP,
-        instructions=instructions,
-        input_msgs=input_msgs,
-        schema=FOLLOWUP_JSON_SCHEMA,
-        timeout_sec=FOLLOWUP_LLM_TIMEOUT_SEC,
-    )
-    if not j:
-        return None
-
-    msg = str(j.get("message") or "").strip()
-    msg = re.sub(r"\n{3,}", "\n\n", msg).strip()
-    return msg[:900] if msg else None
-
-
-# ============================================================
-# Phase1: analyze (DB truth: intent & next_goal)
-# ============================================================
-
-async def analyze_only(
-    shop_id: str,
-    conv_key: str,
-    user_text: str,
-) -> Tuple[int, float, str, str, List[str], Dict[str, str], str]:
-    """
-    return: raw_level, conf, intent, next_goal, reasons, merged_slots, status_override
-    """
-    t = (user_text or "").strip()
-
-    for pat in OPTOUT_PATTERNS:
-        if re.search(pat, t, flags=re.IGNORECASE):
-            return 1, 0.95, "other", "関係終了確認", ["配信停止/連絡不要の意思"], {}, "OPTOUT"
-
-    for pat in CANCEL_PATTERNS:
-        if re.search(pat, t):
-            return 2, 0.90, "other", "関係終了確認", ["キャンセル/拒否の明確表現"], {}, "LOST"
-
-    new_slots = extract_slots(user_text)
-    prev_slots = get_customer_slots(shop_id, conv_key)
-    merged = merge_slots(prev_slots, new_slots)
-
-    history = get_recent_conversation(shop_id, conv_key, ANALYZE_HISTORY_LIMIT)
-    if not history or history[-1].get("content") != user_text:
-        history.append({"role": "user", "content": user_text})
-
-    raw_level = 5
-    conf = 0.6
-    intent = "other"
-    next_goal = "要件確認"
-    reasons: List[str] = []
-
-    input_msgs: List[Dict[str, str]] = []
-    if merged:
-        input_msgs.append({"role": "user", "content": "抽出スロット(参考): " + json.dumps(merged, ensure_ascii=False)})
-    input_msgs.extend(history[-max(2, ANALYZE_HISTORY_LIMIT):])
-
-    j = await openai_responses_json(
-        model=OPENAI_MODEL_ANALYZE,
-        instructions=SYSTEM_PROMPT_ANALYZE,
-        input_msgs=input_msgs,
-        schema=ANALYZE_JSON_SCHEMA,
-        timeout_sec=ANALYZE_TIMEOUT_SEC,
-    )
-
-    if j:
-        raw_level = coerce_level(j.get("temp_level_raw", 5))
-        conf = coerce_confidence(j.get("confidence", 0.6))
-        intent = coerce_intent(j.get("intent", "other"))
-        next_goal = coerce_goal(j.get("next_goal", "要件確認"))
-        rs = j.get("reasons", [])
-        if isinstance(rs, list):
-            reasons = [str(x).strip()[:60] for x in rs if str(x).strip()][:3]
-        return raw_level, conf, intent, next_goal, reasons, merged, ""
-
-    if len(t) <= SHORT_TEXT_MAX_LEN:
-        return 3, 0.75, "other", "要件確認", ["短文で情報不足（fallback）"], merged, ""
-
-    return raw_level, conf, intent, next_goal, reasons, merged, ""
-
-
-async def generate_reply_only(user_id: str, user_text: str) -> str:
-    history = CHAT_HISTORY[user_id]
-    ctx = [{"role": "system", "content": SYSTEM_PROMPT_ASSISTANT}]
-    for role, content in list(history)[-10:]:
-        ctx.append({"role": role, "content": content})
-    ctx.append({"role": "user", "content": user_text})
-
-    reply_text = await openai_chat(ctx, temperature=0.35, timeout_sec=FAST_REPLY_TIMEOUT_SEC)
-    reply_text = (reply_text or "").strip()
-    if not reply_text:
-        reply_text = "ありがとうございます。条件をもう少し教えてください（エリア/予算/間取り/入居時期など）。"
-
-    history.append(("user", user_text))
-    history.append(("assistant", reply_text))
-    return reply_text
-
-
-# ============================================================
-# Maintenance
-# ============================================================
-
-def maintenance_update_statuses(shop_id: str) -> None:
-    if not DATABASE_URL:
-        return
-    db_execute(
-        """
-        UPDATE customers SET status='OPTOUT', need_reply=FALSE, need_reply_reason='optout'
-        WHERE shop_id=%s AND COALESCE(opt_out,FALSE)=TRUE AND COALESCE(status,'')<>'OPTOUT'
-        """,
-        (shop_id,),
-    )
-    db_execute(
-        """
-        UPDATE customers SET status='COLD', need_reply=FALSE, need_reply_reason='cold'
-        WHERE shop_id=%s
-          AND COALESCE(status,'ACTIVE')='ACTIVE'
-          AND COALESCE(temp_level_stable,0) <= 2
-          AND updated_at < (now() - interval '7 days')
-        """,
-        (shop_id,),
-    )
-
-
-# ============================================================
-# Job lock
-# ============================================================
-
-def acquire_job_lock(key: str, ttl_sec: int) -> bool:
-    now = utcnow()
-    until = now + timedelta(seconds=ttl_sec)
-    rows = db_fetchall("SELECT locked_until FROM job_locks WHERE key=%s", (key,))
-    if rows and rows[0][0] and rows[0][0] > now:
-        return False
-    db_execute(
-        """
-        INSERT INTO job_locks (key, locked_until)
-        VALUES (%s, %s)
-        ON CONFLICT (key) DO UPDATE SET locked_until=EXCLUDED.locked_until
-        """,
-        (key, until),
-    )
-    return True
-
-
-# ============================================================
-# Followup candidates
-# ============================================================
-
-def get_followup_candidates_stage1() -> List[Dict[str, Any]]:
-    if not DATABASE_URL:
-        return []
-    threshold = utcnow() - timedelta(minutes=FOLLOWUP_AFTER_MINUTES)
-
-    rows = db_fetchall(
-        """
-        SELECT conv_key, user_id,
-               COALESCE(temp_level_stable,0), COALESCE(next_goal,''), COALESCE(last_user_text,''),
-               COALESCE(intent,'other'),
-               COALESCE(status,'ACTIVE'), COALESCE(opt_out,FALSE),
-               pref_hour_jst,
-               updated_at
-        FROM customers
-        WHERE shop_id=%s
-          AND COALESCE(temp_level_stable,0) >= %s
-          AND updated_at < %s
-          AND COALESCE(user_id,'') <> ''
-        ORDER BY updated_at ASC
-        LIMIT %s
-        """,
-        (SHOP_ID, FOLLOWUP_MIN_LEVEL, threshold, FOLLOWUP_LIMIT),
-    )
-
-    out: List[Dict[str, Any]] = []
-    for conv_key, user_id, lvl, goal, last_text, intent, st, opt, pref_hour_jst, updated_at in rows:
-        st = (st or "ACTIVE").upper()
-        if opt or st in ("COLD", "LOST", "OPTOUT"):
-            continue
-        out.append(
-            {
-                "conv_key": conv_key,
-                "user_id": user_id,
-                "level": int(lvl or 0),
-                "next_goal": goal or "",
-                "last_user_text": last_text or "",
-                "intent": (intent or "other"),
-                "pref_hour_jst": pref_hour_jst,
-                "updated_at": updated_at,
-            }
-        )
-    return out
-
-
-def get_followup_candidates_stage2() -> List[Dict[str, Any]]:
-    if not DATABASE_URL:
-        return []
-    threshold = utcnow() - timedelta(hours=FOLLOWUP_SECOND_TOUCH_AFTER_HOURS)
-
-    rows = db_fetchall(
-        """
-        SELECT fl.conv_key, fl.user_id
-        FROM followup_logs fl
-        WHERE fl.shop_id=%s
-          AND fl.status='sent'
-          AND COALESCE(fl.stage,1)=1
-          AND fl.responded_at IS NULL
-          AND fl.created_at < %s
-          AND NOT EXISTS (
-            SELECT 1 FROM followup_logs fl2
-            WHERE fl2.shop_id=fl.shop_id
-              AND fl2.conv_key=fl.conv_key
-              AND fl2.status='sent'
-              AND COALESCE(fl2.stage,1)=2
-          )
-        ORDER BY fl.created_at ASC
-        LIMIT %s
-        """,
-        (SHOP_ID, threshold, FOLLOWUP_SECOND_TOUCH_LIMIT),
-    )
-
-    out: List[Dict[str, Any]] = []
-    for conv_key, user_id in rows:
-        if is_inactive(SHOP_ID, conv_key):
-            continue
-        cg = db_fetchall(
-            """
-            SELECT COALESCE(next_goal,''), COALESCE(intent,'other'), COALESCE(last_user_text,''), COALESCE(temp_level_stable,0),
-                   pref_hour_jst, updated_at
-            FROM customers
-            WHERE shop_id=%s AND conv_key=%s
-            LIMIT 1
-            """,
-            (SHOP_ID, conv_key),
-        )
-        goal = cg[0][0] if cg else ""
-        intent = cg[0][1] if cg else "other"
-        last_text = cg[0][2] if cg else ""
-        lvl = int(cg[0][3] or 0) if cg else 0
-        pref_hour_jst = cg[0][4] if cg else None
-        updated_at = cg[0][5] if cg else None
-        out.append(
-            {
-                "conv_key": conv_key,
-                "user_id": user_id,
-                "next_goal": goal or "",
-                "intent": intent or "other",
-                "last_user_text": last_text or "",
-                "level": lvl,
-                "pref_hour_jst": pref_hour_jst,
-                "updated_at": updated_at,
-            }
-        )
-    return out
-
-
-# ============================================================
-# Background tasks
-# ============================================================
-
-async def process_analysis_only_store(shop_id: str, user_id: str, conv_key: str, user_text: str, reply_text: str) -> None:
-    try:
-        raw_level, conf, intent, next_goal, reasons, merged_slots, status_override = await analyze_only(shop_id, conv_key, user_text)
-        stable_level = stable_from_history(conv_key, raw_level)
-
-        if status_override == "OPTOUT":
-            mark_opt_out(shop_id, conv_key, user_id)
-            return
-        if status_override == "LOST":
-            mark_lost(shop_id, conv_key)
-            return
-
-        if merged_slots:
-            set_customer_slots(shop_id, conv_key, merged_slots)
-
-        upsert_customer_state(shop_id, conv_key, user_id, user_text, raw_level, stable_level, conf, intent, next_goal)
-        save_message(shop_id, conv_key, "assistant", reply_text, raw_level, stable_level, conf, intent, next_goal)
-
-        flags = get_customer_flags(shop_id, conv_key)
-        need, reason = compute_need_reply(next_goal, flags, assistant_text=reply_text)
-        set_need_reply(shop_id, conv_key, need, reason)
-    except Exception as e:
-        print("[BG] process_analysis_only_store:", repr(e))
-
-
-async def process_ai_and_push_full(shop_id: str, user_id: str, conv_key: str, user_text: str) -> None:
-    try:
-        raw_level, conf, intent, next_goal, reasons, merged_slots, status_override = await analyze_only(shop_id, conv_key, user_text)
-        stable_level = stable_from_history(conv_key, raw_level)
-
-        if status_override == "OPTOUT":
-            mark_opt_out(shop_id, conv_key, user_id)
-            return
-        if status_override == "LOST":
-            mark_lost(shop_id, conv_key)
-            return
-
-        if merged_slots:
-            set_customer_slots(shop_id, conv_key, merged_slots)
-
-        try:
-            reply_text = await openai_chat(
-                [{"role": "system", "content": SYSTEM_PROMPT_ASSISTANT}, {"role": "user", "content": user_text}],
-                temperature=0.35,
-                timeout_sec=20.0,
-            )
-            reply_text = (reply_text or "").strip() or "ありがとうございます。条件をもう少し教えてください（エリア/予算/間取り/入居時期など）。"
-        except Exception:
-            reply_text = "ありがとうございます。条件をもう少し教えてください（エリア/予算/間取り/入居時期など）。"
-
-        upsert_customer_state(shop_id, conv_key, user_id, user_text, raw_level, stable_level, conf, intent, next_goal)
-        save_message(shop_id, conv_key, "assistant", reply_text, raw_level, stable_level, conf, intent, next_goal)
-
-        flags = get_customer_flags(shop_id, conv_key)
-        need, reason = compute_need_reply(next_goal, flags, assistant_text=reply_text)
-        set_need_reply(shop_id, conv_key, need, reason)
-
-        if is_inactive(shop_id, conv_key):
-            return
-
-        await push_line(user_id, reply_text)
-    except Exception as e:
-        print("[BG] process_ai_and_push_full:", repr(e))
-
-
-# ============================================================
-# Routes
+# Webhook
 # ============================================================
 
 @app.get("/")
@@ -1637,7 +1257,7 @@ async def root():
 
 @app.get("/healthz")
 async def healthz():
-    return {"ok": True, "ts": int(datetime.now(timezone.utc).timestamp())}
+    return {"ok": True, "ts": int(utcnow().timestamp())}
 
 
 @app.post("/line/webhook")
@@ -1650,12 +1270,9 @@ async def line_webhook(
     if not verify_signature(body, x_line_signature):
         raise HTTPException(status_code=401, detail="invalid signature")
 
-    try:
-        payload = json.loads(body.decode("utf-8"))
-    except Exception:
-        raise HTTPException(status_code=400, detail="invalid json")
-
+    payload = json.loads(body.decode("utf-8"))
     events = payload.get("events", []) or []
+
     for ev in events:
         if ev.get("type") != "message":
             continue
@@ -1671,81 +1288,41 @@ async def line_webhook(
 
         conv_key = "user:" + str(user_id)
 
-        try:
-            ensure_customer_row(SHOP_ID, conv_key, user_id)
-        except Exception as e:
-            print("[DB] ensure_customer_row:", repr(e))
+        ensure_customer_row(SHOP_ID, conv_key, user_id)
 
-        # clear need_reply on user reply
-        try:
-            set_need_reply(SHOP_ID, conv_key, False, "user_replied")
-        except Exception:
-            pass
+        # save inbound
+        save_message(SHOP_ID, conv_key, "user", user_text)
 
-        # revive states
-        try:
-            revive_if_cold(SHOP_ID, conv_key)
-        except Exception:
-            pass
-        try:
-            revive_if_lost_by_keywords(SHOP_ID, conv_key, user_text)
-        except Exception:
-            pass
-
-        # persist inbound
-        try:
-            save_message(SHOP_ID, conv_key, "user", user_text)
-        except Exception as e:
-            print("[DB] save user:", repr(e))
-
-        # learn preferred hour
-        try:
-            update_customer_pref_hour(SHOP_ID, conv_key)
-        except Exception as e:
-            print("[PREF] update_customer_pref_hour:", repr(e))
-
-        # attribution (if user replied after followup)
+        # attribute followup response
         try:
             attribute_followup_response(SHOP_ID, conv_key)
         except Exception:
             pass
 
-        # merge slots
+        # clear need_reply
         try:
-            prev = get_customer_slots(SHOP_ID, conv_key)
-            merged = merge_slots(prev, extract_slots(user_text))
-            if merged and merged != prev:
-                set_customer_slots(SHOP_ID, conv_key, merged)
+            set_need_reply(SHOP_ID, conv_key, False, "user_replied")
         except Exception:
             pass
 
-        # visit change request
-        if is_visit_change_request(user_text):
-            set_visit_slot(SHOP_ID, conv_key, "REQUEST_CHANGE")
-            try:
-                set_need_reply(SHOP_ID, conv_key, True, "visit_change_request")
-            except Exception:
-                pass
-            await reply_line(reply_token, "承知しました。ご希望の曜日や時間帯（例：平日夜/土日午後など）を教えてください。")
+        # update preferred hour learning
+        try:
+            update_customer_pref_hour(SHOP_ID, conv_key)
+        except Exception:
+            pass
+
+        # revive lost by keywords
+        try:
+            revive_if_lost_by_keywords(SHOP_ID, conv_key, user_text)
+        except Exception:
+            pass
+
+        # if inactive (won/perma/optout)
+        if is_inactive(SHOP_ID, conv_key):
+            await reply_line(reply_token, "承知しました。必要になったらいつでもご連絡ください。")
             continue
 
-        # visit slot selection
-        sel = parse_slot_selection(user_text)
-        if sel is not None:
-            slots = upcoming_visit_slots_jst(VISIT_DAYS_AHEAD)
-            if 1 <= sel <= len(slots):
-                picked = slots[sel - 1]
-                set_visit_slot(SHOP_ID, conv_key, picked)
-                try:
-                    set_need_reply(SHOP_ID, conv_key, False, "visit_selected")
-                except Exception:
-                    pass
-                await reply_line(reply_token, "ありがとうございます！内見希望枠は「" + picked + "」で承りました。")
-            else:
-                await reply_line(reply_token, "番号は 1〜6 の範囲でお願いします。")
-            continue
-
-        # optout/cancel immediate
+        # hard optout/lost
         for pat in OPTOUT_PATTERNS:
             if re.search(pat, user_text, flags=re.IGNORECASE):
                 mark_opt_out(SHOP_ID, conv_key, user_id)
@@ -1758,28 +1335,55 @@ async def line_webhook(
                 await reply_line(reply_token, "承知しました。必要になったらまたいつでもご連絡ください。")
                 return {"ok": True}
 
-        # fast reply
-        fast_reply_text: Optional[str] = None
-        try:
-            fast_reply_text = await asyncio.wait_for(
-                generate_reply_only(user_id=user_id, user_text=user_text),
-                timeout=FAST_REPLY_TIMEOUT_SEC,
-            )
-        except Exception:
-            fast_reply_text = None
+        # special: visit change
+        if is_visit_change_request(user_text):
+            set_visit_slot(SHOP_ID, conv_key, "REQUEST_CHANGE")
+            await reply_line(reply_token, "承知しました。ご希望の曜日や時間帯（例：平日夜/土日午後など）を教えてください。")
+            continue
 
-        if fast_reply_text:
-            await reply_line(reply_token, fast_reply_text)
-            background.add_task(process_analysis_only_store, SHOP_ID, user_id, conv_key, user_text, fast_reply_text)
+        # fast reply
+        fast_reply = ""
+        try:
+            fast_reply = await asyncio.wait_for(generate_reply_only(user_id, user_text), timeout=FAST_REPLY_TIMEOUT_SEC)
+        except Exception:
+            fast_reply = ""
+
+        if fast_reply:
+            await reply_line(reply_token, fast_reply)
+
+            async def bg_analyze_store():
+                lvl_raw, conf, intent, goal, reasons, override = await analyze_only(SHOP_ID, conv_key, user_text)
+                lvl_stable = stable_from_history(conv_key, lvl_raw)
+
+                if override == "OPTOUT":
+                    mark_opt_out(SHOP_ID, conv_key, user_id)
+                    return
+                if override == "LOST":
+                    mark_lost(SHOP_ID, conv_key)
+                    return
+
+                # slots
+                prev = get_customer_slots(SHOP_ID, conv_key)
+                merged = merge_slots(prev, extract_slots(user_text))
+                if merged and merged != prev:
+                    set_customer_slots(SHOP_ID, conv_key, merged)
+
+                upsert_customer_state(SHOP_ID, conv_key, user_id, user_text, lvl_raw, lvl_stable, conf, intent, goal)
+                save_message(SHOP_ID, conv_key, "assistant", fast_reply, lvl_raw, lvl_stable, conf, intent, goal)
+
+                flags = get_customer_flags(SHOP_ID, conv_key)
+                need, reason = compute_need_reply(goal, flags, assistant_text=fast_reply)
+                set_need_reply(SHOP_ID, conv_key, need, reason)
+
+            background.add_task(bg_analyze_store)
         else:
             await reply_line(reply_token, "ありがとうございます！内容を確認しています。少々お待ちください😊")
-            background.add_task(process_ai_and_push_full, SHOP_ID, user_id, conv_key, user_text)
 
     return {"ok": True}
 
 
 # ============================================================
-# Dashboard APIs
+# Dashboard API
 # ============================================================
 
 @app.get("/api/hot")
@@ -1787,21 +1391,17 @@ async def api_hot(
     _: None = Depends(require_dashboard_key),
     shop_id: str = Query(default=SHOP_ID),
     min_level: int = Query(default=1, ge=1, le=10),
-    limit: int = Query(default=50, ge=1, le=200),
+    limit: int = Query(default=80, ge=1, le=200),
     view: str = Query(default="customers", pattern="^(customers|events|followups|ab_stats)$"),
 ):
-    if not DATABASE_URL:
-        return JSONResponse([], status_code=200)
-
     if view == "customers":
         rows = db_fetchall(
             """
-            SELECT conv_key, user_id, last_user_text, temp_level_stable, confidence, COALESCE(intent,'other'), next_goal, updated_at,
-                   COALESCE(status,'ACTIVE') as status,
-                   visit_slot_selected,
-                   slot_budget, slot_area, slot_move_in, slot_layout,
-                   COALESCE(need_reply,FALSE) as need_reply,
-                   COALESCE(need_reply_reason,'') as need_reply_reason,
+            SELECT conv_key, user_id, last_user_text, temp_level_stable, confidence, COALESCE(intent,'other'),
+                   next_goal, updated_at,
+                   COALESCE(status,'ACTIVE'),
+                   COALESCE(need_reply,FALSE), COALESCE(need_reply_reason,''),
+                   COALESCE(won,FALSE), COALESCE(perma_cold,FALSE), COALESCE(silence_score,0),
                    pref_hour_jst, pref_hour_samples
             FROM customers
             WHERE shop_id=%s AND COALESCE(temp_level_stable,0) >= %s
@@ -1812,7 +1412,6 @@ async def api_hot(
         )
         return JSONResponse([
             {
-                "view": "customers",
                 "conv_key": r[0],
                 "user_id": r[1],
                 "message": r[2],
@@ -1822,43 +1421,13 @@ async def api_hot(
                 "next_goal": r[6],
                 "ts": r[7].isoformat() if r[7] else None,
                 "status": r[8],
-                "visit_slot_selected": r[9],
-                "slot_budget": r[10],
-                "slot_area": r[11],
-                "slot_move_in": r[12],
-                "slot_layout": r[13],
-                "need_reply": bool(r[14]),
-                "need_reply_reason": r[15],
-                "pref_hour_jst": r[16],
-                "pref_hour_samples": r[17],
-            }
-            for r in rows
-        ])
-
-    if view == "events":
-        rows = db_fetchall(
-            """
-            SELECT m.role, c.user_id, c.conv_key, m.content, m.created_at, m.temp_level_stable, m.confidence, COALESCE(m.intent,'other'), m.next_goal
-            FROM messages m
-            LEFT JOIN customers c ON c.shop_id=m.shop_id AND c.conv_key=m.conv_key
-            WHERE m.shop_id=%s
-            ORDER BY m.created_at DESC
-            LIMIT %s
-            """,
-            (shop_id, limit),
-        )
-        return JSONResponse([
-            {
-                "view": "events",
-                "role": r[0],
-                "user_id": r[1],
-                "conv_key": r[2],
-                "message": r[3],
-                "ts": r[4].isoformat() if r[4] else None,
-                "temp_level_stable": r[5],
-                "confidence": float(r[6]) if r[6] is not None else None,
-                "intent": r[7],
-                "next_goal": r[8],
+                "need_reply": bool(r[9]),
+                "need_reply_reason": r[10],
+                "won": bool(r[11]),
+                "perma_cold": bool(r[12]),
+                "silence_score": int(r[13] or 0),
+                "pref_hour_jst": r[14],
+                "pref_hour_samples": r[15],
             }
             for r in rows
         ])
@@ -1876,7 +1445,6 @@ async def api_hot(
         )
         return JSONResponse([
             {
-                "view": "followups",
                 "user_id": r[0],
                 "conv_key": r[1],
                 "variant": r[2],
@@ -1892,27 +1460,33 @@ async def api_hot(
             for r in rows
         ])
 
-    # ab_stats
-    rows = db_fetchall(
-        """
-        SELECT
-          COALESCE(variant,'A') as variant,
-          COUNT(*) FILTER (WHERE status='sent') as sent_count,
-          COUNT(*) FILTER (WHERE status='sent' AND responded_at IS NOT NULL) as responded_count
-        FROM followup_logs
-        WHERE shop_id=%s
-        GROUP BY COALESCE(variant,'A')
-        ORDER BY variant
-        """,
-        (shop_id,),
-    )
-    out = []
-    for v, sent, resp in rows:
-        sent = int(sent or 0)
-        resp = int(resp or 0)
-        rate = (resp / sent) if sent > 0 else 0.0
-        out.append({"view": "ab_stats", "variant": v, "sent": sent, "responded": resp, "rate": rate})
-    return JSONResponse(out)
+    if view == "events":
+        rows = db_fetchall(
+            """
+            SELECT role, content, created_at, temp_level_stable, confidence, COALESCE(intent,'other'), next_goal, conv_key
+            FROM messages
+            WHERE shop_id=%s
+            ORDER BY created_at DESC
+            LIMIT %s
+            """,
+            (shop_id, limit),
+        )
+        return JSONResponse([
+            {
+                "role": r[0],
+                "message": r[1],
+                "ts": r[2].isoformat() if r[2] else None,
+                "temp_level_stable": r[3],
+                "confidence": float(r[4]) if r[4] is not None else None,
+                "intent": r[5],
+                "next_goal": r[6],
+                "conv_key": r[7],
+            }
+            for r in rows
+        ])
+
+    # ab_stats placeholder
+    return JSONResponse([])
 
 
 @app.get("/api/stats/level_dist")
@@ -1920,9 +1494,6 @@ async def api_stats_level_dist(
     _: None = Depends(require_dashboard_key),
     shop_id: str = Query(default=SHOP_ID),
 ):
-    if not DATABASE_URL:
-        return JSONResponse({str(i): 0 for i in range(1, 11)}, status_code=200)
-
     rows = db_fetchall(
         """
         SELECT temp_level_stable, COUNT(*)
@@ -1940,190 +1511,11 @@ async def api_stats_level_dist(
         lv_i = int(lv)
         if 1 <= lv_i <= 10:
             dist[str(lv_i)] = int(cnt or 0)
-    return JSONResponse(dist, status_code=200)
+    return JSONResponse(dist)
 
 
 # ============================================================
-# Dashboard HTML (NO template literals)
-# ============================================================
-
-@app.get("/dashboard", response_class=HTMLResponse)
-async def dashboard(
-    _: None = Depends(require_dashboard_key),
-    shop_id: str = Query(default=SHOP_ID),
-    min_level: int = Query(default=1, ge=1, le=10),
-    limit: int = Query(default=80, ge=1, le=200),
-    refresh: int = Query(default=DASHBOARD_REFRESH_SEC_DEFAULT, ge=0, le=300),
-    key: Optional[str] = Query(default=None),
-):
-    key_q = (key or "").strip()
-
-    html = f"""
-<!doctype html>
-<html lang="ja">
-<head>
-<meta charset="utf-8"/>
-<meta name="viewport" content="width=device-width, initial-scale=1"/>
-<title>Dashboard | {shop_id}</title>
-<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
-<style>
-  body{{font-family:system-ui,-apple-system,"Hiragino Sans","Noto Sans JP",sans-serif;margin:16px;background:#0b1020;color:#fff}}
-  .row{{display:flex;gap:12px;flex-wrap:wrap;align-items:center}}
-  .card{{background:rgba(255,255,255,.06);border:1px solid rgba(255,255,255,.12);border-radius:14px;padding:12px}}
-  table{{width:100%;border-collapse:collapse}}
-  th,td{{border-bottom:1px solid rgba(255,255,255,.12);padding:8px;font-size:12px;vertical-align:top}}
-  th{{color:rgba(255,255,255,.7);text-align:left}}
-  .mono{{font-family:ui-monospace,Menlo,Monaco,Consolas,monospace}}
-  a{{color:#8ab4f8}}
-</style>
-</head>
-<body>
-  <div class="row">
-    <div class="card"><b>SHOP</b> <span class="mono">{shop_id}</span></div>
-    <div class="card"><b>min_level</b> {min_level} / <b>limit</b> {limit} / <b>refresh</b> {refresh}s</div>
-  </div>
-
-  <div class="row" style="margin-top:12px;">
-    <div class="card" style="flex:1;min-width:320px;">
-      <div style="display:flex;justify-content:space-between;align-items:center;">
-        <b>温度分布（全体）</b><span class="mono">/api/stats/level_dist</span>
-      </div>
-      <canvas id="chart" height="110"></canvas>
-    </div>
-    <div class="card" style="flex:1;min-width:320px;">
-      <div style="display:flex;justify-content:space-between;align-items:center;">
-        <b>今やる（need_reply=TRUE）</b><span class="mono">customers</span>
-      </div>
-      <div style="margin-top:8px;overflow:auto;max-height:420px;">
-        <table>
-          <thead><tr>
-            <th>更新</th><th>Lv</th><th>intent</th><th>need</th><th>goal</th><th>pref</th><th>user</th><th>msg</th>
-          </tr></thead>
-          <tbody id="needRows"><tr><td colspan="8">loading...</td></tr></tbody>
-        </table>
-      </div>
-    </div>
-  </div>
-
-  <div class="card" style="margin-top:12px;">
-    <div style="display:flex;justify-content:space-between;align-items:center;">
-      <b>顧客（最新）</b><span class="mono">/api/hot?view=customers</span>
-    </div>
-    <div style="margin-top:8px;overflow:auto;max-height:520px;">
-      <table>
-        <thead><tr>
-          <th>更新</th><th>Lv</th><th>conf</th><th>intent</th><th>goal</th><th>pref</th><th>status</th><th>user</th><th>msg</th>
-        </tr></thead>
-        <tbody id="custRows"><tr><td colspan="9">loading...</td></tr></tbody>
-      </table>
-    </div>
-  </div>
-
-<script>
-  const KEY = {json.dumps(key_q)};
-  const SHOP = {json.dumps(shop_id)};
-  const MIN = {min_level};
-  const LIMIT = {limit};
-  const REFRESH = {refresh};
-
-  function esc(s) {{
-    return (s ?? "").toString().replace(/[&<>"]/g, c => ({{"&":"&amp;","<":"&lt;",">":"&gt;","\\"":"&quot;"}}[c]));
-  }}
-  function fmt(iso) {{
-    if (!iso) return "-";
-    try {{ return new Date(iso).toLocaleString(); }} catch(e) {{ return iso; }}
-  }}
-  async function fetchJson(url) {{
-    const r = await fetch(url);
-    return await r.json();
-  }}
-
-  let chart = null;
-
-  async function renderDist() {{
-    const url = "/api/stats/level_dist?shop_id=" + encodeURIComponent(SHOP) + "&key=" + encodeURIComponent(KEY);
-    const dist = await fetchJson(url);
-    const labels = ["1","2","3","4","5","6","7","8","9","10"];
-    const data = labels.map(k => Number(dist[k] || 0));
-    const ctx = document.getElementById("chart");
-    if (chart) {{
-      chart.data.labels = labels;
-      chart.data.datasets[0].data = data;
-      chart.update();
-      return;
-    }}
-    chart = new Chart(ctx, {{
-      type: "bar",
-      data: {{ labels: labels, datasets: [{{ label: "count", data: data, borderWidth: 1 }}] }},
-      options: {{ responsive: true }}
-    }});
-  }}
-
-  async function renderCustomers() {{
-    const url = "/api/hot?view=customers"
-      + "&shop_id=" + encodeURIComponent(SHOP)
-      + "&min_level=" + encodeURIComponent(String(MIN))
-      + "&limit=" + encodeURIComponent(String(LIMIT))
-      + "&key=" + encodeURIComponent(KEY);
-    const rows = await fetchJson(url);
-    const need = rows.filter(r => !!r.need_reply);
-
-    const needBody = need.length ? need.map(r => {{
-      const link = "/dashboard/customer?shop_id=" + encodeURIComponent(SHOP)
-        + "&conv_key=" + encodeURIComponent(r.conv_key)
-        + "&key=" + encodeURIComponent(KEY);
-      return "<tr>"
-        + "<td class='mono'>" + esc(fmt(r.ts)) + "</td>"
-        + "<td class='mono'>" + esc(r.temp_level_stable) + "</td>"
-        + "<td class='mono'>" + esc(r.intent || "-") + "</td>"
-        + "<td>" + esc(r.need_reply_reason || "need") + "</td>"
-        + "<td>" + esc(r.next_goal || "-") + "</td>"
-        + "<td class='mono'>" + esc((r.pref_hour_jst ?? "-")) + "(" + esc((r.pref_hour_samples ?? "-")) + ")</td>"
-        + "<td class='mono'><a href='" + link + "'>" + esc(r.user_id || "") + "</a></td>"
-        + "<td>" + esc((r.message || "").slice(0,140)) + "</td>"
-        + "</tr>";
-    }}).join("") : "<tr><td colspan='8'>need_reply なし</td></tr>";
-
-    document.getElementById("needRows").innerHTML = needBody;
-
-    const custBody = rows.length ? rows.map(r => {{
-      const link = "/dashboard/customer?shop_id=" + encodeURIComponent(SHOP)
-        + "&conv_key=" + encodeURIComponent(r.conv_key)
-        + "&key=" + encodeURIComponent(KEY);
-      const conf = (r.confidence == null) ? "-" : Number(r.confidence).toFixed(2);
-      return "<tr>"
-        + "<td class='mono'>" + esc(fmt(r.ts)) + "</td>"
-        + "<td class='mono'>" + esc(r.temp_level_stable) + "</td>"
-        + "<td class='mono'>" + esc(conf) + "</td>"
-        + "<td class='mono'>" + esc(r.intent || "-") + "</td>"
-        + "<td>" + esc(r.next_goal || "-") + "</td>"
-        + "<td class='mono'>" + esc((r.pref_hour_jst ?? "-")) + "(" + esc((r.pref_hour_samples ?? "-")) + ")</td>"
-        + "<td class='mono'>" + esc(r.status || "-") + "</td>"
-        + "<td class='mono'><a href='" + link + "'>" + esc(r.user_id || "") + "</a></td>"
-        + "<td>" + esc((r.message || "").slice(0,160)) + "</td>"
-        + "</tr>";
-    }}).join("") : "<tr><td colspan='9'>no data</td></tr>";
-
-    document.getElementById("custRows").innerHTML = custBody;
-  }}
-
-  async function tick() {{
-    await Promise.all([renderDist(), renderCustomers()]);
-  }}
-
-  tick().catch(console.error);
-  if (REFRESH > 0) {{
-    setInterval(() => tick().catch(console.error), REFRESH * 1000);
-  }}
-</script>
-</body>
-</html>
-"""
-    return HTMLResponse(html)
-
-
-# ============================================================
-# Customer detail API & page (NO template literals)
+# Customer detail API + pages
 # ============================================================
 
 @app.get("/api/customer/detail")
@@ -2131,19 +1523,16 @@ async def api_customer_detail(
     _: None = Depends(require_dashboard_key),
     shop_id: str = Query(default=SHOP_ID),
     conv_key: str = Query(...),
-    msg_limit: int = Query(default=120, ge=10, le=400),
-    followup_limit: int = Query(default=60, ge=10, le=200),
+    msg_limit: int = Query(default=160, ge=10, le=400),
+    followup_limit: int = Query(default=80, ge=10, le=200),
 ):
-    if not DATABASE_URL:
-        return JSONResponse({"ok": True, "customer": None, "messages": [], "followups": []}, status_code=200)
-
     crow = db_fetchall(
         """
         SELECT conv_key, user_id, last_user_text, temp_level_stable, confidence, COALESCE(intent,'other'), next_goal, updated_at,
                COALESCE(status,'ACTIVE'), COALESCE(opt_out,FALSE),
-               visit_slot_selected, visit_slot_selected_at,
-               slot_budget, slot_area, slot_move_in, slot_layout,
-               COALESCE(need_reply,FALSE), COALESCE(need_reply_reason,''), need_reply_updated_at,
+               COALESCE(need_reply,FALSE), COALESCE(need_reply_reason,''),
+               COALESCE(perma_cold,FALSE), COALESCE(silence_score,0),
+               COALESCE(won,FALSE), won_at, won_by,
                pref_hour_jst, pref_hour_samples
         FROM customers
         WHERE shop_id=%s AND conv_key=%s
@@ -2151,7 +1540,6 @@ async def api_customer_detail(
         """,
         (shop_id, conv_key),
     )
-
     customer = None
     if crow:
         r = crow[0]
@@ -2166,17 +1554,15 @@ async def api_customer_detail(
             "updated_at": r[7].isoformat() if r[7] else None,
             "status": r[8],
             "opt_out": bool(r[9]),
-            "visit_slot_selected": r[10],
-            "visit_slot_selected_at": r[11].isoformat() if r[11] else None,
-            "slot_budget": r[12],
-            "slot_area": r[13],
-            "slot_move_in": r[14],
-            "slot_layout": r[15],
-            "need_reply": bool(r[16]),
-            "need_reply_reason": r[17],
-            "need_reply_updated_at": r[18].isoformat() if r[18] else None,
-            "pref_hour_jst": r[19],
-            "pref_hour_samples": r[20],
+            "need_reply": bool(r[10]),
+            "need_reply_reason": r[11],
+            "perma_cold": bool(r[12]),
+            "silence_score": int(r[13] or 0),
+            "won": bool(r[14]),
+            "won_at": r[15].isoformat() if r[15] else None,
+            "won_by": r[16],
+            "pref_hour_jst": r[17],
+            "pref_hour_samples": r[18],
         }
 
     msgs = db_fetchall(
@@ -2228,8 +1614,168 @@ async def api_customer_detail(
         for f in fls
     ]
 
-    return JSONResponse({"ok": True, "customer": customer, "messages": messages, "followups": followups}, status_code=200)
+    return JSONResponse({"ok": True, "customer": customer, "messages": messages, "followups": followups})
 
+
+# ============================================================
+# KPI (Executive)
+# ============================================================
+
+def get_kpi_summary(shop_id: str, days: int = 30) -> Dict[str, Any]:
+    since = utcnow() - timedelta(days=max(1, min(365, int(days))))
+
+    total = db_fetchall(
+        "SELECT COUNT(*) FROM customers WHERE shop_id=%s AND updated_at>= %s",
+        (shop_id, since),
+    )[0][0]
+
+    won = db_fetchall(
+        "SELECT COUNT(*) FROM customers WHERE shop_id=%s AND COALESCE(won,FALSE)=TRUE AND won_at>= %s",
+        (shop_id, since),
+    )[0][0]
+
+    ai_touched = db_fetchall(
+        """
+        SELECT COUNT(DISTINCT conv_key)
+        FROM messages
+        WHERE shop_id=%s AND role='assistant' AND created_at>= %s
+        """,
+        (shop_id, since),
+    )[0][0]
+
+    intent_rows = db_fetchall(
+        """
+        SELECT COALESCE(intent,'other'), COUNT(*)
+        FROM customers
+        WHERE shop_id=%s AND COALESCE(won,FALSE)=TRUE AND won_at>= %s
+        GROUP BY COALESCE(intent,'other')
+        """,
+        (shop_id, since),
+    )
+    intent_win = {str(r[0] or "other"): int(r[1] or 0) for r in intent_rows}
+
+    return {
+        "period_days": int(days),
+        "customers": int(total),
+        "won": int(won),
+        "win_rate": (won / total) if total else 0.0,
+        "ai_touched": int(ai_touched),
+        "ai_touch_rate": (ai_touched / total) if total else 0.0,
+        "intent_win": intent_win,
+    }
+
+
+@app.get("/api/kpi")
+async def api_kpi(
+    _: None = Depends(require_dashboard_key),
+    shop_id: str = Query(default=SHOP_ID),
+    days: int = Query(default=30, ge=1, le=365),
+):
+    return JSONResponse(get_kpi_summary(shop_id, days))
+
+
+@app.get("/dashboard/executive", response_class=HTMLResponse)
+async def dashboard_executive(
+    _: None = Depends(require_dashboard_key),
+    shop_id: str = Query(default=SHOP_ID),
+    days: int = Query(default=30, ge=1, le=365),
+    key: Optional[str] = Query(default=None),
+):
+    key_q = (key or "").strip()
+    html = f"""
+<!doctype html>
+<html lang="ja">
+<head>
+<meta charset="utf-8"/>
+<title>Executive Dashboard</title>
+<style>
+ body{{font-family:system-ui;background:#0b1020;color:#fff;margin:20px}}
+ .card{{background:rgba(255,255,255,.08);border-radius:14px;padding:14px;margin-bottom:14px}}
+ .row{{display:flex;gap:14px;flex-wrap:wrap}}
+ .kpi{{font-size:28px;font-weight:700}}
+ .mono{{font-family:ui-monospace}}
+ a{{color:#8ab4f8}}
+</style>
+</head>
+<body>
+  <div class="card">
+    <a href="/dashboard?shop_id={shop_id}&key={key_q}">← back</a>
+    <h2>Executive KPI（{days}日）</h2>
+  </div>
+
+  <div id="kpis" class="row"></div>
+
+<script>
+const KEY = {json.dumps(key_q)};
+const SHOP = {json.dumps(shop_id)};
+const DAYS = {days};
+
+async function fetchJson(url) {{
+  const r = await fetch(url);
+  return await r.json();
+}}
+
+(async()=>{
+  const url = "/api/kpi?shop_id=" + encodeURIComponent(SHOP)
+    + "&days=" + encodeURIComponent(String(DAYS))
+    + "&key=" + encodeURIComponent(KEY);
+
+  const k = await fetchJson(url);
+
+  document.getElementById("kpis").innerHTML =
+    "<div class='card'><div>顧客数</div><div class='kpi'>" + k.customers + "</div></div>"
+    + "<div class='card'><div>成約数</div><div class='kpi'>" + k.won + "</div></div>"
+    + "<div class='card'><div>成約率</div><div class='kpi'>" + (k.win_rate*100).toFixed(1) + "%</div></div>"
+    + "<div class='card'><div>AI関与率</div><div class='kpi'>" + (k.ai_touch_rate*100).toFixed(1) + "%</div></div>"
+    + "<div class='card'><div>intent別成約</div><pre class='mono'>" + JSON.stringify(k.intent_win,null,2) + "</pre></div>";
+})();
+</script>
+</body>
+</html>
+"""
+    return HTMLResponse(html)
+
+
+# ============================================================
+# Admin APIs: WIN / perma_cold解除
+# ============================================================
+
+@app.post("/api/customer/mark_won")
+async def api_mark_won(
+    _: None = Depends(require_admin_key),
+    shop_id: str = Query(default=SHOP_ID),
+    conv_key: str = Query(...),
+):
+    mark_won(shop_id, conv_key, by="admin")
+    return {"ok": True, "won": True}
+
+
+@app.post("/api/customer/unmark_won")
+async def api_unmark_won(
+    _: None = Depends(require_admin_key),
+    shop_id: str = Query(default=SHOP_ID),
+    conv_key: str = Query(...),
+):
+    unmark_won(shop_id, conv_key)
+    return {"ok": True, "won": False}
+
+
+@app.post("/api/customer/clear_perma_cold")
+async def api_clear_perma_cold(
+    _: None = Depends(require_admin_key),
+    shop_id: str = Query(default=SHOP_ID),
+    conv_key: str = Query(...),
+):
+    db_execute(
+        "UPDATE customers SET perma_cold=FALSE, silence_score=0, updated_at=now() WHERE shop_id=%s AND conv_key=%s",
+        (shop_id, conv_key),
+    )
+    return {"ok": True}
+
+
+# ============================================================
+# Dashboard HTML (enhanced customer page)
+# ============================================================
 
 @app.get("/dashboard/customer", response_class=HTMLResponse)
 async def dashboard_customer(
@@ -2255,6 +1801,8 @@ async def dashboard_customer(
   .msg{{padding:8px;border-bottom:1px solid rgba(255,255,255,.12)}}
   .u{{color:#ffb020}} .a{{color:#37d67a}}
   pre{{white-space:pre-wrap}}
+  button{{padding:8px 10px;border-radius:10px;border:1px solid rgba(255,255,255,.18);background:rgba(255,255,255,.06);color:#fff;cursor:pointer}}
+  .btnrow{{display:flex;gap:10px;flex-wrap:wrap}}
 </style>
 </head>
 <body>
@@ -2264,6 +1812,17 @@ async def dashboard_customer(
   </div>
 
   <div class="card" id="cust">loading...</div>
+
+  <div class="card">
+    <div class="btnrow">
+      <button onclick="markWon()">🟢 成約（WIN）</button>
+      <button onclick="unmarkWon()">↩︎ 成約取消</button>
+      <button onclick="clearCold()">🧊 perma_cold解除</button>
+      <button onclick="runAutoCold()">🤖 auto_cold</button>
+    </div>
+    <div style="opacity:.8;margin-top:8px">※ 成約は C方式：ここで押した時だけ WIN になります</div>
+  </div>
+
   <div class="card"><b>Messages</b><div id="msgs">loading...</div></div>
   <div class="card"><b>Followups</b><div id="fls">loading...</div></div>
 
@@ -2275,12 +1834,16 @@ async def dashboard_customer(
   function esc(s) {{
     return (s ?? "").toString().replace(/[&<>"]/g, c => ({{"&":"&amp;","<":"&lt;",">":"&gt;","\\"":"&quot;"}}[c]));
   }}
-  async function fetchJson(url) {{
-    const r = await fetch(url);
+  async function fetchJson(url, opts) {{
+    const r = await fetch(url, opts || undefined);
     return await r.json();
   }}
 
-  (async () => {{
+  function adminKey() {{
+    return localStorage.getItem("dashboard_admin_key") || "";
+  }}
+
+  async function reload() {{
     const url = "/api/customer/detail?shop_id=" + encodeURIComponent(SHOP)
       + "&conv_key=" + encodeURIComponent(CONV)
       + "&key=" + encodeURIComponent(KEY);
@@ -2300,11 +1863,11 @@ async def dashboard_customer(
       + esc(c.need_reply_reason || "") + ")<br/>"
       + "<b>pref_hour</b>: <span class='mono'>" + esc((c.pref_hour_jst ?? "-")) + "</span> samples:"
       + "<span class='mono'>" + esc((c.pref_hour_samples ?? "-")) + "</span><br/>"
-      + "<b>slots</b>: budget=" + esc(c.slot_budget || "-")
-      + " / area=" + esc(c.slot_area || "-")
-      + " / move_in=" + esc(c.slot_move_in || "-")
-      + " / layout=" + esc(c.slot_layout || "-") + "<br/>"
-      + "<b>visit</b>: " + esc(c.visit_slot_selected || "-") + "<br/>"
+      + "<b>silence_score</b>: <span class='mono'>" + esc((c.silence_score ?? 0)) + "</span> / "
+      + "<b>perma_cold</b>: <span class='mono'>" + esc(c.perma_cold ? "TRUE" : "FALSE") + "</span><br/>"
+      + "<b>won</b>: <span class='mono'>" + esc(c.won ? "TRUE" : "FALSE") + "</span> / "
+      + "<b>won_at</b>: <span class='mono'>" + esc(c.won_at || "-") + "</span> / "
+      + "<b>won_by</b>: <span class='mono'>" + esc(c.won_by || "-") + "</span><br/>"
       + "<b>updated</b>: <span class='mono'>" + esc(c.updated_at || "-") + "</span>";
 
     const msgs = d.messages || [];
@@ -2333,7 +1896,38 @@ async def dashboard_customer(
         + "<div class='mono'>responded:" + esc(f.responded_at || "-") + " / err:" + esc(f.error || "-") + "</div>"
         + "</div>";
     }}).join("") : "no followups";
-  }})().catch(console.error);
+  }}
+
+  async function markWon() {{
+    const url = "/api/customer/mark_won?shop_id=" + encodeURIComponent(SHOP) + "&conv_key=" + encodeURIComponent(CONV);
+    await fetchJson(url, {{method:"POST", headers:{{"x-admin-key": adminKey()}}}});
+    await reload();
+  }}
+
+  async function unmarkWon() {{
+    const url = "/api/customer/unmark_won?shop_id=" + encodeURIComponent(SHOP) + "&conv_key=" + encodeURIComponent(CONV);
+    await fetchJson(url, {{method:"POST", headers:{{"x-admin-key": adminKey()}}}});
+    await reload();
+  }}
+
+  async function clearCold() {{
+    const url = "/api/customer/clear_perma_cold?shop_id=" + encodeURIComponent(SHOP) + "&conv_key=" + encodeURIComponent(CONV);
+    await fetchJson(url, {{method:"POST", headers:{{"x-admin-key": adminKey()}}}});
+    await reload();
+  }}
+
+  async function runAutoCold() {{
+    const url = "/jobs/auto_cold";
+    await fetchJson(url, {{method:"POST", headers:{{"x-admin-key": adminKey()}}}});
+    await reload();
+  }}
+
+  if (!localStorage.getItem("dashboard_admin_key")) {{
+    const k = prompt("ADMIN_API_KEY を入れてください（このブラウザに保存）");
+    if (k) localStorage.setItem("dashboard_admin_key", k.trim());
+  }}
+
+  reload().catch(console.error);
 </script>
 </body>
 </html>
@@ -2342,125 +1936,215 @@ async def dashboard_customer(
 
 
 # ============================================================
-# Admin actions
+# Dashboard HOME (same as clean stable; minimal)
 # ============================================================
 
-def fetch_customer_for_action(shop_id: str, conv_key: str) -> Optional[Dict[str, Any]]:
-    rows = db_fetchall(
-        """
-        SELECT conv_key, user_id,
-               COALESCE(temp_level_stable,0),
-               COALESCE(next_goal,''),
-               COALESCE(last_user_text,''),
-               COALESCE(status,'ACTIVE'),
-               COALESCE(opt_out,FALSE),
-               COALESCE(intent,'other'),
-               pref_hour_jst,
-               updated_at
-        FROM customers
-        WHERE shop_id=%s AND conv_key=%s
-        LIMIT 1
-        """,
-        (shop_id, conv_key),
-    )
-    if not rows:
-        return None
-    conv_key, user_id, lvl, goal, last_text, st, opt, intent, pref_hour_jst, updated_at = rows[0]
-    return {
-        "conv_key": conv_key,
-        "user_id": user_id,
-        "level": int(lvl or 0),
-        "next_goal": goal or "",
-        "last_user_text": last_text or "",
-        "status": (st or "ACTIVE"),
-        "opt_out": bool(opt),
-        "intent": intent or "other",
-        "pref_hour_jst": pref_hour_jst,
-        "updated_at": updated_at,
-    }
-
-
-@app.post("/api/customer/mark_optout")
-async def api_customer_mark_optout(
-    _: None = Depends(require_admin_key),
+@app.get("/dashboard", response_class=HTMLResponse)
+async def dashboard(
+    _: None = Depends(require_dashboard_key),
     shop_id: str = Query(default=SHOP_ID),
-    conv_key: str = Query(...),
+    min_level: int = Query(default=1, ge=1, le=10),
+    limit: int = Query(default=80, ge=1, le=200),
+    refresh: int = Query(default=DASHBOARD_REFRESH_SEC_DEFAULT, ge=0, le=300),
+    key: Optional[str] = Query(default=None),
 ):
-    if not DATABASE_URL:
-        return {"ok": True}
-    c = fetch_customer_for_action(shop_id, conv_key)
-    uid = (c or {}).get("user_id") or "unknown"
-    mark_opt_out(shop_id, conv_key, uid)
-    return {"ok": True}
+    key_q = (key or "").strip()
 
+    html = f"""
+<!doctype html>
+<html lang="ja">
+<head>
+<meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width, initial-scale=1"/>
+<title>Dashboard | {shop_id}</title>
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
+<style>
+  body{{font-family:system-ui,-apple-system,"Hiragino Sans","Noto Sans JP",sans-serif;margin:16px;background:#0b1020;color:#fff}}
+  .row{{display:flex;gap:12px;flex-wrap:wrap;align-items:center}}
+  .card{{background:rgba(255,255,255,.06);border:1px solid rgba(255,255,255,.12);border-radius:14px;padding:12px}}
+  table{{width:100%;border-collapse:collapse}}
+  th,td{{border-bottom:1px solid rgba(255,255,255,.12);padding:8px;font-size:12px;vertical-align:top}}
+  th{{color:rgba(255,255,255,.7);text-align:left}}
+  .mono{{font-family:ui-monospace,Menlo,Monaco,Consolas,monospace}}
+  a{{color:#8ab4f8}}
+</style>
+</head>
+<body>
+  <div class="row">
+    <div class="card"><b>SHOP</b> <span class="mono">{shop_id}</span></div>
+    <div class="card"><b>min_level</b> {min_level} / <b>limit</b> {limit} / <b>refresh</b> {refresh}s</div>
+    <div class="card"><a href="/dashboard/executive?shop_id={shop_id}&days=30&key={key_q}">Executive KPI →</a></div>
+  </div>
 
-@app.post("/api/customer/reset_need_reply")
-async def api_customer_reset_need_reply(
-    _: None = Depends(require_admin_key),
-    shop_id: str = Query(default=SHOP_ID),
-    conv_key: str = Query(...),
-):
-    if not DATABASE_URL:
-        return {"ok": True}
-    set_need_reply(shop_id, conv_key, False, "manual_reset")
-    return {"ok": True}
+  <div class="row" style="margin-top:12px;">
+    <div class="card" style="flex:1;min-width:320px;">
+      <div style="display:flex;justify-content:space-between;align-items:center;">
+        <b>温度分布（全体）</b><span class="mono">/api/stats/level_dist</span>
+      </div>
+      <canvas id="chart" height="110"></canvas>
+    </div>
+    <div class="card" style="flex:1;min-width:320px;">
+      <div style="display:flex;justify-content:space-between;align-items:center;">
+        <b>今やる（need_reply=TRUE）</b><span class="mono">customers</span>
+      </div>
+      <div style="margin-top:8px;overflow:auto;max-height:420px;">
+        <table>
+          <thead><tr>
+            <th>更新</th><th>Lv</th><th>intent</th><th>need</th><th>goal</th><th>pref</th><th>flags</th><th>user</th><th>msg</th>
+          </tr></thead>
+          <tbody id="needRows"><tr><td colspan="9">loading...</td></tr></tbody>
+        </table>
+      </div>
+    </div>
+  </div>
 
+  <div class="card" style="margin-top:12px;">
+    <div style="display:flex;justify-content:space-between;align-items:center;">
+      <b>顧客（最新）</b><span class="mono">/api/hot?view=customers</span>
+    </div>
+    <div style="margin-top:8px;overflow:auto;max-height:520px;">
+      <table>
+        <thead><tr>
+          <th>更新</th><th>Lv</th><th>conf</th><th>intent</th><th>goal</th><th>pref</th><th>flags</th><th>status</th><th>user</th><th>msg</th>
+        </tr></thead>
+        <tbody id="custRows"><tr><td colspan="10">loading...</td></tr></tbody>
+      </table>
+    </div>
+  </div>
 
-@app.post("/api/customer/send_followup_now")
-async def api_customer_send_followup_now(
-    _: None = Depends(require_admin_key),
-    shop_id: str = Query(default=SHOP_ID),
-    conv_key: str = Query(...),
-    stage: int = Query(default=1, ge=1, le=2),
-):
-    if not DATABASE_URL:
-        return {"ok": True, "sent": False, "reason": "no_db"}
+<script>
+  const KEY = {json.dumps(key_q)};
+  const SHOP = {json.dumps(shop_id)};
+  const MIN = {min_level};
+  const LIMIT = {limit};
+  const REFRESH = {refresh};
 
-    c = fetch_customer_for_action(shop_id, conv_key)
-    if not c:
-        return {"ok": True, "sent": False, "reason": "not_found"}
+  function esc(s) {{
+    return (s ?? "").toString().replace(/[&<>"]/g, c => ({{"&":"&amp;","<":"&lt;",">":"&gt;","\\"":"&quot;"}}[c]));
+  }}
+  function fmt(iso) {{
+    if (!iso) return "-";
+    try {{ return new Date(iso).toLocaleString(); }} catch(e) {{ return iso; }}
+  }}
+  async function fetchJson(url) {{
+    const r = await fetch(url);
+    return await r.json();
+  }}
 
-    if c["opt_out"] or (c["status"] or "").upper() in ("COLD", "LOST", "OPTOUT"):
-        return {"ok": True, "sent": False, "reason": "inactive"}
+  function flagsCell(r) {{
+    let parts = [];
+    if (r.won) parts.push("WON");
+    if (r.perma_cold) parts.push("COLD");
+    if (r.silence_score != null && r.silence_score >= 5) parts.push("SIL+" + r.silence_score);
+    return parts.length ? parts.join(",") : "-";
+  }}
 
-    user_id = c["user_id"]
-    if not user_id or user_id == "unknown":
-        return {"ok": True, "sent": False, "reason": "no_user_id"}
+  let chart = null;
 
-    variant = pick_ab_variant(conv_key)
+  async function renderDist() {{
+    const url = "/api/stats/level_dist?shop_id=" + encodeURIComponent(SHOP) + "&key=" + encodeURIComponent(KEY);
+    const dist = await fetchJson(url);
+    const labels = ["1","2","3","4","5","6","7","8","9","10"];
+    const data = labels.map(k => Number(dist[k] || 0));
+    const ctx = document.getElementById("chart");
+    if (chart) {{
+      chart.data.labels = labels;
+      chart.data.datasets[0].data = data;
+      chart.update();
+      return;
+    }}
+    chart = new Chart(ctx, {{
+      type: "bar",
+      data: {{ labels: labels, datasets: [{{ label: "count", data: data, borderWidth: 1 }}] }},
+      options: {{ responsive: true }}
+    }});
+  }}
 
-    msg: Optional[str] = None
-    mode = "template"
-    if stage == 1:
-        msg = await generate_followup_message_llm(shop_id, conv_key, stage=1, variant=variant, customer=c)
-        if msg:
-            mode = "llm"
-        else:
-            msg = build_followup_template_ab_fallback(variant, c["next_goal"], c["last_user_text"], c["level"])
-    else:
-        msg = await generate_followup_message_llm(shop_id, conv_key, stage=2, variant=variant, customer=c)
-        if msg:
-            mode = "llm"
-        else:
-            msg = build_second_touch_message_fallback(c["next_goal"])
+  async function renderCustomers() {{
+    const url = "/api/hot?view=customers"
+      + "&shop_id=" + encodeURIComponent(SHOP)
+      + "&min_level=" + encodeURIComponent(String(MIN))
+      + "&limit=" + encodeURIComponent(String(LIMIT))
+      + "&key=" + encodeURIComponent(KEY);
 
-    try:
-        await push_line(user_id, msg or "")
-        save_followup_log(shop_id, conv_key, user_id, msg or "", mode, "sent", None, variant, stage, send_hour_jst=now_jst().hour)
-        return {"ok": True, "sent": True, "stage": stage, "variant": variant, "mode": mode}
-    except Exception as e:
-        save_followup_log(shop_id, conv_key, user_id, msg or "", mode, "failed", str(e)[:200], variant, stage, send_hour_jst=now_jst().hour)
-        return {"ok": True, "sent": False, "error": str(e)[:200]}
+    const rows = await fetchJson(url);
+    const need = rows.filter(r => !!r.need_reply);
+
+    const needBody = need.length ? need.map(r => {{
+      const link = "/dashboard/customer?shop_id=" + encodeURIComponent(SHOP)
+        + "&conv_key=" + encodeURIComponent(r.conv_key)
+        + "&key=" + encodeURIComponent(KEY);
+      return "<tr>"
+        + "<td class='mono'>" + esc(fmt(r.ts)) + "</td>"
+        + "<td class='mono'>" + esc(r.temp_level_stable) + "</td>"
+        + "<td class='mono'>" + esc(r.intent || "-") + "</td>"
+        + "<td>" + esc(r.need_reply_reason || "need") + "</td>"
+        + "<td>" + esc(r.next_goal || "-") + "</td>"
+        + "<td class='mono'>" + esc((r.pref_hour_jst ?? "-")) + "(" + esc((r.pref_hour_samples ?? "-")) + ")</td>"
+        + "<td class='mono'>" + esc(flagsCell(r)) + "</td>"
+        + "<td class='mono'><a href='" + link + "'>" + esc(r.user_id || "") + "</a></td>"
+        + "<td>" + esc((r.message || "").slice(0,140)) + "</td>"
+        + "</tr>";
+    }}).join("") : "<tr><td colspan='9'>need_reply なし</td></tr>";
+
+    document.getElementById("needRows").innerHTML = needBody;
+
+    const custBody = rows.length ? rows.map(r => {{
+      const link = "/dashboard/customer?shop_id=" + encodeURIComponent(SHOP)
+        + "&conv_key=" + encodeURIComponent(r.conv_key)
+        + "&key=" + encodeURIComponent(KEY);
+      const conf = (r.confidence == null) ? "-" : Number(r.confidence).toFixed(2);
+      return "<tr>"
+        + "<td class='mono'>" + esc(fmt(r.ts)) + "</td>"
+        + "<td class='mono'>" + esc(r.temp_level_stable) + "</td>"
+        + "<td class='mono'>" + esc(conf) + "</td>"
+        + "<td class='mono'>" + esc(r.intent || "-") + "</td>"
+        + "<td>" + esc(r.next_goal || "-") + "</td>"
+        + "<td class='mono'>" + esc((r.pref_hour_jst ?? "-")) + "(" + esc((r.pref_hour_samples ?? "-")) + ")</td>"
+        + "<td class='mono'>" + esc(flagsCell(r)) + "</td>"
+        + "<td class='mono'>" + esc(r.status || "-") + "</td>"
+        + "<td class='mono'><a href='" + link + "'>" + esc(r.user_id || "") + "</a></td>"
+        + "<td>" + esc((r.message || "").slice(0,160)) + "</td>"
+        + "</tr>";
+    }}).join("") : "<tr><td colspan='10'>no data</td></tr>";
+
+    document.getElementById("custRows").innerHTML = custBody;
+  }}
+
+  async function tick() {{
+    await Promise.all([renderDist(), renderCustomers()]);
+  }}
+
+  tick().catch(console.error);
+  if (REFRESH > 0) {{
+    setInterval(() => tick().catch(console.error), REFRESH * 1000);
+  }}
+</script>
+</body>
+</html>
+"""
+    return HTMLResponse(html)
 
 
 # ============================================================
 # Jobs
 # ============================================================
 
-@app.post("/jobs/maintenance")
-async def job_maintenance(_: None = Depends(require_admin_key)):
-    maintenance_update_statuses(SHOP_ID)
-    return {"ok": True}
+def acquire_job_lock(key: str, ttl_sec: int) -> bool:
+    now = utcnow()
+    until = now + timedelta(seconds=max(10, int(ttl_sec)))
+    rows = db_fetchall("SELECT locked_until FROM job_locks WHERE key=%s", (key,))
+    if rows and rows[0][0] and rows[0][0] > now:
+        return False
+    db_execute(
+        """
+        INSERT INTO job_locks (key, locked_until)
+        VALUES (%s, %s)
+        ON CONFLICT (key) DO UPDATE SET locked_until=EXCLUDED.locked_until
+        """,
+        (key, until),
+    )
+    return True
 
 
 @app.post("/jobs/followup")
@@ -2468,110 +2152,109 @@ async def job_followup(_: None = Depends(require_admin_key)):
     if not FOLLOWUP_ENABLED:
         return {"ok": True, "enabled": False, "reason": "FOLLOWUP_ENABLED!=1"}
 
-    maintenance_update_statuses(SHOP_ID)
-
     if not is_within_jst_window():
         return {"ok": True, "enabled": True, "skipped": True, "reason": "out_of_time_window"}
 
     if not acquire_job_lock("followup", FOLLOWUP_LOCK_TTL_SEC):
         return {"ok": True, "enabled": True, "skipped": True, "reason": "locked"}
 
-    stage1 = get_followup_candidates_stage1()
-    stage2 = get_followup_candidates_stage2()
+    threshold = utcnow() - timedelta(minutes=FOLLOWUP_AFTER_MINUTES)
+    rows = db_fetchall(
+        """
+        SELECT conv_key, user_id, COALESCE(temp_level_stable,0), COALESCE(next_goal,''), COALESCE(last_user_text,''),
+               COALESCE(intent,'other'),
+               pref_hour_jst, updated_at,
+               COALESCE(opt_out,FALSE), COALESCE(perma_cold,FALSE), COALESCE(won,FALSE),
+               COALESCE(status,'ACTIVE')
+        FROM customers
+        WHERE shop_id=%s
+          AND COALESCE(temp_level_stable,0) >= %s
+          AND updated_at < %s
+          AND COALESCE(user_id,'') <> ''
+        ORDER BY updated_at ASC
+        LIMIT %s
+        """,
+        (SHOP_ID, FOLLOWUP_MIN_LEVEL, threshold, FOLLOWUP_LIMIT),
+    )
 
-    if FOLLOWUP_DRYRUN:
-        return {"ok": True, "enabled": True, "dryrun": True, "stage1": stage1[:50], "stage2": stage2[:50]}
-
-    sent1 = 0
-    sent2 = 0
+    sent = 0
     skipped_time = 0
     failed = 0
-
     now_hour = now_jst().hour
 
-    def should_send_now(updated_at: Optional[datetime], pref_hour: Optional[int]) -> bool:
-        if updated_at:
-            age_h = (utcnow() - updated_at).total_seconds() / 3600.0
-            if age_h >= max(1, FOLLOWUP_FORCE_SEND_AFTER_HOURS):
-                return True
-        target = choose_send_hour_jst(pref_hour)
-        return within_hour_band(now_hour, target, FOLLOWUP_TIME_MATCH_HOURS)
-
-    # stage1
-    for c in stage1:
-        conv_key = c["conv_key"]
-        user_id = c["user_id"]
-
-        if is_inactive(SHOP_ID, conv_key):
-            save_followup_log(SHOP_ID, conv_key, user_id, "(skipped inactive)", "llm/template", "skipped", "inactive", None, 1, send_hour_jst=now_hour)
+    for (conv_key, user_id, lvl, goal, last_text, intent, pref_hour, updated_at, opt, cold, won, st) in rows:
+        st_u = (st or "ACTIVE").upper()
+        if opt or cold or won or st_u in ("OPTOUT", "LOST", "WON"):
             continue
 
-        if not should_send_now(c.get("updated_at"), c.get("pref_hour_jst")):
-            skipped_time += 1
-            continue
+        age_h = (utcnow() - updated_at).total_seconds() / 3600.0 if updated_at else 999
+        if age_h < FOLLOWUP_FORCE_SEND_AFTER_HOURS:
+            target = choose_send_hour_jst(pref_hour)
+            if not within_hour_band(now_hour, target, FOLLOWUP_TIME_MATCH_HOURS):
+                skipped_time += 1
+                continue
+
+        customer = {
+            "conv_key": conv_key,
+            "user_id": user_id,
+            "level": int(lvl or 0),
+            "next_goal": goal or "",
+            "last_user_text": last_text or "",
+            "intent": intent or "other",
+            "pref_hour_jst": pref_hour,
+        }
 
         variant = pick_ab_variant(conv_key)
-        msg = await generate_followup_message_llm(SHOP_ID, conv_key, stage=1, variant=variant, customer=c)
+        msg = await generate_followup_message_llm(SHOP_ID, conv_key, stage=1, variant=variant, customer=customer)
         mode = "llm"
         if not msg:
-            msg = build_followup_template_ab_fallback(variant, c["next_goal"], c["last_user_text"], c["level"])
+            msg = followup_fallback(1, intent or "other", goal or "")
             mode = "template"
 
         try:
             await push_line(user_id, msg)
             save_followup_log(SHOP_ID, conv_key, user_id, msg, mode, "sent", None, variant, 1, send_hour_jst=now_hour)
-            sent1 += 1
+            sent += 1
         except Exception as e:
             save_followup_log(SHOP_ID, conv_key, user_id, msg, mode, "failed", str(e)[:200], variant, 1, send_hour_jst=now_hour)
             failed += 1
 
-    # stage2
-    for c in stage2:
-        conv_key = c["conv_key"]
-        user_id = c["user_id"]
+    return {"ok": True, "enabled": True, "sent": sent, "skipped_time": skipped_time, "failed": failed, "now_hour_jst": now_hour}
 
-        if is_inactive(SHOP_ID, conv_key):
-            save_followup_log(SHOP_ID, conv_key, user_id, "(skipped inactive)", "llm/template", "skipped", "inactive", None, 2, send_hour_jst=now_hour)
+
+@app.post("/jobs/auto_cold")
+async def job_auto_cold(_: None = Depends(require_admin_key)):
+    if not acquire_job_lock("auto_cold", 300):
+        return {"ok": True, "skipped": "locked"}
+
+    rows = db_fetchall(
+        """
+        SELECT conv_key
+        FROM customers
+        WHERE shop_id=%s
+          AND COALESCE(won,FALSE)=FALSE
+          AND COALESCE(opt_out,FALSE)=FALSE
+          AND COALESCE(perma_cold,FALSE)=FALSE
+        ORDER BY updated_at ASC
+        LIMIT %s
+        """,
+        (SHOP_ID, AUTO_COLD_LIMIT),
+    )
+
+    judged = 0
+    for (conv_key,) in rows:
+        hist = get_recent_conversation(SHOP_ID, conv_key, 12)
+        if not hist:
             continue
-
-        if not should_send_now(c.get("updated_at"), c.get("pref_hour_jst")):
-            skipped_time += 1
+        j = await auto_cold_judge(SHOP_ID, conv_key, hist)
+        if not j:
             continue
+        apply_silence_update(
+            SHOP_ID,
+            conv_key,
+            int(j.get("silence_score_delta", 0)),
+            bool(j.get("perma_cold", False)),
+        )
+        judged += 1
 
-        variant = pick_ab_variant(conv_key)
-        msg = await generate_followup_message_llm(SHOP_ID, conv_key, stage=2, variant=variant, customer=c)
-        mode = "llm"
-        if not msg:
-            msg = build_second_touch_message_fallback(c["next_goal"])
-            mode = "template"
-
-        try:
-            await push_line(user_id, msg)
-            save_followup_log(SHOP_ID, conv_key, user_id, msg, mode, "sent", None, variant, 2, send_hour_jst=now_hour)
-            sent2 += 1
-        except Exception as e:
-            save_followup_log(SHOP_ID, conv_key, user_id, msg, mode, "failed", str(e)[:200], variant, 2, send_hour_jst=now_hour)
-            failed += 1
-
-    return {
-        "ok": True,
-        "enabled": True,
-        "sent_stage1": sent1,
-        "sent_stage2": sent2,
-        "skipped_time": skipped_time,
-        "failed": failed,
-        "now_hour_jst": now_hour,
-        "time_band": FOLLOWUP_TIME_MATCH_HOURS,
-        "force_send_after_h": FOLLOWUP_FORCE_SEND_AFTER_HOURS,
-        "llm_enabled": FOLLOWUP_USE_LLM,
-    }
-
-
-@app.post("/jobs/push_test")
-async def job_push_test(
-    _: None = Depends(require_admin_key),
-    user_id: str = Query(...),
-    text: str = Query(...),
-):
-    await push_line(user_id, text)
-    return {"ok": True}
+    return {"ok": True, "judged": judged}
