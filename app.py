@@ -1,4 +1,4 @@
-# app.py (FULL REWRITE - STABLE & EVOLVED)
+# app.py (FULL REWRITE - STABLE & EVOLVED + DASHBOARD HUGE UPGRADE)
 # - No f-strings for HTML (prevents SyntaxError from leaked JS)
 # - No JS template literals (no `...` / ${...})
 # - Analyze: OpenAI Responses JSON Schema -> temp/intent/next_goal (DB truth)
@@ -6,6 +6,7 @@
 # - Timing learning: pref_hour_jst
 # - perma_cold + silence_score + /jobs/auto_cold
 # - Manual WIN (C) + KPI + Executive dashboard
+# - ✅ Dashboard upgrade: search/filter/sort/paging, inline actions, KPI overview, 14d trends, AB summary, CSV export, memo
 #
 # Required env:
 #   LINE_CHANNEL_SECRET, LINE_CHANNEL_ACCESS_TOKEN, OPENAI_API_KEY, DATABASE_URL, DASHBOARD_KEY, ADMIN_API_KEY
@@ -20,6 +21,8 @@
 #   PREF_HOUR_LOOKBACK_DAYS=60, PREF_HOUR_MIN_SAMPLES=3
 #   AUTO_COLD_USE_LLM=1, AUTO_COLD_LIMIT=80
 #   DASHBOARD_REFRESH_SEC_DEFAULT=30
+#   FAST_REPLY_TIMEOUT_SEC=3.0
+#   FOLLOWUP_AB_ENABLED=1
 
 import os
 import json
@@ -30,6 +33,8 @@ import ssl
 import secrets
 import asyncio
 import re
+import csv
+import io
 from datetime import datetime, timedelta, timezone
 from collections import deque, defaultdict
 from typing import Any, Dict, List, Optional, Tuple
@@ -39,7 +44,7 @@ import httpx
 import pg8000
 
 from fastapi import FastAPI, Request, Header, HTTPException, Query, Depends, BackgroundTasks
-from fastapi.responses import JSONResponse, HTMLResponse
+from fastapi.responses import JSONResponse, HTMLResponse, Response
 
 
 # ============================================================
@@ -104,7 +109,7 @@ JST = timezone(timedelta(hours=9))
 CHAT_HISTORY: Dict[str, deque] = defaultdict(lambda: deque(maxlen=40))
 TEMP_HISTORY: Dict[str, deque] = defaultdict(lambda: deque(maxlen=5))
 
-app = FastAPI(title="linebot_mvp", version="3.0.0")
+app = FastAPI(title="linebot_mvp", version="3.1.0")
 
 
 # ============================================================
@@ -129,7 +134,7 @@ OPTOUT_PATTERNS = [
 ]
 
 VISIT_CHANGE_PATTERNS = [
-    r"別日|他の日|別の?日|別時間|他の時間|時間変えて|日程変えて|調整したい",
+    r"別日|他の日|別時間|他の時間|時間変えて|日程変えて|調整したい",
 ]
 
 LOST_REVIVE_PATTERNS = [
@@ -192,6 +197,13 @@ def within_hour_band(now_hour: int, target_hour: int, band: int) -> bool:
     diff = abs(now_hour - target_hour)
     diff = min(diff, 24 - diff)
     return diff <= max(0, band)
+
+
+def _to_jst(dt: datetime) -> datetime:
+    try:
+        return dt.astimezone(JST)
+    except Exception:
+        return dt
 
 
 # ============================================================
@@ -345,6 +357,11 @@ def ensure_tables_and_columns() -> None:
     cur.execute("ALTER TABLE customers ADD COLUMN IF NOT EXISTS won BOOLEAN DEFAULT FALSE;")
     cur.execute("ALTER TABLE customers ADD COLUMN IF NOT EXISTS won_at TIMESTAMPTZ;")
     cur.execute("ALTER TABLE customers ADD COLUMN IF NOT EXISTS won_by TEXT;")
+
+    # memo (ops)
+    cur.execute("ALTER TABLE customers ADD COLUMN IF NOT EXISTS memo TEXT;")
+    cur.execute("ALTER TABLE customers ADD COLUMN IF NOT EXISTS memo_updated_at TIMESTAMPTZ;")
+    cur.execute("ALTER TABLE customers ADD COLUMN IF NOT EXISTS memo_by TEXT;")
 
     # messages
     cur.execute(
@@ -744,13 +761,6 @@ def compute_need_reply(next_goal: str, flags: Dict[str, Any], assistant_text: st
 # ============================================================
 # Preferred send hour learning
 # ============================================================
-
-def _to_jst(dt: datetime) -> datetime:
-    try:
-        return dt.astimezone(JST)
-    except Exception:
-        return dt
-
 
 def learn_pref_hour_from_messages(shop_id: str, conv_key: str) -> Tuple[Optional[int], int]:
     since = utcnow() - timedelta(days=max(7, min(365, PREF_HOUR_LOOKBACK_DAYS)))
@@ -1360,6 +1370,411 @@ async def api_stats_level_dist(
     return JSONResponse(dist)
 
 
+# ---- Dashboard v2 list: search/filter/sort/paging ----
+
+ALLOWED_CUSTOMER_ORDER_BY = {
+    "updated_at": "updated_at",
+    "level": "temp_level_stable",
+    "confidence": "confidence",
+    "silence_score": "silence_score",
+    "pref_hour": "pref_hour_jst",
+}
+
+def _normalize_order_dir(s: str) -> str:
+    return "ASC" if (s or "").lower() == "asc" else "DESC"
+
+def _build_customer_where(
+    shop_id: str,
+    min_level: int,
+    q: Optional[str],
+    status: str,
+    intent: str,
+    need: str,
+    include_inactive: bool,
+    updated_within_hours: int,
+) -> Tuple[str, List[Any]]:
+    where: List[str] = []
+    args: List[Any] = []
+
+    where.append("shop_id=%s")
+    args.append(shop_id)
+
+    where.append("COALESCE(temp_level_stable,0) >= %s")
+    args.append(int(min_level))
+
+    if not include_inactive:
+        where.append("COALESCE(opt_out,FALSE)=FALSE")
+        where.append("COALESCE(perma_cold,FALSE)=FALSE")
+        where.append("COALESCE(won,FALSE)=FALSE")
+        where.append("COALESCE(status,'ACTIVE') NOT IN ('OPTOUT','LOST','WON')")
+
+    st = (status or "ALL").strip().upper()
+    if st != "ALL":
+        where.append("COALESCE(status,'ACTIVE')=%s")
+        args.append(st)
+
+    it = (intent or "ALL").strip().lower()
+    if it != "all":
+        where.append("COALESCE(intent,'other')=%s")
+        args.append(it)
+
+    nd = (need or "ALL").strip().upper()
+    if nd == "1":
+        where.append("COALESCE(need_reply,FALSE)=TRUE")
+    elif nd == "0":
+        where.append("COALESCE(need_reply,FALSE)=FALSE")
+
+    if int(updated_within_hours or 0) > 0:
+        since = utcnow() - timedelta(hours=max(1, int(updated_within_hours)))
+        where.append("updated_at >= %s")
+        args.append(since)
+
+    qq = (q or "").strip()
+    if qq:
+        pat = "%" + qq + "%"
+        where.append(
+            "("
+            "conv_key ILIKE %s OR "
+            "COALESCE(user_id,'') ILIKE %s OR "
+            "COALESCE(last_user_text,'') ILIKE %s OR "
+            "COALESCE(next_goal,'') ILIKE %s OR "
+            "COALESCE(memo,'') ILIKE %s"
+            ")"
+        )
+        args.extend([pat, pat, pat, pat, pat])
+
+    return " AND ".join(where), args
+
+
+@app.get("/api/customers")
+async def api_customers(
+    _: None = Depends(require_dashboard_key),
+    shop_id: str = Query(default=SHOP_ID),
+    q: Optional[str] = Query(default=None),
+    min_level: int = Query(default=1, ge=1, le=10),
+    status: str = Query(default="ALL"),
+    intent: str = Query(default="ALL"),
+    need: str = Query(default="ALL"),  # ALL|1|0
+    include_inactive: int = Query(default=0, ge=0, le=1),
+    updated_within_hours: int = Query(default=0, ge=0, le=24 * 365),
+    order_by: str = Query(default="updated_at"),
+    order: str = Query(default="desc"),
+    limit: int = Query(default=120, ge=1, le=500),
+    offset: int = Query(default=0, ge=0, le=20000),
+):
+    where_sql, args = _build_customer_where(
+        shop_id=shop_id,
+        min_level=min_level,
+        q=q,
+        status=status,
+        intent=intent,
+        need=need,
+        include_inactive=bool(include_inactive),
+        updated_within_hours=updated_within_hours,
+    )
+
+    total = db_fetchall("SELECT COUNT(*) FROM customers WHERE " + where_sql, tuple(args))
+    total_n = int(total[0][0] or 0) if total else 0
+
+    col = ALLOWED_CUSTOMER_ORDER_BY.get((order_by or "").strip().lower(), "updated_at")
+    dir_sql = _normalize_order_dir(order)
+
+    order_sql = "COALESCE(need_reply,FALSE) DESC, " + col + " " + dir_sql + ", updated_at DESC"
+
+    sql = (
+        "SELECT conv_key, user_id, last_user_text, temp_level_stable, confidence, "
+        "COALESCE(intent,'other'), COALESCE(next_goal,''), updated_at, "
+        "COALESCE(status,'ACTIVE'), COALESCE(need_reply,FALSE), COALESCE(need_reply_reason,''), "
+        "COALESCE(won,FALSE), COALESCE(perma_cold,FALSE), COALESCE(silence_score,0), "
+        "pref_hour_jst, pref_hour_samples, "
+        "COALESCE(visit_slot_selected,''), COALESCE(slot_budget,''), COALESCE(slot_area,''), COALESCE(slot_move_in,''), COALESCE(slot_layout,''), "
+        "COALESCE(memo,''), memo_updated_at, memo_by "
+        "FROM customers WHERE " + where_sql +
+        " ORDER BY " + order_sql +
+        " LIMIT %s OFFSET %s"
+    )
+    rows = db_fetchall(sql, tuple(args + [int(limit), int(offset)]))
+
+    out = []
+    for r in rows:
+        out.append({
+            "conv_key": r[0],
+            "user_id": r[1],
+            "message": r[2],
+            "temp_level_stable": r[3],
+            "confidence": float(r[4]) if r[4] is not None else None,
+            "intent": r[5],
+            "next_goal": r[6],
+            "ts": r[7].isoformat() if r[7] else None,
+            "status": r[8],
+            "need_reply": bool(r[9]),
+            "need_reply_reason": r[10],
+            "won": bool(r[11]),
+            "perma_cold": bool(r[12]),
+            "silence_score": int(r[13] or 0),
+            "pref_hour_jst": r[14],
+            "pref_hour_samples": r[15],
+            "visit_slot_selected": r[16],
+            "slot_budget": r[17],
+            "slot_area": r[18],
+            "slot_move_in": r[19],
+            "slot_layout": r[20],
+            "memo": r[21],
+            "memo_updated_at": r[22].isoformat() if r[22] else None,
+            "memo_by": r[23],
+        })
+
+    return JSONResponse({
+        "ok": True,
+        "total": total_n,
+        "offset": int(offset),
+        "limit": int(limit),
+        "rows": out,
+    })
+
+
+@app.get("/api/stats/overview")
+async def api_stats_overview(
+    _: None = Depends(require_dashboard_key),
+    shop_id: str = Query(default=SHOP_ID),
+    days: int = Query(default=30, ge=1, le=365),
+):
+    since_30d = utcnow() - timedelta(days=int(days))
+    since_24h = utcnow() - timedelta(hours=24)
+
+    row = db_fetchall(
+        """
+        SELECT
+          COUNT(*) AS total,
+          SUM(CASE WHEN COALESCE(need_reply,FALSE)=TRUE THEN 1 ELSE 0 END) AS need_reply,
+          SUM(CASE WHEN COALESCE(temp_level_stable,0) >= 8 THEN 1 ELSE 0 END) AS hot,
+          SUM(CASE WHEN COALESCE(temp_level_stable,0) BETWEEN 5 AND 7 THEN 1 ELSE 0 END) AS warm,
+          SUM(CASE WHEN COALESCE(temp_level_stable,0) <= 4 THEN 1 ELSE 0 END) AS cold_lv,
+          SUM(CASE WHEN COALESCE(won,FALSE)=TRUE THEN 1 ELSE 0 END) AS won_all,
+          SUM(CASE WHEN COALESCE(opt_out,FALSE)=TRUE THEN 1 ELSE 0 END) AS optout_all,
+          SUM(CASE WHEN COALESCE(perma_cold,FALSE)=TRUE THEN 1 ELSE 0 END) AS perma_cold_all,
+          SUM(CASE WHEN COALESCE(opt_out,FALSE)=FALSE
+                    AND COALESCE(perma_cold,FALSE)=FALSE
+                    AND COALESCE(won,FALSE)=FALSE
+                    AND COALESCE(status,'ACTIVE') NOT IN ('OPTOUT','LOST','WON')
+               THEN 1 ELSE 0 END) AS active
+        FROM customers
+        WHERE shop_id=%s
+        """,
+        (shop_id,),
+    )
+    r = row[0] if row else (0,0,0,0,0,0,0,0,0)
+
+    won_30 = db_fetchall(
+        "SELECT COUNT(*) FROM customers WHERE shop_id=%s AND COALESCE(won,FALSE)=TRUE AND won_at >= %s",
+        (shop_id, since_30d),
+    )[0][0]
+
+    fu_sent_24 = db_fetchall(
+        "SELECT COUNT(*) FROM followup_logs WHERE shop_id=%s AND status='sent' AND created_at >= %s",
+        (shop_id, since_24h),
+    )[0][0]
+    fu_resp_24 = db_fetchall(
+        "SELECT COUNT(*) FROM followup_logs WHERE shop_id=%s AND responded_at IS NOT NULL AND responded_at >= %s",
+        (shop_id, since_24h),
+    )[0][0]
+
+    intent_rows = db_fetchall(
+        "SELECT COALESCE(intent,'other'), COUNT(*) FROM customers WHERE shop_id=%s GROUP BY 1",
+        (shop_id,),
+    )
+    status_rows = db_fetchall(
+        "SELECT COALESCE(status,'ACTIVE'), COUNT(*) FROM customers WHERE shop_id=%s GROUP BY 1",
+        (shop_id,),
+    )
+    intent_dist = {str(a or "other"): int(b or 0) for (a, b) in intent_rows}
+    status_dist = {str(a or "ACTIVE"): int(b or 0) for (a, b) in status_rows}
+
+    ab_rows = db_fetchall(
+        """
+        SELECT COALESCE(variant,'?') AS variant,
+               COALESCE(stage,1) AS stage,
+               COUNT(*) FILTER (WHERE status='sent') AS sent,
+               COUNT(*) FILTER (WHERE responded_at IS NOT NULL) AS responded
+        FROM followup_logs
+        WHERE shop_id=%s AND created_at >= %s
+        GROUP BY 1,2
+        ORDER BY 1,2
+        """,
+        (shop_id, since_30d),
+    )
+    ab = []
+    for v, stg, sent, responded in ab_rows:
+        s = int(sent or 0)
+        rr = (int(responded or 0) / s) if s else 0.0
+        ab.append({"variant": v, "stage": int(stg or 1), "sent": s, "responded": int(responded or 0), "response_rate": rr})
+
+    return JSONResponse({
+        "ok": True,
+        "shop_id": shop_id,
+        "asof": utcnow().isoformat(),
+        "days": int(days),
+        "total": int(r[0] or 0),
+        "active": int(r[8] or 0),
+        "need_reply": int(r[1] or 0),
+        "hot": int(r[2] or 0),
+        "warm": int(r[3] or 0),
+        "cold_lv": int(r[4] or 0),
+        "won_all": int(r[5] or 0),
+        "optout_all": int(r[6] or 0),
+        "perma_cold_all": int(r[7] or 0),
+        "won_30d": int(won_30 or 0),
+        "followups_sent_24h": int(fu_sent_24 or 0),
+        "followups_responded_24h": int(fu_resp_24 or 0),
+        "intent_dist": intent_dist,
+        "status_dist": status_dist,
+        "followup_ab_30d": ab,
+    })
+
+
+@app.get("/api/stats/timeseries")
+async def api_stats_timeseries(
+    _: None = Depends(require_dashboard_key),
+    shop_id: str = Query(default=SHOP_ID),
+    days: int = Query(default=14, ge=7, le=120),
+):
+    since = utcnow() - timedelta(days=int(days))
+
+    m_rows = db_fetchall(
+        """
+        SELECT date_trunc('day', created_at AT TIME ZONE 'Asia/Tokyo') AS d, COUNT(*)
+        FROM messages
+        WHERE shop_id=%s AND role='user' AND created_at >= %s
+        GROUP BY 1 ORDER BY 1
+        """,
+        (shop_id, since),
+    )
+    inbound_msgs = {str(r[0])[:10]: int(r[1] or 0) for r in m_rows}
+
+    u_rows = db_fetchall(
+        """
+        SELECT date_trunc('day', created_at AT TIME ZONE 'Asia/Tokyo') AS d, COUNT(DISTINCT conv_key)
+        FROM messages
+        WHERE shop_id=%s AND role='user' AND created_at >= %s
+        GROUP BY 1 ORDER BY 1
+        """,
+        (shop_id, since),
+    )
+    inbound_users = {str(r[0])[:10]: int(r[1] or 0) for r in u_rows}
+
+    fs_rows = db_fetchall(
+        """
+        SELECT date_trunc('day', created_at AT TIME ZONE 'Asia/Tokyo') AS d, COUNT(*)
+        FROM followup_logs
+        WHERE shop_id=%s AND status='sent' AND created_at >= %s
+        GROUP BY 1 ORDER BY 1
+        """,
+        (shop_id, since),
+    )
+    fu_sent = {str(r[0])[:10]: int(r[1] or 0) for r in fs_rows}
+
+    fr_rows = db_fetchall(
+        """
+        SELECT date_trunc('day', responded_at AT TIME ZONE 'Asia/Tokyo') AS d, COUNT(*)
+        FROM followup_logs
+        WHERE shop_id=%s AND responded_at IS NOT NULL AND responded_at >= %s
+        GROUP BY 1 ORDER BY 1
+        """,
+        (shop_id, since),
+    )
+    fu_resp = {str(r[0])[:10]: int(r[1] or 0) for r in fr_rows}
+
+    w_rows = db_fetchall(
+        """
+        SELECT date_trunc('day', won_at AT TIME ZONE 'Asia/Tokyo') AS d, COUNT(*)
+        FROM customers
+        WHERE shop_id=%s AND COALESCE(won,FALSE)=TRUE AND won_at >= %s
+        GROUP BY 1 ORDER BY 1
+        """,
+        (shop_id, since),
+    )
+    wins = {str(r[0])[:10]: int(r[1] or 0) for r in w_rows}
+
+    series = []
+    for i in range(int(days), -1, -1):
+        d = (_to_jst(utcnow()) - timedelta(days=i)).strftime("%Y-%m-%d")
+        series.append({
+            "date": d,
+            "inbound_users": int(inbound_users.get(d, 0)),
+            "inbound_msgs": int(inbound_msgs.get(d, 0)),
+            "followups_sent": int(fu_sent.get(d, 0)),
+            "followups_responded": int(fu_resp.get(d, 0)),
+            "wins": int(wins.get(d, 0)),
+        })
+
+    return JSONResponse({"ok": True, "days": int(days), "series": series})
+
+
+@app.get("/api/export/customers.csv")
+async def api_export_customers_csv(
+    _: None = Depends(require_dashboard_key),
+    shop_id: str = Query(default=SHOP_ID),
+    q: Optional[str] = Query(default=None),
+    min_level: int = Query(default=1, ge=1, le=10),
+    status: str = Query(default="ALL"),
+    intent: str = Query(default="ALL"),
+    need: str = Query(default="ALL"),
+    include_inactive: int = Query(default=0, ge=0, le=1),
+    updated_within_hours: int = Query(default=0, ge=0, le=24 * 365),
+    limit: int = Query(default=4000, ge=100, le=10000),
+):
+    where_sql, args = _build_customer_where(
+        shop_id=shop_id,
+        min_level=min_level,
+        q=q,
+        status=status,
+        intent=intent,
+        need=need,
+        include_inactive=bool(include_inactive),
+        updated_within_hours=updated_within_hours,
+    )
+
+    sql = (
+        "SELECT conv_key, user_id, COALESCE(status,'ACTIVE'), COALESCE(temp_level_stable,0), confidence, "
+        "COALESCE(intent,'other'), COALESCE(next_goal,''), COALESCE(need_reply,FALSE), COALESCE(need_reply_reason,''), "
+        "COALESCE(won,FALSE), COALESCE(perma_cold,FALSE), COALESCE(silence_score,0), pref_hour_jst, pref_hour_samples, "
+        "COALESCE(visit_slot_selected,''), COALESCE(slot_budget,''), COALESCE(slot_area,''), COALESCE(slot_move_in,''), COALESCE(slot_layout,''), "
+        "COALESCE(memo,''), memo_updated_at, memo_by, updated_at, COALESCE(last_user_text,'') "
+        "FROM customers WHERE " + where_sql +
+        " ORDER BY COALESCE(need_reply,FALSE) DESC, updated_at DESC "
+        "LIMIT %s"
+    )
+    rows = db_fetchall(sql, tuple(args + [int(limit)]))
+
+    buf = io.StringIO()
+    w = csv.writer(buf)
+    w.writerow([
+        "conv_key","user_id","status","level","confidence","intent","next_goal",
+        "need_reply","need_reply_reason","won","perma_cold","silence_score",
+        "pref_hour_jst","pref_hour_samples",
+        "visit_slot_selected","slot_budget","slot_area","slot_move_in","slot_layout",
+        "memo","memo_updated_at","memo_by",
+        "updated_at","last_user_text"
+    ])
+    for r in rows:
+        w.writerow([
+            r[0], r[1], r[2], r[3], r[4], r[5], r[6],
+            r[7], r[8], r[9], r[10], r[11],
+            r[12], r[13],
+            r[14], r[15], r[16], r[17], r[18],
+            r[19], (r[20].isoformat() if r[20] else ""), (r[21] or ""),
+            (r[22].isoformat() if r[22] else ""), (r[23] or "")
+        ])
+
+    data = buf.getvalue().encode("utf-8-sig")
+    filename = "customers_" + str(shop_id) + ".csv"
+    return Response(
+        content=data,
+        media_type="text/csv; charset=utf-8",
+        headers={"Content-Disposition": "attachment; filename=" + filename},
+    )
+
+
 @app.get("/api/customer/detail")
 async def api_customer_detail(
     _: None = Depends(require_dashboard_key),
@@ -1378,7 +1793,8 @@ async def api_customer_detail(
                COALESCE(need_reply,FALSE), COALESCE(need_reply_reason,''),
                COALESCE(perma_cold,FALSE), COALESCE(silence_score,0),
                COALESCE(won,FALSE), won_at, won_by,
-               pref_hour_jst, pref_hour_samples
+               pref_hour_jst, pref_hour_samples,
+               COALESCE(memo,''), memo_updated_at, memo_by
         FROM customers
         WHERE shop_id=%s AND conv_key=%s
         LIMIT 1
@@ -1408,6 +1824,9 @@ async def api_customer_detail(
             "won_by": r[16],
             "pref_hour_jst": r[17],
             "pref_hour_samples": r[18],
+            "memo": r[19],
+            "memo_updated_at": r[20].isoformat() if r[20] else None,
+            "memo_by": r[21],
         }
 
     msgs = db_fetchall(
@@ -1535,6 +1954,41 @@ async def api_clear_perma_cold(
     conv_key: str = Query(...),
 ):
     db_execute("UPDATE customers SET perma_cold=FALSE, silence_score=0, updated_at=now() WHERE shop_id=%s AND conv_key=%s", (shop_id, conv_key))
+    return {"ok": True}
+
+
+@app.post("/api/customer/clear_need_reply")
+async def api_customer_clear_need_reply(
+    _: None = Depends(require_admin_key),
+    shop_id: str = Query(default=SHOP_ID),
+    conv_key: str = Query(...),
+):
+    set_need_reply(shop_id, conv_key, False, "admin_clear")
+    return {"ok": True}
+
+
+@app.post("/api/customer/set_memo")
+async def api_customer_set_memo(
+    request: Request,
+    _: None = Depends(require_admin_key),
+    shop_id: str = Query(default=SHOP_ID),
+    conv_key: str = Query(...),
+):
+    try:
+        data = await request.json()
+    except Exception:
+        data = {}
+    memo = str((data or {}).get("memo") or "").strip()[:600]
+    by = str((data or {}).get("by") or "admin").strip()[:40]
+
+    db_execute(
+        """
+        UPDATE customers
+        SET memo=%s, memo_updated_at=now(), memo_by=%s, updated_at=now()
+        WHERE shop_id=%s AND conv_key=%s
+        """,
+        (memo, by, shop_id, conv_key),
+    )
     return {"ok": True}
 
 
@@ -1701,38 +2155,142 @@ DASHBOARD_HTML = r"""<!doctype html>
   body{font-family:system-ui;margin:16px;background:#0b1020;color:#fff}
   .row{display:flex;gap:12px;flex-wrap:wrap;align-items:center}
   .card{background:rgba(255,255,255,.06);border:1px solid rgba(255,255,255,.12);border-radius:14px;padding:12px}
-  table{width:100%;border-collapse:collapse}
-  th,td{border-bottom:1px solid rgba(255,255,255,.12);padding:8px;font-size:12px;vertical-align:top}
-  th{color:rgba(255,255,255,.7);text-align:left}
+  .kpi{font-size:24px;font-weight:800}
+  .muted{color:rgba(255,255,255,.7)}
   .mono{font-family:ui-monospace,Menlo,Monaco,Consolas,monospace}
   a{color:#8ab4f8}
+  button{padding:7px 10px;border-radius:10px;border:1px solid rgba(255,255,255,.18);background:rgba(255,255,255,.06);color:#fff;cursor:pointer}
+  button.tiny{padding:4px 7px;font-size:12px;border-radius:9px}
+  input,select{padding:8px 10px;border-radius:10px;border:1px solid rgba(255,255,255,.18);background:rgba(0,0,0,.2);color:#fff}
+  table{width:100%;border-collapse:collapse}
+  th,td{border-bottom:1px solid rgba(255,255,255,.12);padding:8px;font-size:12px;vertical-align:top}
+  th{color:rgba(255,255,255,.7);text-align:left;position:sticky;top:0;background:rgba(11,16,32,.92)}
+  .badge{display:inline-block;padding:2px 7px;border-radius:999px;border:1px solid rgba(255,255,255,.18);font-size:12px}
+  .b-need{border-color:rgba(255,200,0,.5)}
+  .b-hot{border-color:rgba(255,80,80,.5)}
+  .b-won{border-color:rgba(80,255,140,.5)}
 </style>
 </head>
 <body>
   <div class="row">
     <div class="card"><b>SHOP</b> <span class="mono">__SHOP__</span></div>
+    <div class="card">
+      <button class="tiny" onclick="promptAdminKey()">ADMIN key</button>
+      <span id="adminState" class="mono muted">off</span>
+    </div>
     <div class="card"><a href="/dashboard/executive?shop_id=__SHOP__&days=30&key=__KEY__">Executive KPI →</a></div>
+    <div class="card"><a id="exportLink" href="#">Export CSV →</a></div>
+    <div class="card"><span class="muted">refresh:</span> <span class="mono">__REFRESH__</span>s</div>
+  </div>
+
+  <div class="row" style="margin-top:12px;" id="kpiRow">
+    <div class="card">loading...</div>
+  </div>
+
+  <div class="card" style="margin-top:12px;">
+    <div class="row">
+      <div class="muted">検索</div><input id="q" style="min-width:240px" placeholder="user_id / goal / msg / memo など"/>
+      <div class="muted">minLv</div>
+      <select id="minLevel"></select>
+
+      <div class="muted">status</div>
+      <select id="status">
+        <option value="ALL">ALL</option>
+        <option value="ACTIVE">ACTIVE</option>
+        <option value="LOST">LOST</option>
+        <option value="WON">WON</option>
+        <option value="OPTOUT">OPTOUT</option>
+      </select>
+
+      <div class="muted">intent</div>
+      <select id="intent">
+        <option value="ALL">ALL</option>
+        <option value="rent">rent</option>
+        <option value="buy">buy</option>
+        <option value="invest">invest</option>
+        <option value="research">research</option>
+        <option value="other">other</option>
+      </select>
+
+      <div class="muted">need</div>
+      <select id="need">
+        <option value="ALL">ALL</option>
+        <option value="1">need_only</option>
+        <option value="0">need_none</option>
+      </select>
+
+      <div class="muted">更新</div>
+      <select id="within">
+        <option value="0">指定なし</option>
+        <option value="6">6h</option>
+        <option value="24">24h</option>
+        <option value="72">72h</option>
+        <option value="168">7d</option>
+        <option value="720">30d</option>
+      </select>
+
+      <label class="muted"><input type="checkbox" id="inactive" style="transform:translateY(2px)"/> inactive含む</label>
+
+      <div class="muted">並び</div>
+      <select id="orderBy">
+        <option value="updated_at">updated</option>
+        <option value="level">level</option>
+        <option value="confidence">conf</option>
+        <option value="silence_score">silence</option>
+        <option value="pref_hour">pref_hour</option>
+      </select>
+      <select id="orderDir">
+        <option value="desc">desc</option>
+        <option value="asc">asc</option>
+      </select>
+
+      <div class="muted">limit</div>
+      <select id="limit">
+        <option value="50">50</option>
+        <option value="120">120</option>
+        <option value="200">200</option>
+        <option value="400">400</option>
+      </select>
+
+      <button onclick="applyFilters()">Apply</button>
+    </div>
+
+    <div class="row" style="margin-top:10px;">
+      <button class="tiny" onclick="prevPage()">← Prev</button>
+      <div id="pageInfo" class="mono muted">-</div>
+      <button class="tiny" onclick="nextPage()">Next →</button>
+      <div id="listMeta" class="mono muted"></div>
+    </div>
   </div>
 
   <div class="row" style="margin-top:12px;">
-    <div class="card" style="flex:1;min-width:320px;">
+    <div class="card" style="flex:1;min-width:360px;">
       <div style="display:flex;justify-content:space-between;align-items:center;">
-        <b>温度分布（全体）</b><span class="mono">/api/stats/level_dist</span>
+        <b>温度分布（全体）</b><span class="mono muted">/api/stats/level_dist</span>
       </div>
-      <canvas id="chart" height="110"></canvas>
+      <canvas id="chartDist" height="120"></canvas>
     </div>
-    <div class="card" style="flex:2;min-width:520px;">
+
+    <div class="card" style="flex:1;min-width:360px;">
       <div style="display:flex;justify-content:space-between;align-items:center;">
-        <b>顧客（need_reply優先）</b><span class="mono">/api/hot</span>
+        <b>14日トレンド（JST）</b><span class="mono muted">/api/stats/timeseries</span>
       </div>
-      <div style="margin-top:8px;overflow:auto;max-height:520px;">
-        <table>
-          <thead><tr>
-            <th>更新</th><th>Lv</th><th>intent</th><th>need</th><th>goal</th><th>pref</th><th>flags</th><th>user</th><th>msg</th>
-          </tr></thead>
-          <tbody id="rows"><tr><td colspan="9">loading...</td></tr></tbody>
-        </table>
-      </div>
+      <canvas id="chartTrend" height="120"></canvas>
+    </div>
+  </div>
+
+  <div class="card" style="margin-top:12px;">
+    <div style="display:flex;justify-content:space-between;align-items:center;">
+      <b>顧客一覧</b><span class="mono muted" id="tableHint">/api/customers</span>
+    </div>
+    <div style="margin-top:8px;overflow:auto;max-height:620px;">
+      <table>
+        <thead><tr>
+          <th>更新</th><th>Lv</th><th>conf</th><th>intent</th><th>status</th><th>need</th><th>goal</th>
+          <th>visit</th><th>slots</th><th>pref</th><th>flags</th><th>memo</th><th>user</th><th>msg</th><th>act</th>
+        </tr></thead>
+        <tbody id="rows"><tr><td colspan="15">loading...</td></tr></tbody>
+      </table>
     </div>
   </div>
 
@@ -1748,58 +2306,356 @@ DASHBOARD_HTML = r"""<!doctype html>
     if (!iso) return "-";
     try { return new Date(iso).toLocaleString(); } catch(e) { return iso; }
   }
-  async function fetchJson(url) { const r = await fetch(url); return await r.json(); }
+  function fetchJson(url, opts){ return fetch(url, opts || undefined).then(r => r.json()); }
+
+  function adminKey(){ return (localStorage.getItem("dashboard_admin_key") || "").trim(); }
+  function setAdminState(){
+    document.getElementById("adminState").textContent = adminKey() ? "on" : "off";
+  }
+  function promptAdminKey(){
+    const k = prompt("ADMIN_API_KEY を入れてください（このブラウザに保存）");
+    if (k) localStorage.setItem("dashboard_admin_key", k.trim());
+    setAdminState();
+  }
+  function requireAdminKey(){
+    let k = adminKey();
+    if (!k){
+      promptAdminKey();
+      k = adminKey();
+    }
+    return k;
+  }
+
+  function qp(){ return new URLSearchParams(location.search); }
+
+  function getParam(name, def){
+    const v = qp().get(name);
+    return (v == null || v === "") ? def : v;
+  }
+
+  function initControls(){
+    const ml = document.getElementById("minLevel");
+    if (!ml.options.length){
+      for (let i=1;i<=10;i++){
+        const o = document.createElement("option");
+        o.value = String(i); o.textContent = String(i);
+        ml.appendChild(o);
+      }
+    }
+
+    document.getElementById("q").value = getParam("q","");
+    document.getElementById("minLevel").value = getParam("min_level","1");
+    document.getElementById("status").value = getParam("status","ALL");
+    document.getElementById("intent").value = getParam("intent","ALL");
+    document.getElementById("need").value = getParam("need","ALL");
+    document.getElementById("within").value = getParam("within","0");
+    document.getElementById("inactive").checked = getParam("inactive","0") === "1";
+    document.getElementById("orderBy").value = getParam("order_by","updated_at");
+    document.getElementById("orderDir").value = getParam("order","desc");
+    document.getElementById("limit").value = getParam("limit","120");
+  }
+
+  function stateFromControls(){
+    return {
+      q: (document.getElementById("q").value || "").trim(),
+      min_level: document.getElementById("minLevel").value,
+      status: document.getElementById("status").value,
+      intent: document.getElementById("intent").value,
+      need: document.getElementById("need").value,
+      within: document.getElementById("within").value,
+      inactive: document.getElementById("inactive").checked ? "1" : "0",
+      order_by: document.getElementById("orderBy").value,
+      order: document.getElementById("orderDir").value,
+      limit: document.getElementById("limit").value,
+      offset: getParam("offset","0"),
+    };
+  }
+
+  function updateUrl(s){
+    const p = new URLSearchParams();
+    p.set("shop_id", SHOP);
+    p.set("key", KEY);
+    if (s.q) p.set("q", s.q);
+    p.set("min_level", s.min_level);
+    p.set("status", s.status);
+    p.set("intent", s.intent);
+    p.set("need", s.need);
+    p.set("within", s.within);
+    p.set("inactive", s.inactive);
+    p.set("order_by", s.order_by);
+    p.set("order", s.order);
+    p.set("limit", s.limit);
+    p.set("offset", s.offset);
+    history.replaceState(null, "", "/dashboard?" + p.toString());
+  }
+
+  function buildCustomersUrl(s){
+    const p = new URLSearchParams();
+    p.set("shop_id", SHOP);
+    p.set("key", KEY);
+    p.set("min_level", s.min_level);
+    p.set("status", s.status);
+    p.set("intent", s.intent);
+    p.set("need", s.need);
+    p.set("include_inactive", s.inactive);
+    p.set("updated_within_hours", s.within);
+    p.set("order_by", s.order_by);
+    p.set("order", s.order);
+    p.set("limit", s.limit);
+    p.set("offset", s.offset);
+    if (s.q) p.set("q", s.q);
+    return "/api/customers?" + p.toString();
+  }
+
+  function buildExportUrl(s){
+    const p = new URLSearchParams();
+    p.set("shop_id", SHOP);
+    p.set("key", KEY);
+    p.set("min_level", s.min_level);
+    p.set("status", s.status);
+    p.set("intent", s.intent);
+    p.set("need", s.need);
+    p.set("include_inactive", s.inactive);
+    p.set("updated_within_hours", s.within);
+    p.set("limit", "4000");
+    if (s.q) p.set("q", s.q);
+    return "/api/export/customers.csv?" + p.toString();
+  }
+
+  function applyFilters(){
+    const s = stateFromControls();
+    s.offset = "0";
+    updateUrl(s);
+    tick().catch(console.error);
+  }
+
+  function nextPage(){
+    const s = stateFromControls();
+    const off = parseInt(s.offset || "0", 10) || 0;
+    const lim = parseInt(s.limit || "120", 10) || 120;
+    s.offset = String(off + lim);
+    updateUrl(s);
+    tick().catch(console.error);
+  }
+
+  function prevPage(){
+    const s = stateFromControls();
+    const off = parseInt(s.offset || "0", 10) || 0;
+    const lim = parseInt(s.limit || "120", 10) || 120;
+    s.offset = String(Math.max(0, off - lim));
+    updateUrl(s);
+    tick().catch(console.error);
+  }
 
   function flagsCell(r){
     let parts=[];
     if (r.won) parts.push("WON");
     if (r.perma_cold) parts.push("COLD");
-    if (r.silence_score != null && r.silence_score >= 5) parts.push("SIL+" + r.silence_score);
+    if (r.silence_score != null && r.silence_score >= 5) parts.push("SIL+" + String(r.silence_score));
     return parts.length ? parts.join(",") : "-";
   }
 
-  let chart=null;
+  function slotCell(r){
+    const a = r.slot_area || "";
+    const b = r.slot_budget || "";
+    const m = r.slot_move_in || "";
+    const l = r.slot_layout || "";
+    const parts = [a,b,m,l].filter(x => x);
+    return parts.length ? parts.join(" / ") : "-";
+  }
+
+  function badgeLv(lv){
+    const n = Number(lv || 0);
+    let cls = "badge";
+    if (n >= 8) cls += " b-hot";
+    return "<span class='" + cls + "'>" + esc(String(lv || "-")) + "</span>";
+  }
+
+  function badgeNeed(r){
+    if (!r.need_reply) return "-";
+    return "<span class='badge b-need'>" + esc(r.need_reply_reason || "need") + "</span>";
+  }
+
+  function badgeStatus(r){
+    const st = (r.status || "ACTIVE").toUpperCase();
+    let cls = "badge";
+    if (st === "WON") cls += " b-won";
+    return "<span class='" + cls + "'>" + esc(st) + "</span>";
+  }
+
+  async function actFollowup(conv, stage){
+    const k = requireAdminKey();
+    if (!k) return;
+    const url = "/api/customer/send_followup_now?shop_id=" + encodeURIComponent(SHOP)
+      + "&conv_key=" + encodeURIComponent(conv)
+      + "&stage=" + encodeURIComponent(String(stage));
+    await fetchJson(url, {method:"POST", headers:{"x-admin-key": k}});
+    await tick();
+  }
+
+  async function actWon(conv){
+    const k = requireAdminKey();
+    if (!k) return;
+    const url = "/api/customer/mark_won?shop_id=" + encodeURIComponent(SHOP) + "&conv_key=" + encodeURIComponent(conv);
+    await fetchJson(url, {method:"POST", headers:{"x-admin-key": k}});
+    await tick();
+  }
+
+  async function actClearCold(conv){
+    const k = requireAdminKey();
+    if (!k) return;
+    const url = "/api/customer/clear_perma_cold?shop_id=" + encodeURIComponent(SHOP) + "&conv_key=" + encodeURIComponent(conv);
+    await fetchJson(url, {method:"POST", headers:{"x-admin-key": k}});
+    await tick();
+  }
+
+  async function actClearNeed(conv){
+    const k = requireAdminKey();
+    if (!k) return;
+    const url = "/api/customer/clear_need_reply?shop_id=" + encodeURIComponent(SHOP) + "&conv_key=" + encodeURIComponent(conv);
+    await fetchJson(url, {method:"POST", headers:{"x-admin-key": k}});
+    await tick();
+  }
+
+  let chartDist = null;
+  let chartTrend = null;
 
   async function renderDist(){
     const url = "/api/stats/level_dist?shop_id=" + encodeURIComponent(SHOP) + "&key=" + encodeURIComponent(KEY);
     const dist = await fetchJson(url);
     const labels = ["1","2","3","4","5","6","7","8","9","10"];
     const data = labels.map(k => Number(dist[k] || 0));
-    const ctx = document.getElementById("chart");
-    if (chart){
-      chart.data.labels = labels;
-      chart.data.datasets[0].data = data;
-      chart.update();
+    const ctx = document.getElementById("chartDist");
+    if (chartDist){
+      chartDist.data.labels = labels;
+      chartDist.data.datasets[0].data = data;
+      chartDist.update();
       return;
     }
-    chart = new Chart(ctx, {type:"bar", data:{labels:labels, datasets:[{label:"count", data:data, borderWidth:1}]}, options:{responsive:true}});
+    chartDist = new Chart(ctx, {type:"bar", data:{labels:labels, datasets:[{label:"count", data:data, borderWidth:1}]}, options:{responsive:true}});
+  }
+
+  async function renderTrend(){
+    const url = "/api/stats/timeseries?shop_id=" + encodeURIComponent(SHOP) + "&days=14&key=" + encodeURIComponent(KEY);
+    const d = await fetchJson(url);
+    const s = d.series || [];
+    const labels = s.map(x => x.date);
+    const inboundUsers = s.map(x => Number(x.inbound_users || 0));
+    const followupsSent = s.map(x => Number(x.followups_sent || 0));
+    const wins = s.map(x => Number(x.wins || 0));
+
+    const ctx = document.getElementById("chartTrend");
+    if (chartTrend){
+      chartTrend.data.labels = labels;
+      chartTrend.data.datasets[0].data = inboundUsers;
+      chartTrend.data.datasets[1].data = followupsSent;
+      chartTrend.data.datasets[2].data = wins;
+      chartTrend.update();
+      return;
+    }
+    chartTrend = new Chart(ctx, {
+      type:"line",
+      data:{
+        labels:labels,
+        datasets:[
+          {label:"inbound_users", data: inboundUsers, borderWidth:2, tension:0.2},
+          {label:"followups_sent", data: followupsSent, borderWidth:2, tension:0.2},
+          {label:"wins", data: wins, borderWidth:2, tension:0.2}
+        ]
+      },
+      options:{responsive:true}
+    });
+  }
+
+  async function renderOverview(){
+    const url = "/api/stats/overview?shop_id=" + encodeURIComponent(SHOP) + "&days=30&key=" + encodeURIComponent(KEY);
+    const k = await fetchJson(url);
+
+    const ab = k.followup_ab_30d || [];
+    function abLine(variant, stage){
+      const hit = ab.find(x => (x.variant===variant && Number(x.stage)===Number(stage)));
+      if (!hit) return variant + "-" + String(stage) + ": -";
+      const rr = (Number(hit.response_rate || 0) * 100).toFixed(1);
+      return variant + "-" + String(stage) + ": sent " + String(hit.sent) + " / resp " + String(hit.responded) + " (" + rr + "%)";
+    }
+
+    document.getElementById("kpiRow").innerHTML =
+      "<div class='card'><div class='muted'>active</div><div class='kpi'>" + esc(String(k.active || 0)) + "</div></div>"
+      + "<div class='card'><div class='muted'>need_reply</div><div class='kpi'>" + esc(String(k.need_reply || 0)) + "</div></div>"
+      + "<div class='card'><div class='muted'>hot(>=8)</div><div class='kpi'>" + esc(String(k.hot || 0)) + "</div></div>"
+      + "<div class='card'><div class='muted'>won(30d)</div><div class='kpi'>" + esc(String(k.won_30d || 0)) + "</div></div>"
+      + "<div class='card'><div class='muted'>followup sent(24h)</div><div class='kpi'>" + esc(String(k.followups_sent_24h || 0)) + "</div></div>"
+      + "<div class='card' style='min-width:320px'><div class='muted'>Followup AB (30d)</div>"
+      + "<div class='mono' style='margin-top:6px'>" + esc(abLine("A",1)) + "</div>"
+      + "<div class='mono'>" + esc(abLine("B",1)) + "</div>"
+      + "<div class='mono' style='margin-top:6px'>" + esc(abLine("A",2)) + "</div>"
+      + "<div class='mono'>" + esc(abLine("B",2)) + "</div>"
+      + "</div>";
   }
 
   async function renderRows(){
-    const url = "/api/hot?shop_id=" + encodeURIComponent(SHOP) + "&min_level=1&limit=120&key=" + encodeURIComponent(KEY);
-    const rows = await fetchJson(url);
+    const s = stateFromControls();
+    const url = buildCustomersUrl(s);
+    const d = await fetchJson(url);
+    const rows = d.rows || [];
+    const total = Number(d.total || 0);
+    const off = Number(d.offset || 0);
+
+    document.getElementById("pageInfo").textContent = "offset " + String(off) + " / total " + String(total);
+    document.getElementById("listMeta").textContent = "showing " + String(rows.length) + " rows";
+    document.getElementById("exportLink").href = buildExportUrl(s);
+
     const tbody = document.getElementById("rows");
-    if (!rows.length){ tbody.innerHTML = "<tr><td colspan='9'>no data</td></tr>"; return; }
+    if (!rows.length){
+      tbody.innerHTML = "<tr><td colspan='15'>no data</td></tr>";
+      return;
+    }
 
     tbody.innerHTML = rows.map(r => {
       const link = "/dashboard/customer?shop_id=" + encodeURIComponent(SHOP) + "&conv_key=" + encodeURIComponent(r.conv_key) + "&key=" + encodeURIComponent(KEY);
       const pref = (r.pref_hour_jst == null) ? "-" : (String(r.pref_hour_jst) + "(" + String(r.pref_hour_samples || 0) + ")");
-      const need = r.need_reply ? (r.need_reply_reason || "need") : "-";
+      const visit = r.visit_slot_selected ? r.visit_slot_selected : "-";
+      const memo = r.memo ? r.memo : "-";
+
+      const act =
+        "<button class='tiny' data-conv=\"" + esc(r.conv_key) + "\" onclick=\"actFollowup(this.getAttribute('data-conv'),1)\">FU1</button> "
+        + "<button class='tiny' data-conv=\"" + esc(r.conv_key) + "\" onclick=\"actFollowup(this.getAttribute('data-conv'),2)\">FU2</button> "
+        + "<button class='tiny' data-conv=\"" + esc(r.conv_key) + "\" onclick=\"actClearNeed(this.getAttribute('data-conv'))\">need✓</button> "
+        + "<button class='tiny' data-conv=\"" + esc(r.conv_key) + "\" onclick=\"actClearCold(this.getAttribute('data-conv'))\">🧊</button> "
+        + "<button class='tiny' data-conv=\"" + esc(r.conv_key) + "\" onclick=\"actWon(this.getAttribute('data-conv'))\">WIN</button>";
+
       return "<tr>"
         + "<td class='mono'>" + esc(fmt(r.ts)) + "</td>"
-        + "<td class='mono'>" + esc(r.temp_level_stable) + "</td>"
+        + "<td>" + badgeLv(r.temp_level_stable) + "</td>"
+        + "<td class='mono'>" + esc(r.confidence==null ? "-" : Number(r.confidence).toFixed(2)) + "</td>"
         + "<td class='mono'>" + esc(r.intent || "-") + "</td>"
-        + "<td>" + esc(need) + "</td>"
+        + "<td>" + badgeStatus(r) + "</td>"
+        + "<td>" + badgeNeed(r) + "</td>"
         + "<td>" + esc(r.next_goal || "-") + "</td>"
+        + "<td class='mono'>" + esc(visit) + "</td>"
+        + "<td class='mono'>" + esc(slotCell(r)) + "</td>"
         + "<td class='mono'>" + esc(pref) + "</td>"
         + "<td class='mono'>" + esc(flagsCell(r)) + "</td>"
+        + "<td>" + esc(memo.slice(0,60)) + "</td>"
         + "<td class='mono'><a href='" + link + "'>" + esc(r.user_id || "") + "</a></td>"
-        + "<td>" + esc((r.message || "").slice(0,140)) + "</td>"
+        + "<td>" + esc((r.message || "").slice(0,120)) + "</td>"
+        + "<td class='mono'>" + act + "</td>"
         + "</tr>";
     }).join("");
   }
 
-  async function tick(){ await Promise.all([renderDist(), renderRows()]); }
+  async function tick(){
+    setAdminState();
+    await Promise.all([renderOverview(), renderDist(), renderTrend(), renderRows()]);
+  }
+
+  initControls();
+  setAdminState();
+
+  document.getElementById("q").addEventListener("keydown", function(e){
+    if (e.key === "Enter") applyFilters();
+  });
+
   tick().catch(console.error);
   if (REFRESH > 0) setInterval(() => tick().catch(console.error), REFRESH * 1000);
 </script>
@@ -1869,6 +2725,7 @@ CUSTOMER_HTML = r"""<!doctype html>
   .btnrow{display:flex;gap:10px;flex-wrap:wrap}
   pre{white-space:pre-wrap}
   .msg{padding:8px;border-bottom:1px solid rgba(255,255,255,.12)}
+  textarea{width:100%;height:110px;margin-top:8px;border-radius:12px;border:1px solid rgba(255,255,255,.18);background:rgba(0,0,0,.2);color:#fff;padding:10px}
 </style>
 </head>
 <body>
@@ -1880,10 +2737,21 @@ CUSTOMER_HTML = r"""<!doctype html>
   <div class="card" id="cust">loading...</div>
 
   <div class="card">
+    <div style="display:flex;justify-content:space-between;align-items:center;">
+      <b>Memo</b><span class="mono" id="memoMeta">-</span>
+    </div>
+    <textarea id="memoBox" placeholder="対応メモ / 次アクション / NG事項 など"></textarea>
+    <div class="btnrow" style="margin-top:10px;">
+      <button onclick="saveMemo()">💾 Save memo</button>
+    </div>
+  </div>
+
+  <div class="card">
     <div class="btnrow">
       <button onclick="markWon()">🟢 成約（WIN）</button>
       <button onclick="unmarkWon()">↩︎ 成約取消</button>
       <button onclick="clearCold()">🧊 perma_cold解除</button>
+      <button onclick="clearNeed()">✅ need_replyクリア</button>
       <button onclick="runAutoCold()">🤖 auto_cold</button>
       <button onclick="sendFollowup(1)">📨 followup(1)</button>
       <button onclick="sendFollowup(2)">📨 followup(2)</button>
@@ -1926,6 +2794,9 @@ CUSTOMER_HTML = r"""<!doctype html>
       + " / <b>won_at</b>: <span class='mono'>" + esc(c.won_at || "-") + "</span>"
       + " / <b>won_by</b>: <span class='mono'>" + esc(c.won_by || "-") + "</span></div>";
 
+    document.getElementById("memoBox").value = c.memo || "";
+    document.getElementById("memoMeta").textContent = "updated:" + (c.memo_updated_at || "-") + " by:" + (c.memo_by || "-");
+
     const msgs = d.messages || [];
     document.getElementById("msgs").innerHTML = msgs.length ? msgs.map(m => {
       return "<div class='msg'>"
@@ -1947,6 +2818,15 @@ CUSTOMER_HTML = r"""<!doctype html>
     }).join("") : "no followups";
   }
 
+  async function saveMemo(){
+    const k = adminKey();
+    if (!k){ alert("ADMIN_API_KEY が必要です"); return; }
+    const memo = (document.getElementById("memoBox").value || "").slice(0,600);
+    const url = "/api/customer/set_memo?shop_id=" + encodeURIComponent(SHOP) + "&conv_key=" + encodeURIComponent(CONV);
+    await fetchJson(url, {method:"POST", headers:{"x-admin-key": k, "Content-Type":"application/json"}, body: JSON.stringify({memo:memo, by:"admin"})});
+    await reload();
+  }
+
   async function markWon(){
     const url = "/api/customer/mark_won?shop_id=" + encodeURIComponent(SHOP) + "&conv_key=" + encodeURIComponent(CONV);
     await fetchJson(url, {method:"POST", headers:{"x-admin-key": adminKey()}});
@@ -1959,6 +2839,11 @@ CUSTOMER_HTML = r"""<!doctype html>
   }
   async function clearCold(){
     const url = "/api/customer/clear_perma_cold?shop_id=" + encodeURIComponent(SHOP) + "&conv_key=" + encodeURIComponent(CONV);
+    await fetchJson(url, {method:"POST", headers:{"x-admin-key": adminKey()}});
+    await reload();
+  }
+  async function clearNeed(){
+    const url = "/api/customer/clear_need_reply?shop_id=" + encodeURIComponent(SHOP) + "&conv_key=" + encodeURIComponent(CONV);
     await fetchJson(url, {method:"POST", headers:{"x-admin-key": adminKey()}});
     await reload();
   }
@@ -1996,10 +2881,11 @@ async def dashboard(
     _: None = Depends(require_dashboard_key),
     shop_id: str = Query(default=SHOP_ID),
     key: Optional[str] = Query(default=None),
+    refresh: int = Query(default=DASHBOARD_REFRESH_SEC_DEFAULT, ge=0, le=600),
 ):
     key_q = (key or "").strip()
     html = DASHBOARD_HTML
-    html = html.replace("__SHOP__", str(shop_id)).replace("__KEY__", key_q).replace("__REFRESH__", str(int(DASHBOARD_REFRESH_SEC_DEFAULT)))
+    html = html.replace("__SHOP__", str(shop_id)).replace("__KEY__", key_q).replace("__REFRESH__", str(int(refresh)))
     return HTMLResponse(html)
 
 
