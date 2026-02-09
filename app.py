@@ -1,4 +1,26 @@
-# app.py (FULL - EVOLVED & STABLE)
+# app.py (FULL REWRITE - STABLE & EVOLVED)
+# - No f-strings for HTML (prevents SyntaxError from leaked JS)
+# - No JS template literals (no `...` / ${...})
+# - Analyze: OpenAI Responses JSON Schema -> temp/intent/next_goal (DB truth)
+# - Followup: LLM + fallback, A/B variant
+# - Timing learning: pref_hour_jst
+# - perma_cold + silence_score + /jobs/auto_cold
+# - Manual WIN (C) + KPI + Executive dashboard
+#
+# Required env:
+#   LINE_CHANNEL_SECRET, LINE_CHANNEL_ACCESS_TOKEN, OPENAI_API_KEY, DATABASE_URL, DASHBOARD_KEY, ADMIN_API_KEY
+#
+# Optional env:
+#   SHOP_ID=tokyo_01
+#   OPENAI_MODEL_ASSISTANT/ANALYZE/FOLLOWUP/COLD (default gpt-4o-mini)
+#   ANALYZE_TIMEOUT_SEC=8.5, FOLLOWUP_LLM_TIMEOUT_SEC=8.5, AUTO_COLD_LLM_TIMEOUT_SEC=8.5
+#   FOLLOWUP_ENABLED=1, FOLLOWUP_AFTER_MINUTES=180, FOLLOWUP_MIN_LEVEL=8, FOLLOWUP_LIMIT=50
+#   FOLLOWUP_JST_FROM=10, FOLLOWUP_JST_TO=20
+#   FOLLOWUP_TIME_MATCH_HOURS=1, FOLLOWUP_FORCE_SEND_AFTER_HOURS=12
+#   PREF_HOUR_LOOKBACK_DAYS=60, PREF_HOUR_MIN_SAMPLES=3
+#   AUTO_COLD_USE_LLM=1, AUTO_COLD_LIMIT=80
+#   DASHBOARD_REFRESH_SEC_DEFAULT=30
+
 import os
 import json
 import hmac
@@ -43,11 +65,15 @@ FOLLOWUP_ENABLED = os.getenv("FOLLOWUP_ENABLED", "0").strip() == "1"
 FOLLOWUP_AFTER_MINUTES = int(os.getenv("FOLLOWUP_AFTER_MINUTES", "180"))
 FOLLOWUP_MIN_LEVEL = int(os.getenv("FOLLOWUP_MIN_LEVEL", "8"))
 FOLLOWUP_LIMIT = int(os.getenv("FOLLOWUP_LIMIT", "50"))
-FOLLOWUP_DRYRUN = os.getenv("FOLLOWUP_DRYRUN", "0").strip() == "1"
 FOLLOWUP_LOCK_TTL_SEC = int(os.getenv("FOLLOWUP_LOCK_TTL_SEC", "180"))
 
 FOLLOWUP_JST_FROM = int(os.getenv("FOLLOWUP_JST_FROM", "10"))
 FOLLOWUP_JST_TO = int(os.getenv("FOLLOWUP_JST_TO", "20"))
+
+FOLLOWUP_TIME_MATCH_HOURS = int(os.getenv("FOLLOWUP_TIME_MATCH_HOURS", "1"))
+FOLLOWUP_FORCE_SEND_AFTER_HOURS = int(os.getenv("FOLLOWUP_FORCE_SEND_AFTER_HOURS", "12"))
+PREF_HOUR_LOOKBACK_DAYS = int(os.getenv("PREF_HOUR_LOOKBACK_DAYS", "60"))
+PREF_HOUR_MIN_SAMPLES = int(os.getenv("PREF_HOUR_MIN_SAMPLES", "3"))
 
 FOLLOWUP_AB_ENABLED = os.getenv("FOLLOWUP_AB_ENABLED", "1").strip() == "1"
 FOLLOWUP_SECOND_TOUCH_AFTER_HOURS = int(os.getenv("FOLLOWUP_SECOND_TOUCH_AFTER_HOURS", "48"))
@@ -57,15 +83,9 @@ FOLLOWUP_ATTRIBUTION_WINDOW_HOURS = int(os.getenv("FOLLOWUP_ATTRIBUTION_WINDOW_H
 VISIT_DAYS_AHEAD = int(os.getenv("VISIT_DAYS_AHEAD", "3"))
 VISIT_SLOT_HOURS = os.getenv("VISIT_SLOT_HOURS", "11,14,17").strip()
 
-FOLLOWUP_TIME_MATCH_HOURS = int(os.getenv("FOLLOWUP_TIME_MATCH_HOURS", "1"))
-FOLLOWUP_FORCE_SEND_AFTER_HOURS = int(os.getenv("FOLLOWUP_FORCE_SEND_AFTER_HOURS", "12"))
-PREF_HOUR_LOOKBACK_DAYS = int(os.getenv("PREF_HOUR_LOOKBACK_DAYS", "60"))
-PREF_HOUR_MIN_SAMPLES = int(os.getenv("PREF_HOUR_MIN_SAMPLES", "3"))
-
+FOLLOWUP_USE_LLM = os.getenv("FOLLOWUP_USE_LLM", "1").strip() != "0"
 AUTO_COLD_USE_LLM = os.getenv("AUTO_COLD_USE_LLM", "1").strip() != "0"
 AUTO_COLD_LIMIT = int(os.getenv("AUTO_COLD_LIMIT", "80"))
-
-FOLLOWUP_USE_LLM = os.getenv("FOLLOWUP_USE_LLM", "1").strip() != "0"
 
 OPENAI_MODEL_ASSISTANT = os.getenv("OPENAI_MODEL_ASSISTANT", "gpt-4o-mini").strip()
 OPENAI_MODEL_ANALYZE = os.getenv("OPENAI_MODEL_ANALYZE", "gpt-4o-mini").strip()
@@ -84,7 +104,7 @@ JST = timezone(timedelta(hours=9))
 CHAT_HISTORY: Dict[str, deque] = defaultdict(lambda: deque(maxlen=40))
 TEMP_HISTORY: Dict[str, deque] = defaultdict(lambda: deque(maxlen=5))
 
-app = FastAPI(title="linebot_mvp", version="2.2.0")
+app = FastAPI(title="linebot_mvp", version="3.0.0")
 
 
 # ============================================================
@@ -130,17 +150,17 @@ def require_dashboard_key(
     key: Optional[str] = Query(default=None),
 ) -> None:
     expected = (DASHBOARD_KEY or "").strip()
-    if not expected:
-        raise HTTPException(status_code=500, detail="DASHBOARD_KEY is not configured")
     provided = (x_dashboard_key or key or "").strip()
-    if not provided or not secrets.compare_digest(provided, expected):
+    if not expected:
+        raise HTTPException(status_code=500, detail="DASHBOARD_KEY not set")
+    if not provided or not secrets.compare_digest(expected, provided):
         raise HTTPException(status_code=401, detail="Unauthorized")
 
 
 def require_admin_key(x_admin_key: Optional[str] = Header(default=None, alias="x-admin-key")) -> None:
     if not ADMIN_API_KEY:
-        raise HTTPException(status_code=500, detail="ADMIN_API_KEY is not configured")
-    if not x_admin_key or not secrets.compare_digest(x_admin_key.strip(), ADMIN_API_KEY):
+        raise HTTPException(status_code=500, detail="ADMIN_API_KEY not set")
+    if not x_admin_key or not secrets.compare_digest(ADMIN_API_KEY, x_admin_key.strip()):
         raise HTTPException(status_code=401, detail="Unauthorized")
 
 
@@ -298,7 +318,7 @@ def ensure_tables_and_columns() -> None:
     cur.execute("ALTER TABLE customers ADD COLUMN IF NOT EXISTS opt_out BOOLEAN DEFAULT FALSE;")
     cur.execute("ALTER TABLE customers ADD COLUMN IF NOT EXISTS opt_out_at TIMESTAMPTZ;")
 
-    # visit + slots
+    # slots
     cur.execute("ALTER TABLE customers ADD COLUMN IF NOT EXISTS visit_slot_selected TEXT;")
     cur.execute("ALTER TABLE customers ADD COLUMN IF NOT EXISTS visit_slot_selected_at TIMESTAMPTZ;")
     cur.execute("ALTER TABLE customers ADD COLUMN IF NOT EXISTS slot_budget TEXT;")
@@ -312,7 +332,7 @@ def ensure_tables_and_columns() -> None:
     cur.execute("ALTER TABLE customers ADD COLUMN IF NOT EXISTS need_reply_reason TEXT;")
     cur.execute("ALTER TABLE customers ADD COLUMN IF NOT EXISTS need_reply_updated_at TIMESTAMPTZ;")
 
-    # preferred hour
+    # timing
     cur.execute("ALTER TABLE customers ADD COLUMN IF NOT EXISTS pref_hour_jst INT;")
     cur.execute("ALTER TABLE customers ADD COLUMN IF NOT EXISTS pref_hour_samples INT;")
     cur.execute("ALTER TABLE customers ADD COLUMN IF NOT EXISTS pref_hour_updated_at TIMESTAMPTZ;")
@@ -321,7 +341,7 @@ def ensure_tables_and_columns() -> None:
     cur.execute("ALTER TABLE customers ADD COLUMN IF NOT EXISTS silence_score INT DEFAULT 0;")
     cur.execute("ALTER TABLE customers ADD COLUMN IF NOT EXISTS perma_cold BOOLEAN DEFAULT FALSE;")
 
-    # manual WIN (C)
+    # manual win
     cur.execute("ALTER TABLE customers ADD COLUMN IF NOT EXISTS won BOOLEAN DEFAULT FALSE;")
     cur.execute("ALTER TABLE customers ADD COLUMN IF NOT EXISTS won_at TIMESTAMPTZ;")
     cur.execute("ALTER TABLE customers ADD COLUMN IF NOT EXISTS won_by TEXT;")
@@ -355,7 +375,7 @@ def ensure_tables_and_columns() -> None:
         """
     )
 
-    # followup logs
+    # followups
     cur.execute(
         """
         CREATE TABLE IF NOT EXISTS followup_logs (
@@ -477,17 +497,7 @@ def save_message(
         INSERT INTO messages (shop_id, conv_key, role, content, temp_level_raw, temp_level_stable, confidence, intent, next_goal)
         VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s)
         """,
-        (
-            shop_id,
-            conv_key,
-            role,
-            content,
-            temp_level_raw,
-            temp_level_stable,
-            confidence,
-            (intent[:24] if intent else None),
-            (next_goal[:120] if next_goal else None),
-        ),
+        (shop_id, conv_key, role, content, temp_level_raw, temp_level_stable, confidence, intent, next_goal),
     )
 
 
@@ -511,7 +521,7 @@ def get_recent_conversation_for_followup(shop_id: str, conv_key: str, limit: int
 
 
 # ============================================================
-# WIN (manual / C)
+# Manual WIN (C)
 # ============================================================
 
 def mark_won(shop_id: str, conv_key: str, by: str = "admin") -> None:
@@ -674,7 +684,10 @@ def get_customer_flags(shop_id: str, conv_key: str) -> Dict[str, Any]:
     rows = db_fetchall(
         """
         SELECT visit_slot_selected, slot_budget, slot_area, slot_move_in, slot_layout,
-               COALESCE(status,'ACTIVE'), COALESCE(opt_out,FALSE), COALESCE(won,FALSE), COALESCE(perma_cold,FALSE)
+               COALESCE(status,'ACTIVE'),
+               COALESCE(opt_out,FALSE),
+               COALESCE(won,FALSE),
+               COALESCE(perma_cold,FALSE)
         FROM customers
         WHERE shop_id=%s AND conv_key=%s
         """,
@@ -729,7 +742,7 @@ def compute_need_reply(next_goal: str, flags: Dict[str, Any], assistant_text: st
 
 
 # ============================================================
-# Preferred hour learning
+# Preferred send hour learning
 # ============================================================
 
 def _to_jst(dt: datetime) -> datetime:
@@ -863,63 +876,6 @@ def revive_if_lost_by_keywords(shop_id: str, conv_key: str, text: str) -> bool:
 
 
 # ============================================================
-# Followup logs + attribution
-# ============================================================
-
-def save_followup_log(
-    shop_id: str,
-    conv_key: str,
-    user_id: str,
-    message: str,
-    mode: str,
-    status: str,
-    error: Optional[str] = None,
-    variant: Optional[str] = None,
-    stage: Optional[int] = None,
-    send_hour_jst: Optional[int] = None,
-) -> None:
-    db_execute(
-        """
-        INSERT INTO followup_logs (shop_id, conv_key, user_id, message, mode, status, error, variant, stage, send_hour_jst)
-        VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
-        """,
-        (
-            shop_id,
-            conv_key,
-            user_id,
-            message,
-            mode,
-            status,
-            (error or None),
-            (variant or None),
-            (stage or None),
-            (send_hour_jst if send_hour_jst is not None else None),
-        ),
-    )
-
-
-def attribute_followup_response(shop_id: str, conv_key: str) -> None:
-    window_since = utcnow() - timedelta(hours=FOLLOWUP_ATTRIBUTION_WINDOW_HOURS)
-    rows = db_fetchall(
-        """
-        SELECT id
-        FROM followup_logs
-        WHERE shop_id=%s AND conv_key=%s
-          AND status='sent'
-          AND responded_at IS NULL
-          AND created_at >= %s
-        ORDER BY created_at DESC
-        LIMIT 1
-        """,
-        (shop_id, conv_key, window_since),
-    )
-    if not rows:
-        return
-    fid = rows[0][0]
-    db_execute("UPDATE followup_logs SET responded_at=now() WHERE id=%s", (fid,))
-
-
-# ============================================================
 # LINE signature verify + send
 # ============================================================
 
@@ -941,7 +897,7 @@ async def reply_line(reply_token: str, text: str) -> None:
         async with httpx.AsyncClient(timeout=10, verify=certifi.where()) as client:
             r = await client.post(url, headers=headers, json=payload)
             if r.status_code >= 400:
-                print("[LINE] reply failed:", r.status_code, r.text[:300])
+                print("[LINE] reply failed:", r.status_code, r.text[:200])
     except Exception as e:
         print("[LINE] reply exception:", repr(e))
 
@@ -958,7 +914,7 @@ async def push_line(user_id: str, text: str) -> None:
         async with httpx.AsyncClient(timeout=10, verify=certifi.where()) as client:
             r = await client.post(url, headers=headers, json=payload)
             if r.status_code >= 400:
-                print("[LINE] push failed:", r.status_code, r.text[:300])
+                print("[LINE] push failed:", r.status_code, r.text[:200])
     except Exception as e:
         print("[LINE] push exception:", repr(e))
 
@@ -1002,21 +958,16 @@ ANALYZE_JSON_SCHEMA = {
         "confidence": {"type": "number", "minimum": 0.0, "maximum": 1.0},
         "intent": {"type": "string", "enum": ["rent", "buy", "invest", "research", "other"]},
         "next_goal": {"type": "string", "maxLength": 80},
-        "reasons": {
-            "type": "array",
-            "items": {"type": "string", "maxLength": 60},
-            "minItems": 0,
-            "maxItems": 3
-        }
+        "reasons": {"type": "array", "items": {"type": "string", "maxLength": 60}, "minItems": 0, "maxItems": 3},
     },
-    "required": ["temp_level_raw", "confidence", "intent", "next_goal", "reasons"]
+    "required": ["temp_level_raw", "confidence", "intent", "next_goal", "reasons"],
 }
 
 FOLLOWUP_JSON_SCHEMA = {
     "type": "object",
     "additionalProperties": False,
     "properties": {"message": {"type": "string", "maxLength": 900}},
-    "required": ["message"]
+    "required": ["message"],
 }
 
 AUTO_COLD_JSON_SCHEMA = {
@@ -1025,15 +976,15 @@ AUTO_COLD_JSON_SCHEMA = {
     "properties": {
         "perma_cold": {"type": "boolean"},
         "silence_score_delta": {"type": "integer", "minimum": -2, "maximum": 5},
-        "reason": {"type": "string", "maxLength": 120}
+        "reason": {"type": "string", "maxLength": 120},
     },
-    "required": ["perma_cold", "silence_score_delta", "reason"]
+    "required": ["perma_cold", "silence_score_delta", "reason"],
 }
 
 
-async def openai_chat(messages: List[Dict[str, str]], temperature: float = 0.2, timeout_sec: float = 25.0) -> str:
+async def openai_chat(messages: List[Dict[str, str]], temperature: float = 0.2, timeout_sec: float = 12.0) -> str:
     if not OPENAI_API_KEY:
-        raise RuntimeError("OPENAI_API_KEY is missing")
+        raise RuntimeError("OPENAI_API_KEY missing")
     headers = {"Authorization": f"Bearer {OPENAI_API_KEY}", "Content-Type": "application/json"}
     payload = {"model": OPENAI_MODEL_ASSISTANT, "messages": messages, "temperature": temperature}
     async with httpx.AsyncClient(timeout=timeout_sec, verify=certifi.where()) as client:
@@ -1043,7 +994,7 @@ async def openai_chat(messages: List[Dict[str, str]], temperature: float = 0.2, 
         return data["choices"][0]["message"]["content"]
 
 
-def _responses_extract_output_text(data: Dict[str, Any]) -> Optional[str]:
+def _responses_extract_text(data: Dict[str, Any]) -> Optional[str]:
     chunks: List[str] = []
     for item in (data.get("output") or []):
         if item.get("type") == "message":
@@ -1076,7 +1027,7 @@ async def openai_responses_json(
                 print("[OPENAI] responses failed:", r.status_code, (r.text or "")[:200])
                 return None
             data = r.json()
-        out = _responses_extract_output_text(data)
+        out = _responses_extract_text(data)
         if not out:
             return None
         return json.loads(out)
@@ -1112,50 +1063,35 @@ def coerce_goal(v: Any) -> str:
     return s[:80] if s else "要件確認"
 
 
-# ============================================================
-# Followup / Auto cold LLM builders
-# ============================================================
-
 def _intent_label(intent: str) -> str:
     return {"rent": "賃貸", "buy": "購入", "invest": "投資", "research": "情報収集", "other": "不明"}.get(intent, "不明")
 
 
-async def generate_followup_message_llm(
-    shop_id: str,
-    conv_key: str,
-    stage: int,
-    variant: str,
-    customer: Dict[str, Any],
-) -> Optional[str]:
+async def generate_followup_message_llm(shop_id: str, conv_key: str, stage: int, variant: str, customer: Dict[str, Any]) -> Optional[str]:
     if not FOLLOWUP_USE_LLM or not OPENAI_API_KEY:
         return None
-
-    next_goal = (customer.get("next_goal") or "").strip()
-    last_user_text = (customer.get("last_user_text") or "").strip()
-    intent = (customer.get("intent") or "other").strip().lower()
-
     instructions = (
         "あなたは不動産/投資のトップ営業です。追客LINE文を1通だけ作ってください。"
         "押し売り禁止。質問は最大2つ。返信しやすい形。短め。出力はJSONのみ。"
     )
 
-    tone = "やさしく丁寧" if variant == "A" else "短く選択肢"
-    stage_rule = "初回追客" if stage == 1 else "2回目追客（しつこくしない）"
+    intent = (customer.get("intent") or "other").strip().lower()
+    next_goal = (customer.get("next_goal") or "").strip()
+    last_user_text = (customer.get("last_user_text") or "").strip()
 
     ctx = {
-        "tone": tone,
-        "stage_rule": stage_rule,
+        "stage": stage,
+        "variant": variant,
+        "tone": ("やさしく丁寧" if variant == "A" else "短く選択肢"),
         "intent": intent,
         "intent_label": _intent_label(intent),
         "next_goal": next_goal,
         "last_user_text": last_user_text[:160],
     }
 
-    history = get_recent_conversation_for_followup(shop_id, conv_key, limit=12)
-    input_msgs: List[Dict[str, str]] = [
-        {"role": "user", "content": "条件: " + json.dumps(ctx, ensure_ascii=False)},
-        {"role": "user", "content": "会話:"},
-    ]
+    history = get_recent_conversation_for_followup(shop_id, conv_key, 12)
+    input_msgs = [{"role": "user", "content": "条件: " + json.dumps(ctx, ensure_ascii=False)}]
+    input_msgs.append({"role": "user", "content": "会話:"})
     for m in history[-12:]:
         input_msgs.append({"role": m["role"], "content": m["content"][:800]})
 
@@ -1193,7 +1129,6 @@ async def auto_cold_judge(shop_id: str, conv_key: str, history: List[Dict[str, s
     input_msgs = [{"role": "user", "content": "会話履歴:"}]
     for m in history[-12:]:
         input_msgs.append({"role": m["role"], "content": m["content"][:800]})
-
     return await openai_responses_json(
         model=OPENAI_MODEL_COLD,
         instructions=instructions,
@@ -1208,17 +1143,50 @@ def apply_silence_update(shop_id: str, conv_key: str, delta: int, perma: bool) -
     cur = int(rows[0][0] or 0) if rows else 0
     nxt = max(0, min(999, cur + int(delta)))
     db_execute(
-        """
-        UPDATE customers
-        SET silence_score=%s, perma_cold=%s, updated_at=now()
-        WHERE shop_id=%s AND conv_key=%s
-        """,
+        "UPDATE customers SET silence_score=%s, perma_cold=%s, updated_at=now() WHERE shop_id=%s AND conv_key=%s",
         (nxt, bool(perma), shop_id, conv_key),
     )
 
 
 # ============================================================
-# Analyze + reply
+# Followup logs + attribution
+# ============================================================
+
+def save_followup_log(shop_id: str, conv_key: str, user_id: str, message: str, mode: str, status: str,
+                      error: Optional[str] = None, variant: Optional[str] = None, stage: Optional[int] = None,
+                      send_hour_jst: Optional[int] = None) -> None:
+    db_execute(
+        """
+        INSERT INTO followup_logs (shop_id, conv_key, user_id, message, mode, status, error, variant, stage, send_hour_jst)
+        VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+        """,
+        (shop_id, conv_key, user_id, message, mode, status, error, variant, stage, send_hour_jst),
+    )
+
+
+def attribute_followup_response(shop_id: str, conv_key: str) -> None:
+    window_since = utcnow() - timedelta(hours=FOLLOWUP_ATTRIBUTION_WINDOW_HOURS)
+    rows = db_fetchall(
+        """
+        SELECT id
+        FROM followup_logs
+        WHERE shop_id=%s AND conv_key=%s
+          AND status='sent'
+          AND responded_at IS NULL
+          AND created_at >= %s
+        ORDER BY created_at DESC
+        LIMIT 1
+        """,
+        (shop_id, conv_key, window_since),
+    )
+    if not rows:
+        return
+    fid = rows[0][0]
+    db_execute("UPDATE followup_logs SET responded_at=now() WHERE id=%s", (fid,))
+
+
+# ============================================================
+# Analyze + fast reply
 # ============================================================
 
 async def analyze_only(shop_id: str, conv_key: str, user_text: str) -> Tuple[int, float, str, str, List[str], str]:
@@ -1296,7 +1264,7 @@ def acquire_job_lock(key: str, ttl_sec: int) -> bool:
     db_execute(
         """
         INSERT INTO job_locks (key, locked_until)
-        VALUES (%s, %s)
+        VALUES (%s,%s)
         ON CONFLICT (key) DO UPDATE SET locked_until=EXCLUDED.locked_until
         """,
         (key, until),
@@ -1305,7 +1273,7 @@ def acquire_job_lock(key: str, ttl_sec: int) -> bool:
 
 
 # ============================================================
-# Dashboard APIs
+# Routes: basics
 # ============================================================
 
 @app.get("/")
@@ -1318,12 +1286,16 @@ async def healthz():
     return {"ok": True, "ts": int(utcnow().timestamp())}
 
 
+# ============================================================
+# API: customers list / dist / customer detail
+# ============================================================
+
 @app.get("/api/hot")
 async def api_hot(
     _: None = Depends(require_dashboard_key),
     shop_id: str = Query(default=SHOP_ID),
     min_level: int = Query(default=1, ge=1, le=10),
-    limit: int = Query(default=80, ge=1, le=200),
+    limit: int = Query(default=120, ge=1, le=300),
 ):
     rows = db_fetchall(
         """
@@ -1491,26 +1463,15 @@ async def api_customer_detail(
 
 
 # ============================================================
-# KPI / Executive
+# KPI + Executive
 # ============================================================
 
 def get_kpi_summary(shop_id: str, days: int = 30) -> Dict[str, Any]:
     since = utcnow() - timedelta(days=max(1, min(365, int(days))))
 
-    total = db_fetchall(
-        "SELECT COUNT(*) FROM customers WHERE shop_id=%s AND updated_at >= %s",
-        (shop_id, since),
-    )[0][0]
-
-    won = db_fetchall(
-        "SELECT COUNT(*) FROM customers WHERE shop_id=%s AND COALESCE(won,FALSE)=TRUE AND won_at >= %s",
-        (shop_id, since),
-    )[0][0]
-
-    ai_touched = db_fetchall(
-        "SELECT COUNT(DISTINCT conv_key) FROM messages WHERE shop_id=%s AND role='assistant' AND created_at >= %s",
-        (shop_id, since),
-    )[0][0]
+    total = db_fetchall("SELECT COUNT(*) FROM customers WHERE shop_id=%s AND updated_at >= %s", (shop_id, since))[0][0]
+    won = db_fetchall("SELECT COUNT(*) FROM customers WHERE shop_id=%s AND COALESCE(won,FALSE)=TRUE AND won_at >= %s", (shop_id, since))[0][0]
+    ai_touched = db_fetchall("SELECT COUNT(DISTINCT conv_key) FROM messages WHERE shop_id=%s AND role='assistant' AND created_at >= %s", (shop_id, since))[0][0]
 
     intent_rows = db_fetchall(
         """
@@ -1577,6 +1538,49 @@ async def api_clear_perma_cold(
     return {"ok": True}
 
 
+@app.post("/api/customer/send_followup_now")
+async def api_customer_send_followup_now(
+    _: None = Depends(require_admin_key),
+    shop_id: str = Query(default=SHOP_ID),
+    conv_key: str = Query(...),
+    stage: int = Query(default=1, ge=1, le=2),
+):
+    crows = db_fetchall(
+        """
+        SELECT user_id, COALESCE(intent,'other'), COALESCE(next_goal,''), COALESCE(last_user_text,''), COALESCE(temp_level_stable,0),
+               COALESCE(opt_out,FALSE), COALESCE(perma_cold,FALSE), COALESCE(won,FALSE), COALESCE(status,'ACTIVE')
+        FROM customers
+        WHERE shop_id=%s AND conv_key=%s
+        LIMIT 1
+        """,
+        (shop_id, conv_key),
+    )
+    if not crows:
+        return {"ok": True, "sent": False, "reason": "not_found"}
+
+    user_id, intent, goal, last_text, lvl, opt, cold, won, st = crows[0]
+    if opt or cold or won or (st or "ACTIVE").upper() in ("OPTOUT", "LOST", "WON"):
+        return {"ok": True, "sent": False, "reason": "inactive"}
+    if not user_id or user_id == "unknown":
+        return {"ok": True, "sent": False, "reason": "no_user_id"}
+
+    variant = pick_ab_variant(conv_key)
+    customer = {"intent": intent, "next_goal": goal, "last_user_text": last_text, "level": int(lvl or 0)}
+    msg = await generate_followup_message_llm(shop_id, conv_key, stage, variant, customer)
+    mode = "llm"
+    if not msg:
+        msg = followup_fallback(stage, intent or "other", goal or "")
+        mode = "template"
+
+    try:
+        await push_line(user_id, msg)
+        save_followup_log(shop_id, conv_key, user_id, msg, mode, "sent", None, variant, stage, send_hour_jst=now_jst().hour)
+        return {"ok": True, "sent": True, "mode": mode}
+    except Exception as e:
+        save_followup_log(shop_id, conv_key, user_id, msg, mode, "failed", str(e)[:200], variant, stage, send_hour_jst=now_jst().hour)
+        return {"ok": True, "sent": False, "error": str(e)[:200]}
+
+
 # ============================================================
 # Jobs
 # ============================================================
@@ -1585,10 +1589,8 @@ async def api_clear_perma_cold(
 async def job_followup(_: None = Depends(require_admin_key)):
     if not FOLLOWUP_ENABLED:
         return {"ok": True, "enabled": False, "reason": "FOLLOWUP_ENABLED!=1"}
-
     if not is_within_jst_window():
         return {"ok": True, "enabled": True, "skipped": True, "reason": "out_of_time_window"}
-
     if not acquire_job_lock("followup", FOLLOWUP_LOCK_TTL_SEC):
         return {"ok": True, "enabled": True, "skipped": True, "reason": "locked"}
 
@@ -1598,8 +1600,7 @@ async def job_followup(_: None = Depends(require_admin_key)):
         SELECT conv_key, user_id, COALESCE(temp_level_stable,0), COALESCE(next_goal,''), COALESCE(last_user_text,''),
                COALESCE(intent,'other'),
                pref_hour_jst, updated_at,
-               COALESCE(opt_out,FALSE), COALESCE(perma_cold,FALSE), COALESCE(won,FALSE),
-               COALESCE(status,'ACTIVE')
+               COALESCE(opt_out,FALSE), COALESCE(perma_cold,FALSE), COALESCE(won,FALSE), COALESCE(status,'ACTIVE')
         FROM customers
         WHERE shop_id=%s
           AND COALESCE(temp_level_stable,0) >= %s
@@ -1628,17 +1629,9 @@ async def job_followup(_: None = Depends(require_admin_key)):
                 skipped_time += 1
                 continue
 
-        customer = {
-            "conv_key": conv_key,
-            "user_id": user_id,
-            "level": int(lvl or 0),
-            "next_goal": goal or "",
-            "last_user_text": last_text or "",
-            "intent": intent or "other",
-        }
+        customer = {"intent": intent, "next_goal": goal, "last_user_text": last_text, "level": int(lvl or 0)}
         variant = pick_ab_variant(conv_key)
-
-        msg = await generate_followup_message_llm(SHOP_ID, conv_key, stage=1, variant=variant, customer=customer)
+        msg = await generate_followup_message_llm(SHOP_ID, conv_key, 1, variant, customer)
         mode = "llm"
         if not msg:
             msg = followup_fallback(1, intent or "other", goal or "")
@@ -1682,54 +1675,43 @@ async def job_auto_cold(_: None = Depends(require_admin_key)):
         j = await auto_cold_judge(SHOP_ID, conv_key, hist)
         if not j:
             continue
-        apply_silence_update(
-            SHOP_ID,
-            conv_key,
-            int(j.get("silence_score_delta", 0)),
-            bool(j.get("perma_cold", False)),
-        )
+        apply_silence_update(SHOP_ID, conv_key, int(j.get("silence_score_delta", 0)), bool(j.get("perma_cold", False)))
         judged += 1
 
     return {"ok": True, "judged": judged}
 
 
+@app.post("/jobs/kpi_snapshot")
+async def job_kpi_snapshot(_: None = Depends(require_admin_key)):
+    return {"ok": True, "kpi": get_kpi_summary(SHOP_ID, 30)}
+
+
 # ============================================================
-# Dashboard HTML (NO template literals)
+# HTML templates (NO f-string) using replace
 # ============================================================
 
-@app.get("/dashboard", response_class=HTMLResponse)
-async def dashboard(
-    _: None = Depends(require_dashboard_key),
-    shop_id: str = Query(default=SHOP_ID),
-    min_level: int = Query(default=1, ge=1, le=10),
-    limit: int = Query(default=80, ge=1, le=200),
-    refresh: int = Query(default=DASHBOARD_REFRESH_SEC_DEFAULT, ge=0, le=300),
-    key: Optional[str] = Query(default=None),
-):
-    key_q = (key or "").strip()
-    html = f"""
-<!doctype html>
+DASHBOARD_HTML = r"""<!doctype html>
 <html lang="ja">
 <head>
 <meta charset="utf-8"/>
 <meta name="viewport" content="width=device-width, initial-scale=1"/>
-<title>Dashboard | {shop_id}</title>
+<title>Dashboard</title>
 <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
 <style>
-  body{{font-family:system-ui,-apple-system,"Hiragino Sans","Noto Sans JP",sans-serif;margin:16px;background:#0b1020;color:#fff}}
-  .row{{display:flex;gap:12px;flex-wrap:wrap;align-items:center}}
-  .card{{background:rgba(255,255,255,.06);border:1px solid rgba(255,255,255,.12);border-radius:14px;padding:12px}}
-  table{{width:100%;border-collapse:collapse}}
-  th,td{{border-bottom:1px solid rgba(255,255,255,.12);padding:8px;font-size:12px;vertical-align:top}}
-  th{{color:rgba(255,255,255,.7);text-align:left}}
-  .mono{{font-family:ui-monospace,Menlo,Monaco,Consolas,monospace}}
-  a{{color:#8ab4f8}}
+  body{font-family:system-ui;margin:16px;background:#0b1020;color:#fff}
+  .row{display:flex;gap:12px;flex-wrap:wrap;align-items:center}
+  .card{background:rgba(255,255,255,.06);border:1px solid rgba(255,255,255,.12);border-radius:14px;padding:12px}
+  table{width:100%;border-collapse:collapse}
+  th,td{border-bottom:1px solid rgba(255,255,255,.12);padding:8px;font-size:12px;vertical-align:top}
+  th{color:rgba(255,255,255,.7);text-align:left}
+  .mono{font-family:ui-monospace,Menlo,Monaco,Consolas,monospace}
+  a{color:#8ab4f8}
 </style>
 </head>
 <body>
   <div class="row">
-    <div class="card"><b>SHOP</b> <span class="mono">{shop_id}</span></div>
-    <div class="card"><a href="/dashboard/executive?shop_id={shop_id}&days=30&key={key_q}">Executive KPI →</a></div>
+    <div class="card"><b>SHOP</b> <span class="mono">__SHOP__</span></div>
+    <div class="card"><a href="/dashboard/executive?shop_id=__SHOP__&days=30&key=__KEY__">Executive KPI →</a></div>
   </div>
 
   <div class="row" style="margin-top:12px;">
@@ -1755,69 +1737,54 @@ async def dashboard(
   </div>
 
 <script>
-  const KEY = {json.dumps(key_q)};
-  const SHOP = {json.dumps(shop_id)};
+  const KEY = "__KEY__";
+  const SHOP = "__SHOP__";
+  const REFRESH = __REFRESH__;
 
-  function esc(s) {{
-    return (s ?? "").toString().replace(/[&<>"]/g, c => ({{"&":"&amp;","<":"&lt;",">":"&gt;","\\"":"&quot;"}}[c]));
-  }}
-  function fmt(iso) {{
+  function esc(s) {
+    return (s ?? "").toString().replace(/[&<>"]/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;","\"":"&quot;"}[c]));
+  }
+  function fmt(iso) {
     if (!iso) return "-";
-    try {{ return new Date(iso).toLocaleString(); }} catch(e) {{ return iso; }}
-  }}
-  async function fetchJson(url) {{
-    const r = await fetch(url);
-    return await r.json();
-  }}
+    try { return new Date(iso).toLocaleString(); } catch(e) { return iso; }
+  }
+  async function fetchJson(url) { const r = await fetch(url); return await r.json(); }
 
-  function flagsCell(r) {{
-    let parts = [];
+  function flagsCell(r){
+    let parts=[];
     if (r.won) parts.push("WON");
     if (r.perma_cold) parts.push("COLD");
     if (r.silence_score != null && r.silence_score >= 5) parts.push("SIL+" + r.silence_score);
     return parts.length ? parts.join(",") : "-";
-  }}
+  }
 
-  let chart = null;
+  let chart=null;
 
-  async function renderDist() {{
+  async function renderDist(){
     const url = "/api/stats/level_dist?shop_id=" + encodeURIComponent(SHOP) + "&key=" + encodeURIComponent(KEY);
     const dist = await fetchJson(url);
     const labels = ["1","2","3","4","5","6","7","8","9","10"];
     const data = labels.map(k => Number(dist[k] || 0));
     const ctx = document.getElementById("chart");
-    if (chart) {{
+    if (chart){
       chart.data.labels = labels;
       chart.data.datasets[0].data = data;
       chart.update();
       return;
-    }}
-    chart = new Chart(ctx, {{
-      type: "bar",
-      data: {{ labels: labels, datasets: [{{ label: "count", data: data, borderWidth: 1 }}] }},
-      options: {{ responsive: true }}
-    }});
-  }}
+    }
+    chart = new Chart(ctx, {type:"bar", data:{labels:labels, datasets:[{label:"count", data:data, borderWidth:1}]}, options:{responsive:true}});
+  }
 
-  async function renderRows() {{
-    const url = "/api/hot?shop_id=" + encodeURIComponent(SHOP)
-      + "&min_level=1&limit=120&key=" + encodeURIComponent(KEY);
+  async function renderRows(){
+    const url = "/api/hot?shop_id=" + encodeURIComponent(SHOP) + "&min_level=1&limit=120&key=" + encodeURIComponent(KEY);
     const rows = await fetchJson(url);
-
     const tbody = document.getElementById("rows");
-    if (!rows.length) {{
-      tbody.innerHTML = "<tr><td colspan='9'>no data</td></tr>";
-      return;
-    }}
+    if (!rows.length){ tbody.innerHTML = "<tr><td colspan='9'>no data</td></tr>"; return; }
 
-    tbody.innerHTML = rows.map(r => {{
-      const link = "/dashboard/customer?shop_id=" + encodeURIComponent(SHOP)
-        + "&conv_key=" + encodeURIComponent(r.conv_key)
-        + "&key=" + encodeURIComponent(KEY);
-
+    tbody.innerHTML = rows.map(r => {
+      const link = "/dashboard/customer?shop_id=" + encodeURIComponent(SHOP) + "&conv_key=" + encodeURIComponent(r.conv_key) + "&key=" + encodeURIComponent(KEY);
       const pref = (r.pref_hour_jst == null) ? "-" : (String(r.pref_hour_jst) + "(" + String(r.pref_hour_samples || 0) + ")");
       const need = r.need_reply ? (r.need_reply_reason || "need") : "-";
-
       return "<tr>"
         + "<td class='mono'>" + esc(fmt(r.ts)) + "</td>"
         + "<td class='mono'>" + esc(r.temp_level_stable) + "</td>"
@@ -1829,19 +1796,210 @@ async def dashboard(
         + "<td class='mono'><a href='" + link + "'>" + esc(r.user_id || "") + "</a></td>"
         + "<td>" + esc((r.message || "").slice(0,140)) + "</td>"
         + "</tr>";
-    }}).join("");
-  }}
+    }).join("");
+  }
 
-  async function tick() {{
-    await Promise.all([renderDist(), renderRows()]);
-  }}
-
+  async function tick(){ await Promise.all([renderDist(), renderRows()]); }
   tick().catch(console.error);
-  setInterval(() => tick().catch(console.error), {int(DASHBOARD_REFRESH_SEC_DEFAULT)} * 1000);
+  if (REFRESH > 0) setInterval(() => tick().catch(console.error), REFRESH * 1000);
 </script>
 </body>
 </html>
 """
+
+EXEC_HTML = r"""<!doctype html>
+<html lang="ja">
+<head>
+<meta charset="utf-8"/>
+<title>Executive</title>
+<style>
+ body{font-family:system-ui;background:#0b1020;color:#fff;margin:20px}
+ .card{background:rgba(255,255,255,.08);border-radius:14px;padding:14px;margin-bottom:14px}
+ .row{display:flex;gap:14px;flex-wrap:wrap}
+ .kpi{font-size:28px;font-weight:700}
+ .mono{font-family:ui-monospace}
+ a{color:#8ab4f8}
+</style>
+</head>
+<body>
+  <div class="card">
+    <a href="/dashboard?shop_id=__SHOP__&key=__KEY__">← back</a>
+    <h2>Executive KPI（__DAYS__日）</h2>
+  </div>
+
+  <div id="kpis" class="row"></div>
+
+<script>
+  const KEY = "__KEY__";
+  const SHOP = "__SHOP__";
+  const DAYS = __DAYS__;
+
+  async function fetchJson(url){ const r = await fetch(url); return await r.json(); }
+
+  (async () => {
+    const url = "/api/kpi?shop_id=" + encodeURIComponent(SHOP)
+      + "&days=" + encodeURIComponent(String(DAYS))
+      + "&key=" + encodeURIComponent(KEY);
+    const k = await fetchJson(url);
+
+    document.getElementById("kpis").innerHTML =
+      "<div class='card'><div>顧客数</div><div class='kpi'>" + k.customers + "</div></div>"
+      + "<div class='card'><div>成約数</div><div class='kpi'>" + k.won + "</div></div>"
+      + "<div class='card'><div>成約率</div><div class='kpi'>" + (k.win_rate*100).toFixed(1) + "%</div></div>"
+      + "<div class='card'><div>AI関与率</div><div class='kpi'>" + (k.ai_touch_rate*100).toFixed(1) + "%</div></div>"
+      + "<div class='card'><div>intent別成約</div><pre class='mono'>" + JSON.stringify(k.intent_win,null,2) + "</pre></div>";
+  })().catch(console.error);
+</script>
+</body>
+</html>
+"""
+
+CUSTOMER_HTML = r"""<!doctype html>
+<html lang="ja">
+<head>
+<meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width, initial-scale=1"/>
+<title>Customer</title>
+<style>
+  body{font-family:system-ui;background:#0b1020;color:#fff;margin:16px}
+  .card{background:rgba(255,255,255,.06);border:1px solid rgba(255,255,255,.12);border-radius:14px;padding:12px;margin-bottom:12px}
+  .mono{font-family:ui-monospace,Menlo,Monaco,Consolas,monospace}
+  a{color:#8ab4f8}
+  button{padding:8px 10px;border-radius:10px;border:1px solid rgba(255,255,255,.18);background:rgba(255,255,255,.06);color:#fff;cursor:pointer}
+  .btnrow{display:flex;gap:10px;flex-wrap:wrap}
+  pre{white-space:pre-wrap}
+  .msg{padding:8px;border-bottom:1px solid rgba(255,255,255,.12)}
+</style>
+</head>
+<body>
+  <div class="card">
+    <a href="/dashboard?shop_id=__SHOP__&key=__KEY__">← back</a>
+    <div class="mono" style="margin-top:8px;">__CONV__</div>
+  </div>
+
+  <div class="card" id="cust">loading...</div>
+
+  <div class="card">
+    <div class="btnrow">
+      <button onclick="markWon()">🟢 成約（WIN）</button>
+      <button onclick="unmarkWon()">↩︎ 成約取消</button>
+      <button onclick="clearCold()">🧊 perma_cold解除</button>
+      <button onclick="runAutoCold()">🤖 auto_cold</button>
+      <button onclick="sendFollowup(1)">📨 followup(1)</button>
+      <button onclick="sendFollowup(2)">📨 followup(2)</button>
+    </div>
+  </div>
+
+  <div class="card"><b>Messages</b><div id="msgs">loading...</div></div>
+  <div class="card"><b>Followups</b><div id="fls">loading...</div></div>
+
+<script>
+  const KEY = "__KEY__";
+  const SHOP = "__SHOP__";
+  const CONV = "__CONV__";
+
+  function esc(s) {
+    return (s ?? "").toString().replace(/[&<>"]/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;","\"":"&quot;"}[c]));
+  }
+  async function fetchJson(url, opts){ const r = await fetch(url, opts || undefined); return await r.json(); }
+  function adminKey(){ return localStorage.getItem("dashboard_admin_key") || ""; }
+
+  async function reload(){
+    const url = "/api/customer/detail?shop_id=" + encodeURIComponent(SHOP)
+      + "&conv_key=" + encodeURIComponent(CONV)
+      + "&key=" + encodeURIComponent(KEY);
+
+    const d = await fetchJson(url);
+    const c = d.customer || {};
+
+    document.getElementById("cust").innerHTML =
+      "<div><b>User</b>: <span class='mono'>" + esc(c.user_id || "-") + "</span></div>"
+      + "<div><b>Status</b>: <span class='mono'>" + esc(c.status || "-") + "</span>"
+      + " / <b>Lv</b>: <span class='mono'>" + esc(c.temp_level_stable || "-") + "</span>"
+      + " / <b>conf</b>: <span class='mono'>" + esc(c.confidence==null? "-" : Number(c.confidence).toFixed(2)) + "</span></div>"
+      + "<div><b>Intent</b>: <span class='mono'>" + esc(c.intent || "-") + "</span>"
+      + " / <b>Goal</b>: " + esc(c.next_goal || "-") + "</div>"
+      + "<div><b>need_reply</b>: <span class='mono'>" + esc(c.need_reply ? "TRUE" : "FALSE") + "</span> (" + esc(c.need_reply_reason || "") + ")</div>"
+      + "<div><b>perma_cold</b>: <span class='mono'>" + esc(c.perma_cold ? "TRUE" : "FALSE") + "</span>"
+      + " / <b>silence_score</b>: <span class='mono'>" + esc(String(c.silence_score ?? 0)) + "</span></div>"
+      + "<div><b>won</b>: <span class='mono'>" + esc(c.won ? "TRUE" : "FALSE") + "</span>"
+      + " / <b>won_at</b>: <span class='mono'>" + esc(c.won_at || "-") + "</span>"
+      + " / <b>won_by</b>: <span class='mono'>" + esc(c.won_by || "-") + "</span></div>";
+
+    const msgs = d.messages || [];
+    document.getElementById("msgs").innerHTML = msgs.length ? msgs.map(m => {
+      return "<div class='msg'>"
+        + "<div class='mono'>" + esc(m.role) + " / " + esc(m.ts || "") + " / Lv:" + esc(m.temp_level_stable || "-")
+        + " / intent:" + esc(m.intent || "-") + " / goal:" + esc(m.next_goal || "-") + "</div>"
+        + "<pre>" + esc(m.content || "") + "</pre>"
+        + "</div>";
+    }).join("") : "no messages";
+
+    const fls = d.followups || [];
+    document.getElementById("fls").innerHTML = fls.length ? fls.map(f => {
+      return "<div class='msg'>"
+        + "<div class='mono'>ts:" + esc(f.ts || "") + " / stage:" + esc(String(f.stage ?? "-"))
+        + " / mode:" + esc(f.mode || "-") + " / status:" + esc(f.status || "-")
+        + " / send_hour:" + esc(String(f.send_hour_jst ?? "-")) + "</div>"
+        + "<pre>" + esc(f.message || "") + "</pre>"
+        + "<div class='mono'>responded:" + esc(f.responded_at || "-") + " / err:" + esc(f.error || "-") + "</div>"
+        + "</div>";
+    }).join("") : "no followups";
+  }
+
+  async function markWon(){
+    const url = "/api/customer/mark_won?shop_id=" + encodeURIComponent(SHOP) + "&conv_key=" + encodeURIComponent(CONV);
+    await fetchJson(url, {method:"POST", headers:{"x-admin-key": adminKey()}});
+    await reload();
+  }
+  async function unmarkWon(){
+    const url = "/api/customer/unmark_won?shop_id=" + encodeURIComponent(SHOP) + "&conv_key=" + encodeURIComponent(CONV);
+    await fetchJson(url, {method:"POST", headers:{"x-admin-key": adminKey()}});
+    await reload();
+  }
+  async function clearCold(){
+    const url = "/api/customer/clear_perma_cold?shop_id=" + encodeURIComponent(SHOP) + "&conv_key=" + encodeURIComponent(CONV);
+    await fetchJson(url, {method:"POST", headers:{"x-admin-key": adminKey()}});
+    await reload();
+  }
+  async function runAutoCold(){
+    const url = "/jobs/auto_cold";
+    await fetchJson(url, {method:"POST", headers:{"x-admin-key": adminKey()}});
+    await reload();
+  }
+  async function sendFollowup(stage){
+    const url = "/api/customer/send_followup_now?shop_id=" + encodeURIComponent(SHOP)
+      + "&conv_key=" + encodeURIComponent(CONV)
+      + "&stage=" + encodeURIComponent(String(stage));
+    await fetchJson(url, {method:"POST", headers:{"x-admin-key": adminKey()}});
+    await reload();
+  }
+
+  if (!localStorage.getItem("dashboard_admin_key")) {
+    const k = prompt("ADMIN_API_KEY を入れてください（このブラウザに保存）");
+    if (k) localStorage.setItem("dashboard_admin_key", k.trim());
+  }
+
+  reload().catch(console.error);
+</script>
+</body>
+</html>
+"""
+
+
+# ============================================================
+# Dashboards (render templates)
+# ============================================================
+
+@app.get("/dashboard", response_class=HTMLResponse)
+async def dashboard(
+    _: None = Depends(require_dashboard_key),
+    shop_id: str = Query(default=SHOP_ID),
+    key: Optional[str] = Query(default=None),
+):
+    key_q = (key or "").strip()
+    html = DASHBOARD_HTML
+    html = html.replace("__SHOP__", str(shop_id)).replace("__KEY__", key_q).replace("__REFRESH__", str(int(DASHBOARD_REFRESH_SEC_DEFAULT)))
     return HTMLResponse(html)
 
 
@@ -1853,67 +2011,9 @@ async def dashboard_executive(
     key: Optional[str] = Query(default=None),
 ):
     key_q = (key or "").strip()
-    html = f"""
-<!doctype html>
-<html lang="ja">
-<head>
-<meta charset="utf-8"/>
-<title>Executive Dashboard</title>
-<style>
- body{{font-family:system-ui;background:#0b1020;color:#fff;margin:20px}}
- .card{{background:rgba(255,255,255,.08);border-radius:14px;padding:14px;margin-bottom:14px}}
- .row{{display:flex;gap:14px;flex-wrap:wrap}}
- .kpi{{font-size:28px;font-weight:700}}
- .mono{{font-family:ui-monospace}}
- a{{color:#8ab4f8}}
-</style>
-</head>
-<body>
-  <div class="card">
-    <a href="/dashboard?shop_id={shop_id}&key={key_q}">← back</a>
-    <h2>Executive KPI（{days}日）</h2>
-  </div>
-
-  <div id="kpis" class="row"></div>
-
-<script>
-const KEY = {json.dumps(key_q)};
-const SHOP = {json.dumps(shop_id)};
-const DAYS = {days};
-
-async function fetchJson(url) {{
-  const r = await fetch(url);
-  return await r.json();
-}}
-
-(async()=>{
-  const url = "/api/kpi?shop_id=" + encodeURIComponent(SHOP)
-    + "&days=" + encodeURIComponent(String(DAYS))
-    + "&key=" + encodeURIComponent(KEY);
-
-  const k = await fetchJson(url);
-
-  document.getElementById("kpis").innerHTML =
-    "<div class='card'><div>顧客数</div><div class='kpi'>" + k.customers + "</div></div>"
-    + "<div class='card'><div>成約数</div><div class='kpi'>" + k.won + "</div></div>"
-    + "<div class='card'><div>成約率</div><div class='kpi'>" + (k.win_rate*100).toFixed(1) + "%</div></div>"
-    + "<div class='card'><div>AI関与率</div><div class='kpi'>" + (k.ai_touch_rate*100).toFixed(1) + "%</div></div>"
-    + "<div class='card'><div>intent別成約</div><pre class='mono'>" + JSON.stringify(k.intent_win,null,2) + "</pre></div>";
-})();
-</script>
-</body>
-</html>
-"""
+    html = EXEC_HTML
+    html = html.replace("__SHOP__", str(shop_id)).replace("__KEY__", key_q).replace("__DAYS__", str(int(days)))
     return HTMLResponse(html)
-
-
-@app.get("/api/kpi")
-async def api_kpi(
-    _: None = Depends(require_dashboard_key),
-    shop_id: str = Query(default=SHOP_ID),
-    days: int = Query(default=30, ge=1, le=365),
-):
-    return JSONResponse(get_kpi_summary(shop_id, days))
 
 
 @app.get("/dashboard/customer", response_class=HTMLResponse)
@@ -1924,181 +2024,9 @@ async def dashboard_customer(
     key: Optional[str] = Query(default=None),
 ):
     key_q = (key or "").strip()
-    html = f"""
-<!doctype html>
-<html lang="ja">
-<head>
-<meta charset="utf-8"/>
-<meta name="viewport" content="width=device-width, initial-scale=1"/>
-<title>Customer | {shop_id}</title>
-<style>
-  body{{font-family:system-ui;background:#0b1020;color:#fff;margin:16px}}
-  .card{{background:rgba(255,255,255,.06);border:1px solid rgba(255,255,255,.12);border-radius:14px;padding:12px;margin-bottom:12px}}
-  .mono{{font-family:ui-monospace,Menlo,Monaco,Consolas,monospace}}
-  a{{color:#8ab4f8}}
-  button{{padding:8px 10px;border-radius:10px;border:1px solid rgba(255,255,255,.18);background:rgba(255,255,255,.06);color:#fff;cursor:pointer}}
-  .btnrow{{display:flex;gap:10px;flex-wrap:wrap}}
-  pre{{white-space:pre-wrap}}
-  .msg{{padding:8px;border-bottom:1px solid rgba(255,255,255,.12)}}
-</style>
-</head>
-<body>
-  <div class="card">
-    <a href="/dashboard?shop_id={shop_id}&key={key_q}">← back</a>
-    <div class="mono" style="margin-top:8px;">{conv_key}</div>
-  </div>
-
-  <div class="card" id="cust">loading...</div>
-
-  <div class="card">
-    <div class="btnrow">
-      <button onclick="markWon()">🟢 成約（WIN）</button>
-      <button onclick="unmarkWon()">↩︎ 成約取消</button>
-      <button onclick="clearCold()">🧊 perma_cold解除</button>
-      <button onclick="runAutoCold()">🤖 auto_cold</button>
-    </div>
-  </div>
-
-  <div class="card"><b>Messages</b><div id="msgs">loading...</div></div>
-  <div class="card"><b>Followups</b><div id="fls">loading...</div></div>
-
-<script>
-  const KEY = {json.dumps(key_q)};
-  const SHOP = {json.dumps(shop_id)};
-  const CONV = {json.dumps(conv_key)};
-
-  function esc(s) {{
-    return (s ?? "").toString().replace(/[&<>"]/g, c => ({{"&":"&amp;","<":"&lt;",">":"&gt;","\\"":"&quot;"}}[c]));
-  }}
-
-  async function fetchJson(url, opts) {{
-    const r = await fetch(url, opts || undefined);
-    return await r.json();
-  }}
-
-  function adminKey() {{
-    return localStorage.getItem("dashboard_admin_key") || "";
-  }}
-
-  async function reload() {{
-    const url = "/api/customer/detail?shop_id=" + encodeURIComponent(SHOP)
-      + "&conv_key=" + encodeURIComponent(CONV)
-      + "&key=" + encodeURIComponent(KEY);
-
-    const d = await fetchJson(url);
-    const c = d.customer || {{}};
-
-    document.getElementById("cust").innerHTML =
-      "<div><b>User</b>: <span class='mono'>" + esc(c.user_id || "-") + "</span></div>"
-      + "<div><b>Status</b>: <span class='mono'>" + esc(c.status || "-") + "</span>"
-      + " / <b>Lv</b>: <span class='mono'>" + esc(c.temp_level_stable || "-") + "</span>"
-      + " / <b>conf</b>: <span class='mono'>" + esc((c.confidence==null? "-" : Number(c.confidence).toFixed(2))) + "</span></div>"
-      + "<div><b>Intent</b>: <span class='mono'>" + esc(c.intent || "-") + "</span>"
-      + " / <b>Goal</b>: " + esc(c.next_goal || "-") + "</div>"
-      + "<div><b>need_reply</b>: <span class='mono'>" + esc(c.need_reply ? "TRUE" : "FALSE") + "</span> (" + esc(c.need_reply_reason || "") + ")</div>"
-      + "<div><b>perma_cold</b>: <span class='mono'>" + esc(c.perma_cold ? "TRUE" : "FALSE") + "</span>"
-      + " / <b>silence_score</b>: <span class='mono'>" + esc(String(c.silence_score ?? 0)) + "</span></div>"
-      + "<div><b>won</b>: <span class='mono'>" + esc(c.won ? "TRUE" : "FALSE") + "</span>"
-      + " / <b>won_at</b>: <span class='mono'>" + esc(c.won_at || "-") + "</span>"
-      + " / <b>won_by</b>: <span class='mono'>" + esc(c.won_by || "-") + "</span></div>";
-
-    const msgs = d.messages || [];
-    document.getElementById("msgs").innerHTML = msgs.length ? msgs.map(m => {{
-      return "<div class='msg'>"
-        + "<div class='mono'>" + esc(m.role) + " / " + esc(m.ts || "") + " / Lv:" + esc(m.temp_level_stable || "-")
-        + " / intent:" + esc(m.intent || "-") + " / goal:" + esc(m.next_goal || "-") + "</div>"
-        + "<pre>" + esc(m.content || "") + "</pre>"
-        + "</div>";
-    }}).join("") : "no messages";
-
-    const fls = d.followups || [];
-    document.getElementById("fls").innerHTML = fls.length ? fls.map(f => {{
-      return "<div class='msg'>"
-        + "<div class='mono'>ts:" + esc(f.ts || "") + " / stage:" + esc(String(f.stage ?? "-")) + " / mode:" + esc(f.mode || "-")
-        + " / status:" + esc(f.status || "-") + " / send_hour:" + esc(String(f.send_hour_jst ?? "-")) + "</div>"
-        + "<pre>" + esc(f.message || "") + "</pre>"
-        + "<div class='mono'>responded:" + esc(f.responded_at || "-") + " / err:" + esc(f.error || "-") + "</div>"
-        + "</div>";
-    }}).join("") : "no followups";
-  }}
-
-  async function markWon() {{
-    const url = "/api/customer/mark_won?shop_id=" + encodeURIComponent(SHOP) + "&conv_key=" + encodeURIComponent(CONV);
-    await fetchJson(url, {{method:"POST", headers:{{"x-admin-key": adminKey()}}}});
-    await reload();
-  }}
-
-  async function unmarkWon() {{
-    const url = "/api/customer/unmark_won?shop_id=" + encodeURIComponent(SHOP) + "&conv_key=" + encodeURIComponent(CONV);
-    await fetchJson(url, {{method:"POST", headers:{{"x-admin-key": adminKey()}}}});
-    await reload();
-  }}
-
-  async function clearCold() {{
-    const url = "/api/customer/clear_perma_cold?shop_id=" + encodeURIComponent(SHOP) + "&conv_key=" + encodeURIComponent(CONV);
-    await fetchJson(url, {{method:"POST", headers:{{"x-admin-key": adminKey()}}}});
-    await reload();
-  }}
-
-  async function runAutoCold() {{
-    const url = "/jobs/auto_cold";
-    await fetchJson(url, {{method:"POST", headers:{{"x-admin-key": adminKey()}}}});
-    await reload();
-  }}
-
-  if (!localStorage.getItem("dashboard_admin_key")) {{
-    const k = prompt("ADMIN_API_KEY を入れてください（このブラウザに保存）");
-    if (k) localStorage.setItem("dashboard_admin_key", k.trim());
-  }}
-
-  reload().catch(console.error);
-</script>
-</body>
-</html>
-"""
+    html = CUSTOMER_HTML
+    html = html.replace("__SHOP__", str(shop_id)).replace("__KEY__", key_q).replace("__CONV__", str(conv_key))
     return HTMLResponse(html)
-
-
-# ============================================================
-# KPI functions + api
-# ============================================================
-
-def get_kpi_summary(shop_id: str, days: int = 30) -> Dict[str, Any]:
-    since = utcnow() - timedelta(days=max(1, min(365, int(days))))
-
-    total = db_fetchall("SELECT COUNT(*) FROM customers WHERE shop_id=%s AND updated_at >= %s", (shop_id, since))[0][0]
-    won = db_fetchall("SELECT COUNT(*) FROM customers WHERE shop_id=%s AND COALESCE(won,FALSE)=TRUE AND won_at >= %s", (shop_id, since))[0][0]
-    ai_touched = db_fetchall("SELECT COUNT(DISTINCT conv_key) FROM messages WHERE shop_id=%s AND role='assistant' AND created_at >= %s", (shop_id, since))[0][0]
-
-    intent_rows = db_fetchall(
-        """
-        SELECT COALESCE(intent,'other'), COUNT(*)
-        FROM customers
-        WHERE shop_id=%s AND COALESCE(won,FALSE)=TRUE AND won_at >= %s
-        GROUP BY COALESCE(intent,'other')
-        """,
-        (shop_id, since),
-    )
-    intent_win = {str(r[0] or "other"): int(r[1] or 0) for r in intent_rows}
-
-    return {
-        "period_days": int(days),
-        "customers": int(total),
-        "won": int(won),
-        "win_rate": (won / total) if total else 0.0,
-        "ai_touched": int(ai_touched),
-        "ai_touch_rate": (ai_touched / total) if total else 0.0,
-        "intent_win": intent_win,
-    }
-
-
-@app.get("/api/kpi")
-async def api_kpi(
-    _: None = Depends(require_dashboard_key),
-    shop_id: str = Query(default=SHOP_ID),
-    days: int = Query(default=30, ge=1, le=365),
-):
-    return JSONResponse(get_kpi_summary(shop_id, days))
 
 
 # ============================================================
@@ -2132,7 +2060,6 @@ async def line_webhook(
             continue
 
         conv_key = "user:" + str(user_id)
-
         ensure_customer_row(SHOP_ID, conv_key, user_id)
 
         # save inbound
@@ -2141,7 +2068,7 @@ async def line_webhook(
         except Exception as e:
             print("[DB] save user:", repr(e))
 
-        # user replied => attribution + clear need
+        # attribution + clear need
         try:
             attribute_followup_response(SHOP_ID, conv_key)
         except Exception:
@@ -2151,23 +2078,24 @@ async def line_webhook(
         except Exception:
             pass
 
-        # update preferred hour
+        # learn pref hour
         try:
             update_customer_pref_hour(SHOP_ID, conv_key)
         except Exception:
             pass
 
-        # revive lost by keywords
+        # revive lost
         try:
             revive_if_lost_by_keywords(SHOP_ID, conv_key, user_text)
         except Exception:
             pass
 
+        # stop if inactive
         if is_inactive(SHOP_ID, conv_key):
             await reply_line(reply_token, "承知しました。必要になったらいつでもご連絡ください。")
             continue
 
-        # hard optout/lost
+        # optout/lost
         for pat in OPTOUT_PATTERNS:
             if re.search(pat, user_text, flags=re.IGNORECASE):
                 mark_opt_out(SHOP_ID, conv_key, user_id)
@@ -2180,12 +2108,13 @@ async def line_webhook(
                 await reply_line(reply_token, "承知しました。必要になったらまたいつでもご連絡ください。")
                 return {"ok": True}
 
-        # visit change / selection
+        # visit change
         if is_visit_change_request(user_text):
             set_visit_slot(SHOP_ID, conv_key, "REQUEST_CHANGE")
             await reply_line(reply_token, "承知しました。ご希望の曜日や時間帯（例：平日夜/土日午後など）を教えてください。")
             continue
 
+        # visit selection
         sel = parse_slot_selection(user_text)
         if sel is not None:
             slots = upcoming_visit_slots_jst(VISIT_DAYS_AHEAD)
@@ -2198,14 +2127,14 @@ async def line_webhook(
             continue
 
         # fast reply
-        fast_reply = ""
+        fast = ""
         try:
-            fast_reply = await asyncio.wait_for(generate_reply_only(user_id, user_text), timeout=FAST_REPLY_TIMEOUT_SEC)
+            fast = await asyncio.wait_for(generate_reply_only(user_id, user_text), timeout=FAST_REPLY_TIMEOUT_SEC)
         except Exception:
-            fast_reply = ""
+            fast = ""
 
-        if fast_reply:
-            await reply_line(reply_token, fast_reply)
+        if fast:
+            await reply_line(reply_token, fast)
 
             async def bg():
                 lvl_raw, conf, intent, goal, reasons, override = await analyze_only(SHOP_ID, conv_key, user_text)
@@ -2224,10 +2153,10 @@ async def line_webhook(
                     set_customer_slots(SHOP_ID, conv_key, merged)
 
                 upsert_customer_state(SHOP_ID, conv_key, user_id, user_text, lvl_raw, lvl_stable, conf, intent, goal)
-                save_message(SHOP_ID, conv_key, "assistant", fast_reply, lvl_raw, lvl_stable, conf, intent, goal)
+                save_message(SHOP_ID, conv_key, "assistant", fast, lvl_raw, lvl_stable, conf, intent, goal)
 
                 flags = get_customer_flags(SHOP_ID, conv_key)
-                need, reason = compute_need_reply(goal, flags, assistant_text=fast_reply)
+                need, reason = compute_need_reply(goal, flags, assistant_text=fast)
                 set_need_reply(SHOP_ID, conv_key, need, reason)
 
             background.add_task(bg)
