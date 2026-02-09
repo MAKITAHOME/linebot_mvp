@@ -1,10 +1,4 @@
-# app.py (FULL - EVOLVED)
-# Based on "clean & stable" version, evolved with:
-# - Manual WIN (C) + Executive KPI
-# - perma_cold + silence_score + auto_cold job
-# - Dashboard customer page includes WIN buttons
-# - JS uses NO template literals (no `${}`) to avoid f-string pitfalls
-
+# app.py (FULL - EVOLVED & STABLE)
 import os
 import json
 import hmac
@@ -51,18 +45,28 @@ FOLLOWUP_MIN_LEVEL = int(os.getenv("FOLLOWUP_MIN_LEVEL", "8"))
 FOLLOWUP_LIMIT = int(os.getenv("FOLLOWUP_LIMIT", "50"))
 FOLLOWUP_DRYRUN = os.getenv("FOLLOWUP_DRYRUN", "0").strip() == "1"
 FOLLOWUP_LOCK_TTL_SEC = int(os.getenv("FOLLOWUP_LOCK_TTL_SEC", "180"))
-FOLLOWUP_MIN_HOURS_BETWEEN = int(os.getenv("FOLLOWUP_MIN_HOURS_BETWEEN", "24"))
+
 FOLLOWUP_JST_FROM = int(os.getenv("FOLLOWUP_JST_FROM", "10"))
 FOLLOWUP_JST_TO = int(os.getenv("FOLLOWUP_JST_TO", "20"))
 
 FOLLOWUP_AB_ENABLED = os.getenv("FOLLOWUP_AB_ENABLED", "1").strip() == "1"
-VISIT_DAYS_AHEAD = int(os.getenv("VISIT_DAYS_AHEAD", "3"))
-VISIT_SLOT_HOURS = os.getenv("VISIT_SLOT_HOURS", "11,14,17").strip()
-FOLLOWUP_ATTRIBUTION_WINDOW_HOURS = int(os.getenv("FOLLOWUP_ATTRIBUTION_WINDOW_HOURS", "72"))
 FOLLOWUP_SECOND_TOUCH_AFTER_HOURS = int(os.getenv("FOLLOWUP_SECOND_TOUCH_AFTER_HOURS", "48"))
 FOLLOWUP_SECOND_TOUCH_LIMIT = int(os.getenv("FOLLOWUP_SECOND_TOUCH_LIMIT", "50"))
+FOLLOWUP_ATTRIBUTION_WINDOW_HOURS = int(os.getenv("FOLLOWUP_ATTRIBUTION_WINDOW_HOURS", "72"))
 
-# OpenAI models / timeouts
+VISIT_DAYS_AHEAD = int(os.getenv("VISIT_DAYS_AHEAD", "3"))
+VISIT_SLOT_HOURS = os.getenv("VISIT_SLOT_HOURS", "11,14,17").strip()
+
+FOLLOWUP_TIME_MATCH_HOURS = int(os.getenv("FOLLOWUP_TIME_MATCH_HOURS", "1"))
+FOLLOWUP_FORCE_SEND_AFTER_HOURS = int(os.getenv("FOLLOWUP_FORCE_SEND_AFTER_HOURS", "12"))
+PREF_HOUR_LOOKBACK_DAYS = int(os.getenv("PREF_HOUR_LOOKBACK_DAYS", "60"))
+PREF_HOUR_MIN_SAMPLES = int(os.getenv("PREF_HOUR_MIN_SAMPLES", "3"))
+
+AUTO_COLD_USE_LLM = os.getenv("AUTO_COLD_USE_LLM", "1").strip() != "0"
+AUTO_COLD_LIMIT = int(os.getenv("AUTO_COLD_LIMIT", "80"))
+
+FOLLOWUP_USE_LLM = os.getenv("FOLLOWUP_USE_LLM", "1").strip() != "0"
+
 OPENAI_MODEL_ASSISTANT = os.getenv("OPENAI_MODEL_ASSISTANT", "gpt-4o-mini").strip()
 OPENAI_MODEL_ANALYZE = os.getenv("OPENAI_MODEL_ANALYZE", "gpt-4o-mini").strip()
 OPENAI_MODEL_FOLLOWUP = os.getenv("OPENAI_MODEL_FOLLOWUP", "gpt-4o-mini").strip()
@@ -75,25 +79,12 @@ AUTO_COLD_LLM_TIMEOUT_SEC = float(os.getenv("AUTO_COLD_LLM_TIMEOUT_SEC", "8.5"))
 RESPONSES_API_URL = "https://api.openai.com/v1/responses"
 OPENAI_CHAT_URL = "https://api.openai.com/v1/chat/completions"
 
-# followup llm switch
-FOLLOWUP_USE_LLM = os.getenv("FOLLOWUP_USE_LLM", "1").strip() != "0"
-
-# timing learning params
-FOLLOWUP_TIME_MATCH_HOURS = int(os.getenv("FOLLOWUP_TIME_MATCH_HOURS", "1"))
-FOLLOWUP_FORCE_SEND_AFTER_HOURS = int(os.getenv("FOLLOWUP_FORCE_SEND_AFTER_HOURS", "12"))
-PREF_HOUR_LOOKBACK_DAYS = int(os.getenv("PREF_HOUR_LOOKBACK_DAYS", "60"))
-PREF_HOUR_MIN_SAMPLES = int(os.getenv("PREF_HOUR_MIN_SAMPLES", "3"))
-
-# auto cold
-AUTO_COLD_USE_LLM = os.getenv("AUTO_COLD_USE_LLM", "1").strip() != "0"
-AUTO_COLD_LIMIT = int(os.getenv("AUTO_COLD_LIMIT", "80"))
+JST = timezone(timedelta(hours=9))
 
 CHAT_HISTORY: Dict[str, deque] = defaultdict(lambda: deque(maxlen=40))
 TEMP_HISTORY: Dict[str, deque] = defaultdict(lambda: deque(maxlen=5))
 
-JST = timezone(timedelta(hours=9))
-
-app = FastAPI(title="linebot_mvp", version="2.0.0")
+app = FastAPI(title="linebot_mvp", version="2.2.0")
 
 
 # ============================================================
@@ -151,6 +142,36 @@ def require_admin_key(x_admin_key: Optional[str] = Header(default=None, alias="x
         raise HTTPException(status_code=500, detail="ADMIN_API_KEY is not configured")
     if not x_admin_key or not secrets.compare_digest(x_admin_key.strip(), ADMIN_API_KEY):
         raise HTTPException(status_code=401, detail="Unauthorized")
+
+
+# ============================================================
+# Time helpers
+# ============================================================
+
+def utcnow() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+def now_jst() -> datetime:
+    return datetime.now(JST)
+
+
+def is_within_jst_window(dt: Optional[datetime] = None) -> bool:
+    d = dt or now_jst()
+    h = d.hour
+    start = max(0, min(23, int(FOLLOWUP_JST_FROM)))
+    end = max(0, min(23, int(FOLLOWUP_JST_TO)))
+    if start < end:
+        return start <= h < end
+    if start > end:
+        return (h >= start) or (h < end)
+    return False
+
+
+def within_hour_band(now_hour: int, target_hour: int, band: int) -> bool:
+    diff = abs(now_hour - target_hour)
+    diff = min(diff, 24 - diff)
+    return diff <= max(0, band)
 
 
 # ============================================================
@@ -274,7 +295,7 @@ def ensure_tables_and_columns() -> None:
 
     # status
     cur.execute("ALTER TABLE customers ADD COLUMN IF NOT EXISTS status TEXT;")
-    cur.execute("ALTER TABLE customers ADD COLUMN IF NOT EXISTS opt_out BOOLEAN;")
+    cur.execute("ALTER TABLE customers ADD COLUMN IF NOT EXISTS opt_out BOOLEAN DEFAULT FALSE;")
     cur.execute("ALTER TABLE customers ADD COLUMN IF NOT EXISTS opt_out_at TIMESTAMPTZ;")
 
     # visit + slots
@@ -296,11 +317,11 @@ def ensure_tables_and_columns() -> None:
     cur.execute("ALTER TABLE customers ADD COLUMN IF NOT EXISTS pref_hour_samples INT;")
     cur.execute("ALTER TABLE customers ADD COLUMN IF NOT EXISTS pref_hour_updated_at TIMESTAMPTZ;")
 
-    # EVOLUTION: perma_cold / silence_score
+    # perma cold
     cur.execute("ALTER TABLE customers ADD COLUMN IF NOT EXISTS silence_score INT DEFAULT 0;")
     cur.execute("ALTER TABLE customers ADD COLUMN IF NOT EXISTS perma_cold BOOLEAN DEFAULT FALSE;")
 
-    # EVOLUTION: manual WIN (C)
+    # manual WIN (C)
     cur.execute("ALTER TABLE customers ADD COLUMN IF NOT EXISTS won BOOLEAN DEFAULT FALSE;")
     cur.execute("ALTER TABLE customers ADD COLUMN IF NOT EXISTS won_at TIMESTAMPTZ;")
     cur.execute("ALTER TABLE customers ADD COLUMN IF NOT EXISTS won_by TEXT;")
@@ -361,7 +382,6 @@ def ensure_tables_and_columns() -> None:
     cur.execute("CREATE INDEX IF NOT EXISTS idx_messages_shop_conv_role_created ON messages(shop_id, conv_key, role, created_at DESC);")
     cur.execute("CREATE INDEX IF NOT EXISTS idx_followup_shop_conv_created ON followup_logs(shop_id, conv_key, created_at DESC);")
 
-    # normalize null
     cur.execute("UPDATE customers SET need_reply=FALSE WHERE need_reply IS NULL;")
 
     cur.close()
@@ -375,54 +395,13 @@ async def on_startup():
 
 
 # ============================================================
-# WIN (C方式) - manual
+# Core state helpers
 # ============================================================
 
-def mark_won(shop_id: str, conv_key: str, by: str = "admin") -> None:
-    db_execute(
-        """
-        UPDATE customers
-        SET won=TRUE, won_at=now(), won_by=%s,
-            status='WON',
-            perma_cold=TRUE,
-            need_reply=FALSE,
-            updated_at=now()
-        WHERE shop_id=%s AND conv_key=%s
-        """,
-        (by, shop_id, conv_key),
-    )
-
-
-def unmark_won(shop_id: str, conv_key: str) -> None:
-    db_execute(
-        """
-        UPDATE customers
-        SET won=FALSE, won_at=NULL, won_by=NULL,
-            status='ACTIVE',
-            perma_cold=FALSE,
-            updated_at=now()
-        WHERE shop_id=%s AND conv_key=%s
-        """,
-        (shop_id, conv_key),
-    )
-
-
-# ============================================================
-# core helpers
-# ============================================================
-
-def utcnow() -> datetime:
-    return datetime.now(timezone.utc)
-
-
-def now_jst() -> datetime:
-    return datetime.now(JST)
-
-
-def stable_from_history(conv_key: str, raw: int) -> int:
-    h = TEMP_HISTORY[conv_key]
-    h.append(raw)
-    s = sorted(h)
+def stable_from_history(conv_key: str, raw_level: int) -> int:
+    hist = TEMP_HISTORY[conv_key]
+    hist.append(raw_level)
+    s = sorted(hist)
     return s[len(s) // 2]
 
 
@@ -430,7 +409,7 @@ def ensure_customer_row(shop_id: str, conv_key: str, user_id: str) -> None:
     db_execute(
         """
         INSERT INTO customers (shop_id, conv_key, user_id, updated_at, status, need_reply, need_reply_reason, need_reply_updated_at)
-        VALUES (%s, %s, %s, now(), 'ACTIVE', FALSE, '', now())
+        VALUES (%s,%s,%s,now(),'ACTIVE',FALSE,'',now())
         ON CONFLICT (shop_id, conv_key)
         DO UPDATE SET user_id=EXCLUDED.user_id, updated_at=now()
         """,
@@ -441,8 +420,7 @@ def ensure_customer_row(shop_id: str, conv_key: str, user_id: str) -> None:
 def is_inactive(shop_id: str, conv_key: str) -> bool:
     rows = db_fetchall(
         """
-        SELECT COALESCE(opt_out,FALSE), COALESCE(status,'ACTIVE'),
-               COALESCE(won,FALSE), COALESCE(perma_cold,FALSE)
+        SELECT COALESCE(opt_out,FALSE), COALESCE(perma_cold,FALSE), COALESCE(won,FALSE), COALESCE(status,'ACTIVE')
         FROM customers
         WHERE shop_id=%s AND conv_key=%s
         """,
@@ -450,11 +428,37 @@ def is_inactive(shop_id: str, conv_key: str) -> bool:
     )
     if not rows:
         return False
-    opt, st, won, cold = rows[0]
-    if bool(opt) or bool(won) or bool(cold):
-        return True
+    opt, cold, won, st = rows[0]
     st = (st or "ACTIVE").upper()
-    return st in ("COLD", "LOST", "OPTOUT", "WON")
+    return bool(opt or cold or won or st in ("OPTOUT", "LOST", "WON"))
+
+
+def upsert_customer_state(
+    shop_id: str,
+    conv_key: str,
+    user_id: str,
+    last_user_text: str,
+    raw_level: int,
+    stable_level: int,
+    confidence: float,
+    intent: str,
+    next_goal: str,
+) -> None:
+    db_execute(
+        """
+        UPDATE customers
+        SET user_id=%s,
+            last_user_text=%s,
+            temp_level_raw=%s,
+            temp_level_stable=%s,
+            confidence=%s,
+            intent=%s,
+            next_goal=%s,
+            updated_at=now()
+        WHERE shop_id=%s AND conv_key=%s
+        """,
+        (user_id, last_user_text, raw_level, stable_level, confidence, intent, next_goal, shop_id, conv_key),
+    )
 
 
 def save_message(
@@ -496,121 +500,51 @@ def get_recent_conversation(shop_id: str, conv_key: str, limit: int) -> List[Dic
         ORDER BY created_at DESC
         LIMIT %s
         """,
-        (shop_id, conv_key, max(1, min(30, int(limit)))),
+        (shop_id, conv_key, max(2, min(30, int(limit)))),
     )
     rows = list(reversed(rows))
     return [{"role": r[0], "content": (r[1] or "")[:1200]} for r in rows]
 
 
-def upsert_customer_state(
-    shop_id: str,
-    conv_key: str,
-    user_id: str,
-    last_user_text: str,
-    raw_level: int,
-    stable_level: int,
-    confidence: float,
-    intent: str,
-    next_goal: str,
-) -> None:
+def get_recent_conversation_for_followup(shop_id: str, conv_key: str, limit: int = 12) -> List[Dict[str, str]]:
+    return get_recent_conversation(shop_id, conv_key, limit=max(6, min(20, int(limit))))
+
+
+# ============================================================
+# WIN (manual / C)
+# ============================================================
+
+def mark_won(shop_id: str, conv_key: str, by: str = "admin") -> None:
     db_execute(
         """
         UPDATE customers
-        SET user_id=%s,
-            last_user_text=%s,
-            temp_level_raw=%s,
-            temp_level_stable=%s,
-            confidence=%s,
-            intent=%s,
-            next_goal=%s,
+        SET won=TRUE, won_at=now(), won_by=%s,
+            status='WON',
+            perma_cold=TRUE,
+            need_reply=FALSE,
             updated_at=now()
         WHERE shop_id=%s AND conv_key=%s
         """,
-        (user_id, last_user_text, raw_level, stable_level, confidence, intent, next_goal, shop_id, conv_key),
+        (by, shop_id, conv_key),
     )
 
 
-def set_need_reply(shop_id: str, conv_key: str, need: bool, reason: str = "") -> None:
+def unmark_won(shop_id: str, conv_key: str) -> None:
     db_execute(
         """
         UPDATE customers
-        SET need_reply=%s, need_reply_reason=%s, need_reply_updated_at=now(), updated_at=now()
-        WHERE shop_id=%s AND conv_key=%s
-        """,
-        (bool(need), (reason or "")[:120], shop_id, conv_key),
-    )
-
-
-# ============================================================
-# need_reply based on goal + slots
-# ============================================================
-
-def get_customer_flags(shop_id: str, conv_key: str) -> Dict[str, Any]:
-    rows = db_fetchall(
-        """
-        SELECT visit_slot_selected, slot_budget, slot_area, slot_move_in, slot_layout,
-               COALESCE(status,'ACTIVE'), COALESCE(opt_out,FALSE), COALESCE(won,FALSE), COALESCE(perma_cold,FALSE)
-        FROM customers
+        SET won=FALSE, won_at=NULL, won_by=NULL,
+            status='ACTIVE',
+            perma_cold=FALSE,
+            updated_at=now()
         WHERE shop_id=%s AND conv_key=%s
         """,
         (shop_id, conv_key),
     )
-    if not rows:
-        return {}
-    vsel, b, a, m, l, st, opt, won, cold = rows[0]
-    return {
-        "visit_slot_selected": vsel,
-        "slot_budget": b,
-        "slot_area": a,
-        "slot_move_in": m,
-        "slot_layout": l,
-        "status": (st or "ACTIVE"),
-        "opt_out": bool(opt),
-        "won": bool(won),
-        "perma_cold": bool(cold),
-    }
-
-
-def compute_need_reply(next_goal: str, flags: Dict[str, Any], assistant_text: str = "") -> Tuple[bool, str]:
-    goal = (next_goal or "").strip()
-    st = (flags.get("status") or "ACTIVE").upper()
-    if flags.get("opt_out") or flags.get("won") or flags.get("perma_cold") or st in ("OPTOUT", "LOST", "WON"):
-        return False, "inactive"
-
-    visit = flags.get("visit_slot_selected")
-    budget = flags.get("slot_budget")
-    area = flags.get("slot_area")
-    move_in = flags.get("slot_move_in")
-    layout = flags.get("slot_layout")
-
-    if any(k in goal for k in ["内見", "候補日", "日程"]):
-        if not visit or visit == "REQUEST_CHANGE":
-            return True, "need_visit_slot"
-        return False, "visit_ok"
-
-    if "予算" in goal and not budget:
-        return True, "need_budget"
-    if ("エリア" in goal or "沿線" in goal) and not area:
-        return True, "need_area"
-    if ("入居" in goal or "時期" in goal) and not move_in:
-        return True, "need_move_in"
-    if "間取り" in goal and not layout:
-        return True, "need_layout"
-
-    if "要件確認" in goal:
-        missing = [k for k, v in [("budget", budget), ("area", area), ("move_in", move_in), ("layout", layout)] if not v]
-        if missing:
-            return True, "need_slots"
-        return False, "slots_ok"
-
-    if "？" in (assistant_text or "") or "?" in (assistant_text or ""):
-        return True, "assistant_question"
-
-    return False, "no_need"
 
 
 # ============================================================
-# Slots
+# Slots + visit
 # ============================================================
 
 def extract_slots(text: str) -> Dict[str, str]:
@@ -671,8 +605,131 @@ def set_customer_slots(shop_id: str, conv_key: str, slots: Dict[str, str]) -> No
     )
 
 
+def set_visit_slot(shop_id: str, conv_key: str, slot_text: str) -> None:
+    db_execute(
+        "UPDATE customers SET visit_slot_selected=%s, visit_slot_selected_at=now(), updated_at=now() WHERE shop_id=%s AND conv_key=%s",
+        (slot_text, shop_id, conv_key),
+    )
+
+
+def parse_slot_hours() -> List[int]:
+    out: List[int] = []
+    for part in (VISIT_SLOT_HOURS or "").split(","):
+        part = part.strip()
+        if not part:
+            continue
+        try:
+            h = int(part)
+            if 0 <= h <= 23:
+                out.append(h)
+        except Exception:
+            pass
+    return out or [11, 14, 17]
+
+
+def upcoming_visit_slots_jst(days_ahead: int = 3) -> List[str]:
+    hours = parse_slot_hours()
+    slots: List[str] = []
+    for d in range(1, max(1, min(14, days_ahead)) + 1):
+        label = "明日" if d == 1 else ("明後日" if d == 2 else f"{d}日後")
+        for h in hours:
+            slots.append(f"{label} {h:02d}:00-{(h+1)%24:02d}:00")
+    return slots[:6]
+
+
+def parse_slot_selection(text: str) -> Optional[int]:
+    t = (text or "").strip()
+    circ_map = {"①": 1, "②": 2, "③": 3, "④": 4, "⑤": 5, "⑥": 6}
+    if t in circ_map:
+        return circ_map[t]
+    m = re.match(r"^\s*([1-6])\s*$", t)
+    if m:
+        return int(m.group(1))
+    m2 = re.search(r"([1-6])\s*(?:番|で|がいい|希望|お願いします)?", t)
+    if m2:
+        return int(m2.group(1))
+    return None
+
+
+def is_visit_change_request(text: str) -> bool:
+    return any(re.search(p, text or "") for p in VISIT_CHANGE_PATTERNS)
+
+
 # ============================================================
-# Preferred hour learning (Phase3)
+# need_reply
+# ============================================================
+
+def set_need_reply(shop_id: str, conv_key: str, need: bool, reason: str = "") -> None:
+    db_execute(
+        """
+        UPDATE customers
+        SET need_reply=%s, need_reply_reason=%s, need_reply_updated_at=now(), updated_at=now()
+        WHERE shop_id=%s AND conv_key=%s
+        """,
+        (bool(need), (reason or "")[:120], shop_id, conv_key),
+    )
+
+
+def get_customer_flags(shop_id: str, conv_key: str) -> Dict[str, Any]:
+    rows = db_fetchall(
+        """
+        SELECT visit_slot_selected, slot_budget, slot_area, slot_move_in, slot_layout,
+               COALESCE(status,'ACTIVE'), COALESCE(opt_out,FALSE), COALESCE(won,FALSE), COALESCE(perma_cold,FALSE)
+        FROM customers
+        WHERE shop_id=%s AND conv_key=%s
+        """,
+        (shop_id, conv_key),
+    )
+    if not rows:
+        return {}
+    vsel, b, a, m, l, st, opt, won, cold = rows[0]
+    return {
+        "visit_slot_selected": vsel,
+        "slot_budget": b,
+        "slot_area": a,
+        "slot_move_in": m,
+        "slot_layout": l,
+        "status": (st or "ACTIVE"),
+        "opt_out": bool(opt),
+        "won": bool(won),
+        "perma_cold": bool(cold),
+    }
+
+
+def compute_need_reply(next_goal: str, flags: Dict[str, Any], assistant_text: str = "") -> Tuple[bool, str]:
+    goal = (next_goal or "").strip()
+    st = (flags.get("status") or "ACTIVE").upper()
+    if flags.get("opt_out") or flags.get("won") or flags.get("perma_cold") or st in ("OPTOUT", "LOST", "WON"):
+        return False, "inactive"
+
+    visit = flags.get("visit_slot_selected")
+    budget = flags.get("slot_budget")
+    area = flags.get("slot_area")
+    move_in = flags.get("slot_move_in")
+    layout = flags.get("slot_layout")
+
+    if any(k in goal for k in ["内見", "候補日", "日程"]):
+        if not visit or visit == "REQUEST_CHANGE":
+            return True, "need_visit_slot"
+        return False, "visit_ok"
+
+    if "予算" in goal and not budget:
+        return True, "need_budget"
+    if ("エリア" in goal or "沿線" in goal) and not area:
+        return True, "need_area"
+    if ("入居" in goal or "時期" in goal) and not move_in:
+        return True, "need_move_in"
+    if "間取り" in goal and not layout:
+        return True, "need_layout"
+
+    if "？" in (assistant_text or "") or "?" in (assistant_text or ""):
+        return True, "assistant_question"
+
+    return False, "no_need"
+
+
+# ============================================================
+# Preferred hour learning
 # ============================================================
 
 def _to_jst(dt: datetime) -> datetime:
@@ -740,22 +797,15 @@ def choose_send_hour_jst(pref_hour: Optional[int]) -> int:
         return 19
 
 
-def is_within_jst_window(dt: Optional[datetime] = None) -> bool:
-    d = dt or now_jst()
-    h = d.hour
-    start = max(0, min(23, int(FOLLOWUP_JST_FROM)))
-    end = max(0, min(23, int(FOLLOWUP_JST_TO)))
-    if start < end:
-        return start <= h < end
-    if start > end:
-        return (h >= start) or (h < end)
-    return False
+# ============================================================
+# Followup AB
+# ============================================================
 
-
-def within_hour_band(now_hour: int, target_hour: int, band: int) -> bool:
-    diff = abs(now_hour - target_hour)
-    diff = min(diff, 24 - diff)
-    return diff <= max(0, band)
+def pick_ab_variant(conv_key: str) -> str:
+    if not FOLLOWUP_AB_ENABLED:
+        return "A"
+    h = hashlib.sha256(conv_key.encode("utf-8")).hexdigest()
+    return "A" if (int(h[:2], 16) % 2 == 0) else "B"
 
 
 # ============================================================
@@ -768,6 +818,7 @@ def mark_opt_out(shop_id: str, conv_key: str, user_id: str) -> None:
         UPDATE customers
         SET opt_out=TRUE, opt_out_at=now(), status='OPTOUT', user_id=%s,
             need_reply=FALSE, need_reply_reason='optout', need_reply_updated_at=now(),
+            perma_cold=TRUE,
             updated_at=now()
         WHERE shop_id=%s AND conv_key=%s
         """,
@@ -781,8 +832,8 @@ def mark_lost(shop_id: str, conv_key: str) -> None:
         UPDATE customers
         SET status='LOST',
             need_reply=FALSE, need_reply_reason='lost', need_reply_updated_at=now(),
-            updated_at=now(),
-            perma_cold=TRUE
+            perma_cold=TRUE,
+            updated_at=now()
         WHERE shop_id=%s AND conv_key=%s
         """,
         (shop_id, conv_key),
@@ -812,7 +863,64 @@ def revive_if_lost_by_keywords(shop_id: str, conv_key: str, text: str) -> bool:
 
 
 # ============================================================
-# LINE helpers
+# Followup logs + attribution
+# ============================================================
+
+def save_followup_log(
+    shop_id: str,
+    conv_key: str,
+    user_id: str,
+    message: str,
+    mode: str,
+    status: str,
+    error: Optional[str] = None,
+    variant: Optional[str] = None,
+    stage: Optional[int] = None,
+    send_hour_jst: Optional[int] = None,
+) -> None:
+    db_execute(
+        """
+        INSERT INTO followup_logs (shop_id, conv_key, user_id, message, mode, status, error, variant, stage, send_hour_jst)
+        VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+        """,
+        (
+            shop_id,
+            conv_key,
+            user_id,
+            message,
+            mode,
+            status,
+            (error or None),
+            (variant or None),
+            (stage or None),
+            (send_hour_jst if send_hour_jst is not None else None),
+        ),
+    )
+
+
+def attribute_followup_response(shop_id: str, conv_key: str) -> None:
+    window_since = utcnow() - timedelta(hours=FOLLOWUP_ATTRIBUTION_WINDOW_HOURS)
+    rows = db_fetchall(
+        """
+        SELECT id
+        FROM followup_logs
+        WHERE shop_id=%s AND conv_key=%s
+          AND status='sent'
+          AND responded_at IS NULL
+          AND created_at >= %s
+        ORDER BY created_at DESC
+        LIMIT 1
+        """,
+        (shop_id, conv_key, window_since),
+    )
+    if not rows:
+        return
+    fid = rows[0][0]
+    db_execute("UPDATE followup_logs SET responded_at=now() WHERE id=%s", (fid,))
+
+
+# ============================================================
+# LINE signature verify + send
 # ============================================================
 
 def verify_signature(body: bytes, signature: str) -> bool:
@@ -853,10 +961,6 @@ async def push_line(user_id: str, text: str) -> None:
                 print("[LINE] push failed:", r.status_code, r.text[:300])
     except Exception as e:
         print("[LINE] push exception:", repr(e))
-
-
-def is_visit_change_request(text: str) -> bool:
-    return any(re.search(p, text or "") for p in VISIT_CHANGE_PATTERNS)
 
 
 # ============================================================
@@ -940,17 +1044,13 @@ async def openai_chat(messages: List[Dict[str, str]], temperature: float = 0.2, 
 
 
 def _responses_extract_output_text(data: Dict[str, Any]) -> Optional[str]:
-    output_items = data.get("output", []) or []
     chunks: List[str] = []
-    for item in output_items:
+    for item in (data.get("output") or []):
         if item.get("type") == "message":
-            content = item.get("content", []) or []
-            for c in content:
+            for c in (item.get("content") or []):
                 if c.get("type") == "output_text" and isinstance(c.get("text"), str):
                     chunks.append(c["text"])
-    if not chunks:
-        return None
-    return "\n".join(chunks).strip()
+    return "\n".join(chunks).strip() if chunks else None
 
 
 async def openai_responses_json(
@@ -973,7 +1073,7 @@ async def openai_responses_json(
         async with httpx.AsyncClient(timeout=timeout_sec, verify=certifi.where()) as client:
             r = await client.post(RESPONSES_API_URL, headers=headers, json=payload)
             if r.status_code >= 400:
-                print("[OPENAI] responses failed:", r.status_code, (r.text or "")[:240])
+                print("[OPENAI] responses failed:", r.status_code, (r.text or "")[:200])
                 return None
             data = r.json()
         out = _responses_extract_output_text(data)
@@ -987,22 +1087,17 @@ async def openai_responses_json(
 
 def coerce_level(v: Any) -> int:
     try:
-        iv = int(float(str(v).strip()))
+        return max(1, min(10, int(float(str(v).strip()))))
     except Exception:
         return 5
-    return max(1, min(10, iv))
 
 
-def coerce_confidence(v: Any) -> float:
-    if v is None:
-        return 0.6
-    if isinstance(v, (int, float)):
-        fv = float(v)
-        if 1.0 < fv <= 100.0:
-            fv = fv / 100.0
-        return max(0.0, min(1.0, fv))
+def coerce_conf(v: Any) -> float:
     try:
-        return max(0.0, min(1.0, float(str(v).strip())))
+        f = float(v)
+        if 1.0 < f <= 100.0:
+            f = f / 100.0
+        return max(0.0, min(1.0, f))
     except Exception:
         return 0.6
 
@@ -1018,7 +1113,7 @@ def coerce_goal(v: Any) -> str:
 
 
 # ============================================================
-# Followup / auto_cold LLM
+# Followup / Auto cold LLM builders
 # ============================================================
 
 def _intent_label(intent: str) -> str:
@@ -1046,13 +1141,14 @@ async def generate_followup_message_llm(
 
     tone = "やさしく丁寧" if variant == "A" else "短く選択肢"
     stage_rule = "初回追客" if stage == 1 else "2回目追客（しつこくしない）"
+
     ctx = {
         "tone": tone,
         "stage_rule": stage_rule,
         "intent": intent,
         "intent_label": _intent_label(intent),
         "next_goal": next_goal,
-        "last_user_text": last_user_text[:200],
+        "last_user_text": last_user_text[:160],
     }
 
     history = get_recent_conversation_for_followup(shop_id, conv_key, limit=12)
@@ -1061,10 +1157,7 @@ async def generate_followup_message_llm(
         {"role": "user", "content": "会話:"},
     ]
     for m in history[-12:]:
-        role = m.get("role")
-        content = (m.get("content") or "")[:800]
-        if role in ("user", "assistant"):
-            input_msgs.append({"role": role, "content": content})
+        input_msgs.append({"role": m["role"], "content": m["content"][:800]})
 
     j = await openai_responses_json(
         model=OPENAI_MODEL_FOLLOWUP,
@@ -1099,7 +1192,7 @@ async def auto_cold_judge(shop_id: str, conv_key: str, history: List[Dict[str, s
     )
     input_msgs = [{"role": "user", "content": "会話履歴:"}]
     for m in history[-12:]:
-        input_msgs.append({"role": m["role"], "content": m["content"]})
+        input_msgs.append({"role": m["role"], "content": m["content"][:800]})
 
     return await openai_responses_json(
         model=OPENAI_MODEL_COLD,
@@ -1125,7 +1218,7 @@ def apply_silence_update(shop_id: str, conv_key: str, delta: int, perma: bool) -
 
 
 # ============================================================
-# Analyze + reply generation
+# Analyze + reply
 # ============================================================
 
 async def analyze_only(shop_id: str, conv_key: str, user_text: str) -> Tuple[int, float, str, str, List[str], str]:
@@ -1153,7 +1246,7 @@ async def analyze_only(shop_id: str, conv_key: str, user_text: str) -> Tuple[int
 
     if j:
         lvl = coerce_level(j.get("temp_level_raw", 5))
-        conf = coerce_confidence(j.get("confidence", 0.6))
+        conf = coerce_conf(j.get("confidence", 0.6))
         intent = coerce_intent(j.get("intent", "other"))
         goal = coerce_goal(j.get("next_goal", "要件確認"))
         reasons = j.get("reasons", [])
@@ -1175,6 +1268,7 @@ async def generate_reply_only(user_id: str, user_text: str) -> str:
         ctx.append({"role": role, "content": content})
     ctx.append({"role": "user", "content": user_text})
 
+    reply_text = ""
     try:
         reply_text = await openai_chat(ctx, temperature=0.35, timeout_sec=FAST_REPLY_TIMEOUT_SEC)
         reply_text = (reply_text or "").strip()
@@ -1190,69 +1284,33 @@ async def generate_reply_only(user_id: str, user_text: str) -> str:
 
 
 # ============================================================
-# Followup logs + attribution
+# Job lock
 # ============================================================
 
-def save_followup_log(
-    shop_id: str,
-    conv_key: str,
-    user_id: str,
-    message: str,
-    mode: str,
-    status: str,
-    error: Optional[str] = None,
-    variant: Optional[str] = None,
-    stage: Optional[int] = None,
-    send_hour_jst: Optional[int] = None,
-) -> None:
+def acquire_job_lock(key: str, ttl_sec: int) -> bool:
+    now = utcnow()
+    until = now + timedelta(seconds=max(10, int(ttl_sec)))
+    rows = db_fetchall("SELECT locked_until FROM job_locks WHERE key=%s", (key,))
+    if rows and rows[0][0] and rows[0][0] > now:
+        return False
     db_execute(
         """
-        INSERT INTO followup_logs (shop_id, conv_key, user_id, message, mode, status, error, variant, stage, send_hour_jst)
-        VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+        INSERT INTO job_locks (key, locked_until)
+        VALUES (%s, %s)
+        ON CONFLICT (key) DO UPDATE SET locked_until=EXCLUDED.locked_until
         """,
-        (
-            shop_id,
-            conv_key,
-            user_id,
-            message,
-            mode,
-            status,
-            (error or None),
-            (variant or None),
-            (stage or None),
-            (send_hour_jst if send_hour_jst is not None else None),
-        ),
+        (key, until),
     )
-
-
-def attribute_followup_response(shop_id: str, conv_key: str) -> None:
-    window_since = utcnow() - timedelta(hours=FOLLOWUP_ATTRIBUTION_WINDOW_HOURS)
-    rows = db_fetchall(
-        """
-        SELECT id
-        FROM followup_logs
-        WHERE shop_id=%s AND conv_key=%s
-          AND status='sent'
-          AND responded_at IS NULL
-          AND created_at >= %s
-        ORDER BY created_at DESC
-        LIMIT 1
-        """,
-        (shop_id, conv_key, window_since),
-    )
-    if not rows:
-        return
-    fid = rows[0][0]
-    db_execute("UPDATE followup_logs SET responded_at=now() WHERE id=%s", (fid,))
+    return True
 
 
 # ============================================================
-# Webhook
+# Dashboard APIs
 # ============================================================
 
 @app.get("/")
 async def root():
-    return {"ok": True}
+    return {"ok": True, "shop_id": SHOP_ID}
 
 
 @app.get("/healthz")
@@ -1260,233 +1318,50 @@ async def healthz():
     return {"ok": True, "ts": int(utcnow().timestamp())}
 
 
-@app.post("/line/webhook")
-async def line_webhook(
-    request: Request,
-    background: BackgroundTasks,
-    x_line_signature: str = Header(default="", alias="X-Line-Signature"),
-):
-    body = await request.body()
-    if not verify_signature(body, x_line_signature):
-        raise HTTPException(status_code=401, detail="invalid signature")
-
-    payload = json.loads(body.decode("utf-8"))
-    events = payload.get("events", []) or []
-
-    for ev in events:
-        if ev.get("type") != "message":
-            continue
-        message = ev.get("message", {}) or {}
-        if message.get("type") != "text":
-            continue
-
-        user_id = (ev.get("source") or {}).get("userId", "unknown")
-        reply_token = ev.get("replyToken", "")
-        user_text = (message.get("text") or "").strip()
-        if not user_text:
-            continue
-
-        conv_key = "user:" + str(user_id)
-
-        ensure_customer_row(SHOP_ID, conv_key, user_id)
-
-        # save inbound
-        save_message(SHOP_ID, conv_key, "user", user_text)
-
-        # attribute followup response
-        try:
-            attribute_followup_response(SHOP_ID, conv_key)
-        except Exception:
-            pass
-
-        # clear need_reply
-        try:
-            set_need_reply(SHOP_ID, conv_key, False, "user_replied")
-        except Exception:
-            pass
-
-        # update preferred hour learning
-        try:
-            update_customer_pref_hour(SHOP_ID, conv_key)
-        except Exception:
-            pass
-
-        # revive lost by keywords
-        try:
-            revive_if_lost_by_keywords(SHOP_ID, conv_key, user_text)
-        except Exception:
-            pass
-
-        # if inactive (won/perma/optout)
-        if is_inactive(SHOP_ID, conv_key):
-            await reply_line(reply_token, "承知しました。必要になったらいつでもご連絡ください。")
-            continue
-
-        # hard optout/lost
-        for pat in OPTOUT_PATTERNS:
-            if re.search(pat, user_text, flags=re.IGNORECASE):
-                mark_opt_out(SHOP_ID, conv_key, user_id)
-                await reply_line(reply_token, "承知しました。今後こちらからのご連絡は停止します。")
-                return {"ok": True}
-
-        for pat in CANCEL_PATTERNS:
-            if re.search(pat, user_text):
-                mark_lost(SHOP_ID, conv_key)
-                await reply_line(reply_token, "承知しました。必要になったらまたいつでもご連絡ください。")
-                return {"ok": True}
-
-        # special: visit change
-        if is_visit_change_request(user_text):
-            set_visit_slot(SHOP_ID, conv_key, "REQUEST_CHANGE")
-            await reply_line(reply_token, "承知しました。ご希望の曜日や時間帯（例：平日夜/土日午後など）を教えてください。")
-            continue
-
-        # fast reply
-        fast_reply = ""
-        try:
-            fast_reply = await asyncio.wait_for(generate_reply_only(user_id, user_text), timeout=FAST_REPLY_TIMEOUT_SEC)
-        except Exception:
-            fast_reply = ""
-
-        if fast_reply:
-            await reply_line(reply_token, fast_reply)
-
-            async def bg_analyze_store():
-                lvl_raw, conf, intent, goal, reasons, override = await analyze_only(SHOP_ID, conv_key, user_text)
-                lvl_stable = stable_from_history(conv_key, lvl_raw)
-
-                if override == "OPTOUT":
-                    mark_opt_out(SHOP_ID, conv_key, user_id)
-                    return
-                if override == "LOST":
-                    mark_lost(SHOP_ID, conv_key)
-                    return
-
-                # slots
-                prev = get_customer_slots(SHOP_ID, conv_key)
-                merged = merge_slots(prev, extract_slots(user_text))
-                if merged and merged != prev:
-                    set_customer_slots(SHOP_ID, conv_key, merged)
-
-                upsert_customer_state(SHOP_ID, conv_key, user_id, user_text, lvl_raw, lvl_stable, conf, intent, goal)
-                save_message(SHOP_ID, conv_key, "assistant", fast_reply, lvl_raw, lvl_stable, conf, intent, goal)
-
-                flags = get_customer_flags(SHOP_ID, conv_key)
-                need, reason = compute_need_reply(goal, flags, assistant_text=fast_reply)
-                set_need_reply(SHOP_ID, conv_key, need, reason)
-
-            background.add_task(bg_analyze_store)
-        else:
-            await reply_line(reply_token, "ありがとうございます！内容を確認しています。少々お待ちください😊")
-
-    return {"ok": True}
-
-
-# ============================================================
-# Dashboard API
-# ============================================================
-
 @app.get("/api/hot")
 async def api_hot(
     _: None = Depends(require_dashboard_key),
     shop_id: str = Query(default=SHOP_ID),
     min_level: int = Query(default=1, ge=1, le=10),
     limit: int = Query(default=80, ge=1, le=200),
-    view: str = Query(default="customers", pattern="^(customers|events|followups|ab_stats)$"),
 ):
-    if view == "customers":
-        rows = db_fetchall(
-            """
-            SELECT conv_key, user_id, last_user_text, temp_level_stable, confidence, COALESCE(intent,'other'),
-                   next_goal, updated_at,
-                   COALESCE(status,'ACTIVE'),
-                   COALESCE(need_reply,FALSE), COALESCE(need_reply_reason,''),
-                   COALESCE(won,FALSE), COALESCE(perma_cold,FALSE), COALESCE(silence_score,0),
-                   pref_hour_jst, pref_hour_samples
-            FROM customers
-            WHERE shop_id=%s AND COALESCE(temp_level_stable,0) >= %s
-            ORDER BY need_reply DESC, updated_at DESC
-            LIMIT %s
-            """,
-            (shop_id, min_level, limit),
-        )
-        return JSONResponse([
-            {
-                "conv_key": r[0],
-                "user_id": r[1],
-                "message": r[2],
-                "temp_level_stable": r[3],
-                "confidence": float(r[4]) if r[4] is not None else None,
-                "intent": r[5],
-                "next_goal": r[6],
-                "ts": r[7].isoformat() if r[7] else None,
-                "status": r[8],
-                "need_reply": bool(r[9]),
-                "need_reply_reason": r[10],
-                "won": bool(r[11]),
-                "perma_cold": bool(r[12]),
-                "silence_score": int(r[13] or 0),
-                "pref_hour_jst": r[14],
-                "pref_hour_samples": r[15],
-            }
-            for r in rows
-        ])
-
-    if view == "followups":
-        rows = db_fetchall(
-            """
-            SELECT user_id, conv_key, variant, mode, status, stage, message, error, responded_at, send_hour_jst, created_at
-            FROM followup_logs
-            WHERE shop_id=%s
-            ORDER BY created_at DESC
-            LIMIT %s
-            """,
-            (shop_id, limit),
-        )
-        return JSONResponse([
-            {
-                "user_id": r[0],
-                "conv_key": r[1],
-                "variant": r[2],
-                "mode": r[3],
-                "status": r[4],
-                "stage": r[5],
-                "message": r[6],
-                "error": r[7],
-                "responded_at": r[8].isoformat() if r[8] else None,
-                "send_hour_jst": r[9],
-                "ts": r[10].isoformat() if r[10] else None,
-            }
-            for r in rows
-        ])
-
-    if view == "events":
-        rows = db_fetchall(
-            """
-            SELECT role, content, created_at, temp_level_stable, confidence, COALESCE(intent,'other'), next_goal, conv_key
-            FROM messages
-            WHERE shop_id=%s
-            ORDER BY created_at DESC
-            LIMIT %s
-            """,
-            (shop_id, limit),
-        )
-        return JSONResponse([
-            {
-                "role": r[0],
-                "message": r[1],
-                "ts": r[2].isoformat() if r[2] else None,
-                "temp_level_stable": r[3],
-                "confidence": float(r[4]) if r[4] is not None else None,
-                "intent": r[5],
-                "next_goal": r[6],
-                "conv_key": r[7],
-            }
-            for r in rows
-        ])
-
-    # ab_stats placeholder
-    return JSONResponse([])
+    rows = db_fetchall(
+        """
+        SELECT conv_key, user_id, last_user_text, temp_level_stable, confidence,
+               COALESCE(intent,'other'), COALESCE(next_goal,''),
+               updated_at,
+               COALESCE(status,'ACTIVE'),
+               COALESCE(need_reply,FALSE), COALESCE(need_reply_reason,''),
+               COALESCE(won,FALSE), COALESCE(perma_cold,FALSE), COALESCE(silence_score,0),
+               pref_hour_jst, pref_hour_samples
+        FROM customers
+        WHERE shop_id=%s AND COALESCE(temp_level_stable,0) >= %s
+        ORDER BY need_reply DESC, updated_at DESC
+        LIMIT %s
+        """,
+        (shop_id, min_level, limit),
+    )
+    return JSONResponse([
+        {
+            "conv_key": r[0],
+            "user_id": r[1],
+            "message": r[2],
+            "temp_level_stable": r[3],
+            "confidence": float(r[4]) if r[4] is not None else None,
+            "intent": r[5],
+            "next_goal": r[6],
+            "ts": r[7].isoformat() if r[7] else None,
+            "status": r[8],
+            "need_reply": bool(r[9]),
+            "need_reply_reason": r[10],
+            "won": bool(r[11]),
+            "perma_cold": bool(r[12]),
+            "silence_score": int(r[13] or 0),
+            "pref_hour_jst": r[14],
+            "pref_hour_samples": r[15],
+        }
+        for r in rows
+    ])
 
 
 @app.get("/api/stats/level_dist")
@@ -1498,8 +1373,7 @@ async def api_stats_level_dist(
         """
         SELECT temp_level_stable, COUNT(*)
         FROM customers
-        WHERE shop_id=%s
-          AND temp_level_stable BETWEEN 1 AND 10
+        WHERE shop_id=%s AND temp_level_stable BETWEEN 1 AND 10
         GROUP BY temp_level_stable
         """,
         (shop_id,),
@@ -1514,22 +1388,21 @@ async def api_stats_level_dist(
     return JSONResponse(dist)
 
 
-# ============================================================
-# Customer detail API + pages
-# ============================================================
-
 @app.get("/api/customer/detail")
 async def api_customer_detail(
     _: None = Depends(require_dashboard_key),
     shop_id: str = Query(default=SHOP_ID),
     conv_key: str = Query(...),
-    msg_limit: int = Query(default=160, ge=10, le=400),
+    msg_limit: int = Query(default=180, ge=10, le=400),
     followup_limit: int = Query(default=80, ge=10, le=200),
 ):
     crow = db_fetchall(
         """
-        SELECT conv_key, user_id, last_user_text, temp_level_stable, confidence, COALESCE(intent,'other'), next_goal, updated_at,
-               COALESCE(status,'ACTIVE'), COALESCE(opt_out,FALSE),
+        SELECT conv_key, user_id, last_user_text, temp_level_stable, confidence,
+               COALESCE(intent,'other'), COALESCE(next_goal,''),
+               updated_at,
+               COALESCE(status,'ACTIVE'),
+               COALESCE(opt_out,FALSE),
                COALESCE(need_reply,FALSE), COALESCE(need_reply_reason,''),
                COALESCE(perma_cold,FALSE), COALESCE(silence_score,0),
                COALESCE(won,FALSE), won_at, won_by,
@@ -1567,7 +1440,7 @@ async def api_customer_detail(
 
     msgs = db_fetchall(
         """
-        SELECT role, content, created_at, temp_level_stable, confidence, COALESCE(intent,'other'), next_goal
+        SELECT role, content, created_at, temp_level_stable, confidence, COALESCE(intent,'other'), COALESCE(next_goal,'')
         FROM messages
         WHERE shop_id=%s AND conv_key=%s
         ORDER BY created_at DESC
@@ -1618,28 +1491,24 @@ async def api_customer_detail(
 
 
 # ============================================================
-# KPI (Executive)
+# KPI / Executive
 # ============================================================
 
 def get_kpi_summary(shop_id: str, days: int = 30) -> Dict[str, Any]:
     since = utcnow() - timedelta(days=max(1, min(365, int(days))))
 
     total = db_fetchall(
-        "SELECT COUNT(*) FROM customers WHERE shop_id=%s AND updated_at>= %s",
+        "SELECT COUNT(*) FROM customers WHERE shop_id=%s AND updated_at >= %s",
         (shop_id, since),
     )[0][0]
 
     won = db_fetchall(
-        "SELECT COUNT(*) FROM customers WHERE shop_id=%s AND COALESCE(won,FALSE)=TRUE AND won_at>= %s",
+        "SELECT COUNT(*) FROM customers WHERE shop_id=%s AND COALESCE(won,FALSE)=TRUE AND won_at >= %s",
         (shop_id, since),
     )[0][0]
 
     ai_touched = db_fetchall(
-        """
-        SELECT COUNT(DISTINCT conv_key)
-        FROM messages
-        WHERE shop_id=%s AND role='assistant' AND created_at>= %s
-        """,
+        "SELECT COUNT(DISTINCT conv_key) FROM messages WHERE shop_id=%s AND role='assistant' AND created_at >= %s",
         (shop_id, since),
     )[0][0]
 
@@ -1647,7 +1516,7 @@ def get_kpi_summary(shop_id: str, days: int = 30) -> Dict[str, Any]:
         """
         SELECT COALESCE(intent,'other'), COUNT(*)
         FROM customers
-        WHERE shop_id=%s AND COALESCE(won,FALSE)=TRUE AND won_at>= %s
+        WHERE shop_id=%s AND COALESCE(won,FALSE)=TRUE AND won_at >= %s
         GROUP BY COALESCE(intent,'other')
         """,
         (shop_id, since),
@@ -1672,6 +1541,308 @@ async def api_kpi(
     days: int = Query(default=30, ge=1, le=365),
 ):
     return JSONResponse(get_kpi_summary(shop_id, days))
+
+
+# ============================================================
+# Admin APIs
+# ============================================================
+
+@app.post("/api/customer/mark_won")
+async def api_mark_won(
+    _: None = Depends(require_admin_key),
+    shop_id: str = Query(default=SHOP_ID),
+    conv_key: str = Query(...),
+):
+    mark_won(shop_id, conv_key, by="admin")
+    return {"ok": True}
+
+
+@app.post("/api/customer/unmark_won")
+async def api_unmark_won(
+    _: None = Depends(require_admin_key),
+    shop_id: str = Query(default=SHOP_ID),
+    conv_key: str = Query(...),
+):
+    unmark_won(shop_id, conv_key)
+    return {"ok": True}
+
+
+@app.post("/api/customer/clear_perma_cold")
+async def api_clear_perma_cold(
+    _: None = Depends(require_admin_key),
+    shop_id: str = Query(default=SHOP_ID),
+    conv_key: str = Query(...),
+):
+    db_execute("UPDATE customers SET perma_cold=FALSE, silence_score=0, updated_at=now() WHERE shop_id=%s AND conv_key=%s", (shop_id, conv_key))
+    return {"ok": True}
+
+
+# ============================================================
+# Jobs
+# ============================================================
+
+@app.post("/jobs/followup")
+async def job_followup(_: None = Depends(require_admin_key)):
+    if not FOLLOWUP_ENABLED:
+        return {"ok": True, "enabled": False, "reason": "FOLLOWUP_ENABLED!=1"}
+
+    if not is_within_jst_window():
+        return {"ok": True, "enabled": True, "skipped": True, "reason": "out_of_time_window"}
+
+    if not acquire_job_lock("followup", FOLLOWUP_LOCK_TTL_SEC):
+        return {"ok": True, "enabled": True, "skipped": True, "reason": "locked"}
+
+    threshold = utcnow() - timedelta(minutes=FOLLOWUP_AFTER_MINUTES)
+    rows = db_fetchall(
+        """
+        SELECT conv_key, user_id, COALESCE(temp_level_stable,0), COALESCE(next_goal,''), COALESCE(last_user_text,''),
+               COALESCE(intent,'other'),
+               pref_hour_jst, updated_at,
+               COALESCE(opt_out,FALSE), COALESCE(perma_cold,FALSE), COALESCE(won,FALSE),
+               COALESCE(status,'ACTIVE')
+        FROM customers
+        WHERE shop_id=%s
+          AND COALESCE(temp_level_stable,0) >= %s
+          AND updated_at < %s
+          AND COALESCE(user_id,'') <> ''
+        ORDER BY updated_at ASC
+        LIMIT %s
+        """,
+        (SHOP_ID, FOLLOWUP_MIN_LEVEL, threshold, FOLLOWUP_LIMIT),
+    )
+
+    sent = 0
+    skipped_time = 0
+    failed = 0
+    now_hour = now_jst().hour
+
+    for (conv_key, user_id, lvl, goal, last_text, intent, pref_hour, updated_at, opt, cold, won, st) in rows:
+        st_u = (st or "ACTIVE").upper()
+        if opt or cold or won or st_u in ("OPTOUT", "LOST", "WON"):
+            continue
+
+        age_h = (utcnow() - updated_at).total_seconds() / 3600.0 if updated_at else 999
+        if age_h < FOLLOWUP_FORCE_SEND_AFTER_HOURS:
+            target = choose_send_hour_jst(pref_hour)
+            if not within_hour_band(now_hour, target, FOLLOWUP_TIME_MATCH_HOURS):
+                skipped_time += 1
+                continue
+
+        customer = {
+            "conv_key": conv_key,
+            "user_id": user_id,
+            "level": int(lvl or 0),
+            "next_goal": goal or "",
+            "last_user_text": last_text or "",
+            "intent": intent or "other",
+        }
+        variant = pick_ab_variant(conv_key)
+
+        msg = await generate_followup_message_llm(SHOP_ID, conv_key, stage=1, variant=variant, customer=customer)
+        mode = "llm"
+        if not msg:
+            msg = followup_fallback(1, intent or "other", goal or "")
+            mode = "template"
+
+        try:
+            await push_line(user_id, msg)
+            save_followup_log(SHOP_ID, conv_key, user_id, msg, mode, "sent", None, variant, 1, send_hour_jst=now_hour)
+            sent += 1
+        except Exception as e:
+            save_followup_log(SHOP_ID, conv_key, user_id, msg, mode, "failed", str(e)[:200], variant, 1, send_hour_jst=now_hour)
+            failed += 1
+
+    return {"ok": True, "sent": sent, "skipped_time": skipped_time, "failed": failed, "now_hour_jst": now_hour}
+
+
+@app.post("/jobs/auto_cold")
+async def job_auto_cold(_: None = Depends(require_admin_key)):
+    if not acquire_job_lock("auto_cold", 300):
+        return {"ok": True, "skipped": "locked"}
+
+    rows = db_fetchall(
+        """
+        SELECT conv_key
+        FROM customers
+        WHERE shop_id=%s
+          AND COALESCE(won,FALSE)=FALSE
+          AND COALESCE(opt_out,FALSE)=FALSE
+          AND COALESCE(perma_cold,FALSE)=FALSE
+        ORDER BY updated_at ASC
+        LIMIT %s
+        """,
+        (SHOP_ID, AUTO_COLD_LIMIT),
+    )
+
+    judged = 0
+    for (conv_key,) in rows:
+        hist = get_recent_conversation(SHOP_ID, conv_key, 12)
+        if not hist:
+            continue
+        j = await auto_cold_judge(SHOP_ID, conv_key, hist)
+        if not j:
+            continue
+        apply_silence_update(
+            SHOP_ID,
+            conv_key,
+            int(j.get("silence_score_delta", 0)),
+            bool(j.get("perma_cold", False)),
+        )
+        judged += 1
+
+    return {"ok": True, "judged": judged}
+
+
+# ============================================================
+# Dashboard HTML (NO template literals)
+# ============================================================
+
+@app.get("/dashboard", response_class=HTMLResponse)
+async def dashboard(
+    _: None = Depends(require_dashboard_key),
+    shop_id: str = Query(default=SHOP_ID),
+    min_level: int = Query(default=1, ge=1, le=10),
+    limit: int = Query(default=80, ge=1, le=200),
+    refresh: int = Query(default=DASHBOARD_REFRESH_SEC_DEFAULT, ge=0, le=300),
+    key: Optional[str] = Query(default=None),
+):
+    key_q = (key or "").strip()
+    html = f"""
+<!doctype html>
+<html lang="ja">
+<head>
+<meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width, initial-scale=1"/>
+<title>Dashboard | {shop_id}</title>
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
+<style>
+  body{{font-family:system-ui,-apple-system,"Hiragino Sans","Noto Sans JP",sans-serif;margin:16px;background:#0b1020;color:#fff}}
+  .row{{display:flex;gap:12px;flex-wrap:wrap;align-items:center}}
+  .card{{background:rgba(255,255,255,.06);border:1px solid rgba(255,255,255,.12);border-radius:14px;padding:12px}}
+  table{{width:100%;border-collapse:collapse}}
+  th,td{{border-bottom:1px solid rgba(255,255,255,.12);padding:8px;font-size:12px;vertical-align:top}}
+  th{{color:rgba(255,255,255,.7);text-align:left}}
+  .mono{{font-family:ui-monospace,Menlo,Monaco,Consolas,monospace}}
+  a{{color:#8ab4f8}}
+</style>
+</head>
+<body>
+  <div class="row">
+    <div class="card"><b>SHOP</b> <span class="mono">{shop_id}</span></div>
+    <div class="card"><a href="/dashboard/executive?shop_id={shop_id}&days=30&key={key_q}">Executive KPI →</a></div>
+  </div>
+
+  <div class="row" style="margin-top:12px;">
+    <div class="card" style="flex:1;min-width:320px;">
+      <div style="display:flex;justify-content:space-between;align-items:center;">
+        <b>温度分布（全体）</b><span class="mono">/api/stats/level_dist</span>
+      </div>
+      <canvas id="chart" height="110"></canvas>
+    </div>
+    <div class="card" style="flex:2;min-width:520px;">
+      <div style="display:flex;justify-content:space-between;align-items:center;">
+        <b>顧客（need_reply優先）</b><span class="mono">/api/hot</span>
+      </div>
+      <div style="margin-top:8px;overflow:auto;max-height:520px;">
+        <table>
+          <thead><tr>
+            <th>更新</th><th>Lv</th><th>intent</th><th>need</th><th>goal</th><th>pref</th><th>flags</th><th>user</th><th>msg</th>
+          </tr></thead>
+          <tbody id="rows"><tr><td colspan="9">loading...</td></tr></tbody>
+        </table>
+      </div>
+    </div>
+  </div>
+
+<script>
+  const KEY = {json.dumps(key_q)};
+  const SHOP = {json.dumps(shop_id)};
+
+  function esc(s) {{
+    return (s ?? "").toString().replace(/[&<>"]/g, c => ({{"&":"&amp;","<":"&lt;",">":"&gt;","\\"":"&quot;"}}[c]));
+  }}
+  function fmt(iso) {{
+    if (!iso) return "-";
+    try {{ return new Date(iso).toLocaleString(); }} catch(e) {{ return iso; }}
+  }}
+  async function fetchJson(url) {{
+    const r = await fetch(url);
+    return await r.json();
+  }}
+
+  function flagsCell(r) {{
+    let parts = [];
+    if (r.won) parts.push("WON");
+    if (r.perma_cold) parts.push("COLD");
+    if (r.silence_score != null && r.silence_score >= 5) parts.push("SIL+" + r.silence_score);
+    return parts.length ? parts.join(",") : "-";
+  }}
+
+  let chart = null;
+
+  async function renderDist() {{
+    const url = "/api/stats/level_dist?shop_id=" + encodeURIComponent(SHOP) + "&key=" + encodeURIComponent(KEY);
+    const dist = await fetchJson(url);
+    const labels = ["1","2","3","4","5","6","7","8","9","10"];
+    const data = labels.map(k => Number(dist[k] || 0));
+    const ctx = document.getElementById("chart");
+    if (chart) {{
+      chart.data.labels = labels;
+      chart.data.datasets[0].data = data;
+      chart.update();
+      return;
+    }}
+    chart = new Chart(ctx, {{
+      type: "bar",
+      data: {{ labels: labels, datasets: [{{ label: "count", data: data, borderWidth: 1 }}] }},
+      options: {{ responsive: true }}
+    }});
+  }}
+
+  async function renderRows() {{
+    const url = "/api/hot?shop_id=" + encodeURIComponent(SHOP)
+      + "&min_level=1&limit=120&key=" + encodeURIComponent(KEY);
+    const rows = await fetchJson(url);
+
+    const tbody = document.getElementById("rows");
+    if (!rows.length) {{
+      tbody.innerHTML = "<tr><td colspan='9'>no data</td></tr>";
+      return;
+    }}
+
+    tbody.innerHTML = rows.map(r => {{
+      const link = "/dashboard/customer?shop_id=" + encodeURIComponent(SHOP)
+        + "&conv_key=" + encodeURIComponent(r.conv_key)
+        + "&key=" + encodeURIComponent(KEY);
+
+      const pref = (r.pref_hour_jst == null) ? "-" : (String(r.pref_hour_jst) + "(" + String(r.pref_hour_samples || 0) + ")");
+      const need = r.need_reply ? (r.need_reply_reason || "need") : "-";
+
+      return "<tr>"
+        + "<td class='mono'>" + esc(fmt(r.ts)) + "</td>"
+        + "<td class='mono'>" + esc(r.temp_level_stable) + "</td>"
+        + "<td class='mono'>" + esc(r.intent || "-") + "</td>"
+        + "<td>" + esc(need) + "</td>"
+        + "<td>" + esc(r.next_goal || "-") + "</td>"
+        + "<td class='mono'>" + esc(pref) + "</td>"
+        + "<td class='mono'>" + esc(flagsCell(r)) + "</td>"
+        + "<td class='mono'><a href='" + link + "'>" + esc(r.user_id || "") + "</a></td>"
+        + "<td>" + esc((r.message || "").slice(0,140)) + "</td>"
+        + "</tr>";
+    }}).join("");
+  }}
+
+  async function tick() {{
+    await Promise.all([renderDist(), renderRows()]);
+  }}
+
+  tick().catch(console.error);
+  setInterval(() => tick().catch(console.error), {int(DASHBOARD_REFRESH_SEC_DEFAULT)} * 1000);
+</script>
+</body>
+</html>
+"""
+    return HTMLResponse(html)
 
 
 @app.get("/dashboard/executive", response_class=HTMLResponse)
@@ -1736,46 +1907,14 @@ async function fetchJson(url) {{
     return HTMLResponse(html)
 
 
-# ============================================================
-# Admin APIs: WIN / perma_cold解除
-# ============================================================
-
-@app.post("/api/customer/mark_won")
-async def api_mark_won(
-    _: None = Depends(require_admin_key),
+@app.get("/api/kpi")
+async def api_kpi(
+    _: None = Depends(require_dashboard_key),
     shop_id: str = Query(default=SHOP_ID),
-    conv_key: str = Query(...),
+    days: int = Query(default=30, ge=1, le=365),
 ):
-    mark_won(shop_id, conv_key, by="admin")
-    return {"ok": True, "won": True}
+    return JSONResponse(get_kpi_summary(shop_id, days))
 
-
-@app.post("/api/customer/unmark_won")
-async def api_unmark_won(
-    _: None = Depends(require_admin_key),
-    shop_id: str = Query(default=SHOP_ID),
-    conv_key: str = Query(...),
-):
-    unmark_won(shop_id, conv_key)
-    return {"ok": True, "won": False}
-
-
-@app.post("/api/customer/clear_perma_cold")
-async def api_clear_perma_cold(
-    _: None = Depends(require_admin_key),
-    shop_id: str = Query(default=SHOP_ID),
-    conv_key: str = Query(...),
-):
-    db_execute(
-        "UPDATE customers SET perma_cold=FALSE, silence_score=0, updated_at=now() WHERE shop_id=%s AND conv_key=%s",
-        (shop_id, conv_key),
-    )
-    return {"ok": True}
-
-
-# ============================================================
-# Dashboard HTML (enhanced customer page)
-# ============================================================
 
 @app.get("/dashboard/customer", response_class=HTMLResponse)
 async def dashboard_customer(
@@ -1785,7 +1924,6 @@ async def dashboard_customer(
     key: Optional[str] = Query(default=None),
 ):
     key_q = (key or "").strip()
-
     html = f"""
 <!doctype html>
 <html lang="ja">
@@ -1794,15 +1932,14 @@ async def dashboard_customer(
 <meta name="viewport" content="width=device-width, initial-scale=1"/>
 <title>Customer | {shop_id}</title>
 <style>
-  body{{font-family:system-ui,-apple-system,"Hiragino Sans","Noto Sans JP",sans-serif;margin:16px;background:#0b1020;color:#fff}}
+  body{{font-family:system-ui;background:#0b1020;color:#fff;margin:16px}}
   .card{{background:rgba(255,255,255,.06);border:1px solid rgba(255,255,255,.12);border-radius:14px;padding:12px;margin-bottom:12px}}
   .mono{{font-family:ui-monospace,Menlo,Monaco,Consolas,monospace}}
   a{{color:#8ab4f8}}
-  .msg{{padding:8px;border-bottom:1px solid rgba(255,255,255,.12)}}
-  .u{{color:#ffb020}} .a{{color:#37d67a}}
-  pre{{white-space:pre-wrap}}
   button{{padding:8px 10px;border-radius:10px;border:1px solid rgba(255,255,255,.18);background:rgba(255,255,255,.06);color:#fff;cursor:pointer}}
   .btnrow{{display:flex;gap:10px;flex-wrap:wrap}}
+  pre{{white-space:pre-wrap}}
+  .msg{{padding:8px;border-bottom:1px solid rgba(255,255,255,.12)}}
 </style>
 </head>
 <body>
@@ -1820,7 +1957,6 @@ async def dashboard_customer(
       <button onclick="clearCold()">🧊 perma_cold解除</button>
       <button onclick="runAutoCold()">🤖 auto_cold</button>
     </div>
-    <div style="opacity:.8;margin-top:8px">※ 成約は C方式：ここで押した時だけ WIN になります</div>
   </div>
 
   <div class="card"><b>Messages</b><div id="msgs">loading...</div></div>
@@ -1834,6 +1970,7 @@ async def dashboard_customer(
   function esc(s) {{
     return (s ?? "").toString().replace(/[&<>"]/g, c => ({{"&":"&amp;","<":"&lt;",">":"&gt;","\\"":"&quot;"}}[c]));
   }}
+
   async function fetchJson(url, opts) {{
     const r = await fetch(url, opts || undefined);
     return await r.json();
@@ -1851,35 +1988,25 @@ async def dashboard_customer(
     const d = await fetchJson(url);
     const c = d.customer || {{}};
 
-    const conf = (c.confidence == null) ? "-" : Number(c.confidence).toFixed(2);
     document.getElementById("cust").innerHTML =
-      "<b>User</b>: <span class='mono'>" + esc(c.user_id || "-") + "</span><br/>"
-      + "<b>Status</b>: <span class='mono'>" + esc(c.status || "-") + "</span> / "
-      + "<b>Lv</b>: <span class='mono'>" + esc(c.temp_level_stable || "-") + "</span> / "
-      + "<b>conf</b>: <span class='mono'>" + esc(conf) + "</span><br/>"
-      + "<b>Intent</b>: <span class='mono'>" + esc(c.intent || "-") + "</span> / "
-      + "<b>Goal</b>: " + esc(c.next_goal || "-") + "<br/>"
-      + "<b>need_reply</b>: <span class='mono'>" + esc(c.need_reply ? "TRUE" : "FALSE") + "</span> ("
-      + esc(c.need_reply_reason || "") + ")<br/>"
-      + "<b>pref_hour</b>: <span class='mono'>" + esc((c.pref_hour_jst ?? "-")) + "</span> samples:"
-      + "<span class='mono'>" + esc((c.pref_hour_samples ?? "-")) + "</span><br/>"
-      + "<b>silence_score</b>: <span class='mono'>" + esc((c.silence_score ?? 0)) + "</span> / "
-      + "<b>perma_cold</b>: <span class='mono'>" + esc(c.perma_cold ? "TRUE" : "FALSE") + "</span><br/>"
-      + "<b>won</b>: <span class='mono'>" + esc(c.won ? "TRUE" : "FALSE") + "</span> / "
-      + "<b>won_at</b>: <span class='mono'>" + esc(c.won_at || "-") + "</span> / "
-      + "<b>won_by</b>: <span class='mono'>" + esc(c.won_by || "-") + "</span><br/>"
-      + "<b>updated</b>: <span class='mono'>" + esc(c.updated_at || "-") + "</span>";
+      "<div><b>User</b>: <span class='mono'>" + esc(c.user_id || "-") + "</span></div>"
+      + "<div><b>Status</b>: <span class='mono'>" + esc(c.status || "-") + "</span>"
+      + " / <b>Lv</b>: <span class='mono'>" + esc(c.temp_level_stable || "-") + "</span>"
+      + " / <b>conf</b>: <span class='mono'>" + esc((c.confidence==null? "-" : Number(c.confidence).toFixed(2))) + "</span></div>"
+      + "<div><b>Intent</b>: <span class='mono'>" + esc(c.intent || "-") + "</span>"
+      + " / <b>Goal</b>: " + esc(c.next_goal || "-") + "</div>"
+      + "<div><b>need_reply</b>: <span class='mono'>" + esc(c.need_reply ? "TRUE" : "FALSE") + "</span> (" + esc(c.need_reply_reason || "") + ")</div>"
+      + "<div><b>perma_cold</b>: <span class='mono'>" + esc(c.perma_cold ? "TRUE" : "FALSE") + "</span>"
+      + " / <b>silence_score</b>: <span class='mono'>" + esc(String(c.silence_score ?? 0)) + "</span></div>"
+      + "<div><b>won</b>: <span class='mono'>" + esc(c.won ? "TRUE" : "FALSE") + "</span>"
+      + " / <b>won_at</b>: <span class='mono'>" + esc(c.won_at || "-") + "</span>"
+      + " / <b>won_by</b>: <span class='mono'>" + esc(c.won_by || "-") + "</span></div>";
 
     const msgs = d.messages || [];
     document.getElementById("msgs").innerHTML = msgs.length ? msgs.map(m => {{
-      const cls = (m.role === "user") ? "u" : "a";
-      const conf2 = (m.confidence == null) ? "-" : Number(m.confidence).toFixed(2);
       return "<div class='msg'>"
-        + "<div class='mono " + cls + "'>"
-        + esc(m.role) + " / " + esc(m.ts || "") + " / Lv:" + esc(m.temp_level_stable || "-")
-        + " / intent:" + esc(m.intent || "-") + " / goal:" + esc(m.next_goal || "-")
-        + " / conf:" + esc(conf2)
-        + "</div>"
+        + "<div class='mono'>" + esc(m.role) + " / " + esc(m.ts || "") + " / Lv:" + esc(m.temp_level_stable || "-")
+        + " / intent:" + esc(m.intent || "-") + " / goal:" + esc(m.next_goal || "-") + "</div>"
         + "<pre>" + esc(m.content || "") + "</pre>"
         + "</div>";
     }}).join("") : "no messages";
@@ -1887,11 +2014,8 @@ async def dashboard_customer(
     const fls = d.followups || [];
     document.getElementById("fls").innerHTML = fls.length ? fls.map(f => {{
       return "<div class='msg'>"
-        + "<div class='mono'>"
-        + "ts:" + esc(f.ts || "") + " / stage:" + esc(f.stage ?? "-")
-        + " / var:" + esc(f.variant || "-") + " / mode:" + esc(f.mode || "-")
-        + " / status:" + esc(f.status || "-") + " / send_hour:" + esc(f.send_hour_jst ?? "-")
-        + "</div>"
+        + "<div class='mono'>ts:" + esc(f.ts || "") + " / stage:" + esc(String(f.stage ?? "-")) + " / mode:" + esc(f.mode || "-")
+        + " / status:" + esc(f.status || "-") + " / send_hour:" + esc(String(f.send_hour_jst ?? "-")) + "</div>"
         + "<pre>" + esc(f.message || "") + "</pre>"
         + "<div class='mono'>responded:" + esc(f.responded_at || "-") + " / err:" + esc(f.error || "-") + "</div>"
         + "</div>";
@@ -1936,325 +2060,178 @@ async def dashboard_customer(
 
 
 # ============================================================
-# Dashboard HOME (same as clean stable; minimal)
+# KPI functions + api
 # ============================================================
 
-@app.get("/dashboard", response_class=HTMLResponse)
-async def dashboard(
+def get_kpi_summary(shop_id: str, days: int = 30) -> Dict[str, Any]:
+    since = utcnow() - timedelta(days=max(1, min(365, int(days))))
+
+    total = db_fetchall("SELECT COUNT(*) FROM customers WHERE shop_id=%s AND updated_at >= %s", (shop_id, since))[0][0]
+    won = db_fetchall("SELECT COUNT(*) FROM customers WHERE shop_id=%s AND COALESCE(won,FALSE)=TRUE AND won_at >= %s", (shop_id, since))[0][0]
+    ai_touched = db_fetchall("SELECT COUNT(DISTINCT conv_key) FROM messages WHERE shop_id=%s AND role='assistant' AND created_at >= %s", (shop_id, since))[0][0]
+
+    intent_rows = db_fetchall(
+        """
+        SELECT COALESCE(intent,'other'), COUNT(*)
+        FROM customers
+        WHERE shop_id=%s AND COALESCE(won,FALSE)=TRUE AND won_at >= %s
+        GROUP BY COALESCE(intent,'other')
+        """,
+        (shop_id, since),
+    )
+    intent_win = {str(r[0] or "other"): int(r[1] or 0) for r in intent_rows}
+
+    return {
+        "period_days": int(days),
+        "customers": int(total),
+        "won": int(won),
+        "win_rate": (won / total) if total else 0.0,
+        "ai_touched": int(ai_touched),
+        "ai_touch_rate": (ai_touched / total) if total else 0.0,
+        "intent_win": intent_win,
+    }
+
+
+@app.get("/api/kpi")
+async def api_kpi(
     _: None = Depends(require_dashboard_key),
     shop_id: str = Query(default=SHOP_ID),
-    min_level: int = Query(default=1, ge=1, le=10),
-    limit: int = Query(default=80, ge=1, le=200),
-    refresh: int = Query(default=DASHBOARD_REFRESH_SEC_DEFAULT, ge=0, le=300),
-    key: Optional[str] = Query(default=None),
+    days: int = Query(default=30, ge=1, le=365),
 ):
-    key_q = (key or "").strip()
-
-    html = f"""
-<!doctype html>
-<html lang="ja">
-<head>
-<meta charset="utf-8"/>
-<meta name="viewport" content="width=device-width, initial-scale=1"/>
-<title>Dashboard | {shop_id}</title>
-<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
-<style>
-  body{{font-family:system-ui,-apple-system,"Hiragino Sans","Noto Sans JP",sans-serif;margin:16px;background:#0b1020;color:#fff}}
-  .row{{display:flex;gap:12px;flex-wrap:wrap;align-items:center}}
-  .card{{background:rgba(255,255,255,.06);border:1px solid rgba(255,255,255,.12);border-radius:14px;padding:12px}}
-  table{{width:100%;border-collapse:collapse}}
-  th,td{{border-bottom:1px solid rgba(255,255,255,.12);padding:8px;font-size:12px;vertical-align:top}}
-  th{{color:rgba(255,255,255,.7);text-align:left}}
-  .mono{{font-family:ui-monospace,Menlo,Monaco,Consolas,monospace}}
-  a{{color:#8ab4f8}}
-</style>
-</head>
-<body>
-  <div class="row">
-    <div class="card"><b>SHOP</b> <span class="mono">{shop_id}</span></div>
-    <div class="card"><b>min_level</b> {min_level} / <b>limit</b> {limit} / <b>refresh</b> {refresh}s</div>
-    <div class="card"><a href="/dashboard/executive?shop_id={shop_id}&days=30&key={key_q}">Executive KPI →</a></div>
-  </div>
-
-  <div class="row" style="margin-top:12px;">
-    <div class="card" style="flex:1;min-width:320px;">
-      <div style="display:flex;justify-content:space-between;align-items:center;">
-        <b>温度分布（全体）</b><span class="mono">/api/stats/level_dist</span>
-      </div>
-      <canvas id="chart" height="110"></canvas>
-    </div>
-    <div class="card" style="flex:1;min-width:320px;">
-      <div style="display:flex;justify-content:space-between;align-items:center;">
-        <b>今やる（need_reply=TRUE）</b><span class="mono">customers</span>
-      </div>
-      <div style="margin-top:8px;overflow:auto;max-height:420px;">
-        <table>
-          <thead><tr>
-            <th>更新</th><th>Lv</th><th>intent</th><th>need</th><th>goal</th><th>pref</th><th>flags</th><th>user</th><th>msg</th>
-          </tr></thead>
-          <tbody id="needRows"><tr><td colspan="9">loading...</td></tr></tbody>
-        </table>
-      </div>
-    </div>
-  </div>
-
-  <div class="card" style="margin-top:12px;">
-    <div style="display:flex;justify-content:space-between;align-items:center;">
-      <b>顧客（最新）</b><span class="mono">/api/hot?view=customers</span>
-    </div>
-    <div style="margin-top:8px;overflow:auto;max-height:520px;">
-      <table>
-        <thead><tr>
-          <th>更新</th><th>Lv</th><th>conf</th><th>intent</th><th>goal</th><th>pref</th><th>flags</th><th>status</th><th>user</th><th>msg</th>
-        </tr></thead>
-        <tbody id="custRows"><tr><td colspan="10">loading...</td></tr></tbody>
-      </table>
-    </div>
-  </div>
-
-<script>
-  const KEY = {json.dumps(key_q)};
-  const SHOP = {json.dumps(shop_id)};
-  const MIN = {min_level};
-  const LIMIT = {limit};
-  const REFRESH = {refresh};
-
-  function esc(s) {{
-    return (s ?? "").toString().replace(/[&<>"]/g, c => ({{"&":"&amp;","<":"&lt;",">":"&gt;","\\"":"&quot;"}}[c]));
-  }}
-  function fmt(iso) {{
-    if (!iso) return "-";
-    try {{ return new Date(iso).toLocaleString(); }} catch(e) {{ return iso; }}
-  }}
-  async function fetchJson(url) {{
-    const r = await fetch(url);
-    return await r.json();
-  }}
-
-  function flagsCell(r) {{
-    let parts = [];
-    if (r.won) parts.push("WON");
-    if (r.perma_cold) parts.push("COLD");
-    if (r.silence_score != null && r.silence_score >= 5) parts.push("SIL+" + r.silence_score);
-    return parts.length ? parts.join(",") : "-";
-  }}
-
-  let chart = null;
-
-  async function renderDist() {{
-    const url = "/api/stats/level_dist?shop_id=" + encodeURIComponent(SHOP) + "&key=" + encodeURIComponent(KEY);
-    const dist = await fetchJson(url);
-    const labels = ["1","2","3","4","5","6","7","8","9","10"];
-    const data = labels.map(k => Number(dist[k] || 0));
-    const ctx = document.getElementById("chart");
-    if (chart) {{
-      chart.data.labels = labels;
-      chart.data.datasets[0].data = data;
-      chart.update();
-      return;
-    }}
-    chart = new Chart(ctx, {{
-      type: "bar",
-      data: {{ labels: labels, datasets: [{{ label: "count", data: data, borderWidth: 1 }}] }},
-      options: {{ responsive: true }}
-    }});
-  }}
-
-  async function renderCustomers() {{
-    const url = "/api/hot?view=customers"
-      + "&shop_id=" + encodeURIComponent(SHOP)
-      + "&min_level=" + encodeURIComponent(String(MIN))
-      + "&limit=" + encodeURIComponent(String(LIMIT))
-      + "&key=" + encodeURIComponent(KEY);
-
-    const rows = await fetchJson(url);
-    const need = rows.filter(r => !!r.need_reply);
-
-    const needBody = need.length ? need.map(r => {{
-      const link = "/dashboard/customer?shop_id=" + encodeURIComponent(SHOP)
-        + "&conv_key=" + encodeURIComponent(r.conv_key)
-        + "&key=" + encodeURIComponent(KEY);
-      return "<tr>"
-        + "<td class='mono'>" + esc(fmt(r.ts)) + "</td>"
-        + "<td class='mono'>" + esc(r.temp_level_stable) + "</td>"
-        + "<td class='mono'>" + esc(r.intent || "-") + "</td>"
-        + "<td>" + esc(r.need_reply_reason || "need") + "</td>"
-        + "<td>" + esc(r.next_goal || "-") + "</td>"
-        + "<td class='mono'>" + esc((r.pref_hour_jst ?? "-")) + "(" + esc((r.pref_hour_samples ?? "-")) + ")</td>"
-        + "<td class='mono'>" + esc(flagsCell(r)) + "</td>"
-        + "<td class='mono'><a href='" + link + "'>" + esc(r.user_id || "") + "</a></td>"
-        + "<td>" + esc((r.message || "").slice(0,140)) + "</td>"
-        + "</tr>";
-    }}).join("") : "<tr><td colspan='9'>need_reply なし</td></tr>";
-
-    document.getElementById("needRows").innerHTML = needBody;
-
-    const custBody = rows.length ? rows.map(r => {{
-      const link = "/dashboard/customer?shop_id=" + encodeURIComponent(SHOP)
-        + "&conv_key=" + encodeURIComponent(r.conv_key)
-        + "&key=" + encodeURIComponent(KEY);
-      const conf = (r.confidence == null) ? "-" : Number(r.confidence).toFixed(2);
-      return "<tr>"
-        + "<td class='mono'>" + esc(fmt(r.ts)) + "</td>"
-        + "<td class='mono'>" + esc(r.temp_level_stable) + "</td>"
-        + "<td class='mono'>" + esc(conf) + "</td>"
-        + "<td class='mono'>" + esc(r.intent || "-") + "</td>"
-        + "<td>" + esc(r.next_goal || "-") + "</td>"
-        + "<td class='mono'>" + esc((r.pref_hour_jst ?? "-")) + "(" + esc((r.pref_hour_samples ?? "-")) + ")</td>"
-        + "<td class='mono'>" + esc(flagsCell(r)) + "</td>"
-        + "<td class='mono'>" + esc(r.status || "-") + "</td>"
-        + "<td class='mono'><a href='" + link + "'>" + esc(r.user_id || "") + "</a></td>"
-        + "<td>" + esc((r.message || "").slice(0,160)) + "</td>"
-        + "</tr>";
-    }}).join("") : "<tr><td colspan='10'>no data</td></tr>";
-
-    document.getElementById("custRows").innerHTML = custBody;
-  }}
-
-  async function tick() {{
-    await Promise.all([renderDist(), renderCustomers()]);
-  }}
-
-  tick().catch(console.error);
-  if (REFRESH > 0) {{
-    setInterval(() => tick().catch(console.error), REFRESH * 1000);
-  }}
-</script>
-</body>
-</html>
-"""
-    return HTMLResponse(html)
+    return JSONResponse(get_kpi_summary(shop_id, days))
 
 
 # ============================================================
-# Jobs
+# LINE webhook
 # ============================================================
 
-def acquire_job_lock(key: str, ttl_sec: int) -> bool:
-    now = utcnow()
-    until = now + timedelta(seconds=max(10, int(ttl_sec)))
-    rows = db_fetchall("SELECT locked_until FROM job_locks WHERE key=%s", (key,))
-    if rows and rows[0][0] and rows[0][0] > now:
-        return False
-    db_execute(
-        """
-        INSERT INTO job_locks (key, locked_until)
-        VALUES (%s, %s)
-        ON CONFLICT (key) DO UPDATE SET locked_until=EXCLUDED.locked_until
-        """,
-        (key, until),
-    )
-    return True
+@app.post("/line/webhook")
+async def line_webhook(
+    request: Request,
+    background: BackgroundTasks,
+    x_line_signature: str = Header(default="", alias="X-Line-Signature"),
+):
+    body = await request.body()
+    if not verify_signature(body, x_line_signature):
+        raise HTTPException(status_code=401, detail="invalid signature")
 
+    payload = json.loads(body.decode("utf-8"))
+    events = payload.get("events", []) or []
 
-@app.post("/jobs/followup")
-async def job_followup(_: None = Depends(require_admin_key)):
-    if not FOLLOWUP_ENABLED:
-        return {"ok": True, "enabled": False, "reason": "FOLLOWUP_ENABLED!=1"}
-
-    if not is_within_jst_window():
-        return {"ok": True, "enabled": True, "skipped": True, "reason": "out_of_time_window"}
-
-    if not acquire_job_lock("followup", FOLLOWUP_LOCK_TTL_SEC):
-        return {"ok": True, "enabled": True, "skipped": True, "reason": "locked"}
-
-    threshold = utcnow() - timedelta(minutes=FOLLOWUP_AFTER_MINUTES)
-    rows = db_fetchall(
-        """
-        SELECT conv_key, user_id, COALESCE(temp_level_stable,0), COALESCE(next_goal,''), COALESCE(last_user_text,''),
-               COALESCE(intent,'other'),
-               pref_hour_jst, updated_at,
-               COALESCE(opt_out,FALSE), COALESCE(perma_cold,FALSE), COALESCE(won,FALSE),
-               COALESCE(status,'ACTIVE')
-        FROM customers
-        WHERE shop_id=%s
-          AND COALESCE(temp_level_stable,0) >= %s
-          AND updated_at < %s
-          AND COALESCE(user_id,'') <> ''
-        ORDER BY updated_at ASC
-        LIMIT %s
-        """,
-        (SHOP_ID, FOLLOWUP_MIN_LEVEL, threshold, FOLLOWUP_LIMIT),
-    )
-
-    sent = 0
-    skipped_time = 0
-    failed = 0
-    now_hour = now_jst().hour
-
-    for (conv_key, user_id, lvl, goal, last_text, intent, pref_hour, updated_at, opt, cold, won, st) in rows:
-        st_u = (st or "ACTIVE").upper()
-        if opt or cold or won or st_u in ("OPTOUT", "LOST", "WON"):
+    for ev in events:
+        if ev.get("type") != "message":
+            continue
+        message = ev.get("message", {}) or {}
+        if message.get("type") != "text":
             continue
 
-        age_h = (utcnow() - updated_at).total_seconds() / 3600.0 if updated_at else 999
-        if age_h < FOLLOWUP_FORCE_SEND_AFTER_HOURS:
-            target = choose_send_hour_jst(pref_hour)
-            if not within_hour_band(now_hour, target, FOLLOWUP_TIME_MATCH_HOURS):
-                skipped_time += 1
-                continue
+        user_id = (ev.get("source") or {}).get("userId", "unknown")
+        reply_token = ev.get("replyToken", "")
+        user_text = (message.get("text") or "").strip()
+        if not user_text:
+            continue
 
-        customer = {
-            "conv_key": conv_key,
-            "user_id": user_id,
-            "level": int(lvl or 0),
-            "next_goal": goal or "",
-            "last_user_text": last_text or "",
-            "intent": intent or "other",
-            "pref_hour_jst": pref_hour,
-        }
+        conv_key = "user:" + str(user_id)
 
-        variant = pick_ab_variant(conv_key)
-        msg = await generate_followup_message_llm(SHOP_ID, conv_key, stage=1, variant=variant, customer=customer)
-        mode = "llm"
-        if not msg:
-            msg = followup_fallback(1, intent or "other", goal or "")
-            mode = "template"
+        ensure_customer_row(SHOP_ID, conv_key, user_id)
 
+        # save inbound
         try:
-            await push_line(user_id, msg)
-            save_followup_log(SHOP_ID, conv_key, user_id, msg, mode, "sent", None, variant, 1, send_hour_jst=now_hour)
-            sent += 1
+            save_message(SHOP_ID, conv_key, "user", user_text)
         except Exception as e:
-            save_followup_log(SHOP_ID, conv_key, user_id, msg, mode, "failed", str(e)[:200], variant, 1, send_hour_jst=now_hour)
-            failed += 1
+            print("[DB] save user:", repr(e))
 
-    return {"ok": True, "enabled": True, "sent": sent, "skipped_time": skipped_time, "failed": failed, "now_hour_jst": now_hour}
+        # user replied => attribution + clear need
+        try:
+            attribute_followup_response(SHOP_ID, conv_key)
+        except Exception:
+            pass
+        try:
+            set_need_reply(SHOP_ID, conv_key, False, "user_replied")
+        except Exception:
+            pass
 
+        # update preferred hour
+        try:
+            update_customer_pref_hour(SHOP_ID, conv_key)
+        except Exception:
+            pass
 
-@app.post("/jobs/auto_cold")
-async def job_auto_cold(_: None = Depends(require_admin_key)):
-    if not acquire_job_lock("auto_cold", 300):
-        return {"ok": True, "skipped": "locked"}
+        # revive lost by keywords
+        try:
+            revive_if_lost_by_keywords(SHOP_ID, conv_key, user_text)
+        except Exception:
+            pass
 
-    rows = db_fetchall(
-        """
-        SELECT conv_key
-        FROM customers
-        WHERE shop_id=%s
-          AND COALESCE(won,FALSE)=FALSE
-          AND COALESCE(opt_out,FALSE)=FALSE
-          AND COALESCE(perma_cold,FALSE)=FALSE
-        ORDER BY updated_at ASC
-        LIMIT %s
-        """,
-        (SHOP_ID, AUTO_COLD_LIMIT),
-    )
-
-    judged = 0
-    for (conv_key,) in rows:
-        hist = get_recent_conversation(SHOP_ID, conv_key, 12)
-        if not hist:
+        if is_inactive(SHOP_ID, conv_key):
+            await reply_line(reply_token, "承知しました。必要になったらいつでもご連絡ください。")
             continue
-        j = await auto_cold_judge(SHOP_ID, conv_key, hist)
-        if not j:
-            continue
-        apply_silence_update(
-            SHOP_ID,
-            conv_key,
-            int(j.get("silence_score_delta", 0)),
-            bool(j.get("perma_cold", False)),
-        )
-        judged += 1
 
-    return {"ok": True, "judged": judged}
+        # hard optout/lost
+        for pat in OPTOUT_PATTERNS:
+            if re.search(pat, user_text, flags=re.IGNORECASE):
+                mark_opt_out(SHOP_ID, conv_key, user_id)
+                await reply_line(reply_token, "承知しました。今後こちらからのご連絡は停止します。")
+                return {"ok": True}
+
+        for pat in CANCEL_PATTERNS:
+            if re.search(pat, user_text):
+                mark_lost(SHOP_ID, conv_key)
+                await reply_line(reply_token, "承知しました。必要になったらまたいつでもご連絡ください。")
+                return {"ok": True}
+
+        # visit change / selection
+        if is_visit_change_request(user_text):
+            set_visit_slot(SHOP_ID, conv_key, "REQUEST_CHANGE")
+            await reply_line(reply_token, "承知しました。ご希望の曜日や時間帯（例：平日夜/土日午後など）を教えてください。")
+            continue
+
+        sel = parse_slot_selection(user_text)
+        if sel is not None:
+            slots = upcoming_visit_slots_jst(VISIT_DAYS_AHEAD)
+            if 1 <= sel <= len(slots):
+                picked = slots[sel - 1]
+                set_visit_slot(SHOP_ID, conv_key, picked)
+                await reply_line(reply_token, "ありがとうございます！内見希望枠は「" + picked + "」で承りました。")
+            else:
+                await reply_line(reply_token, "番号は 1〜6 の範囲でお願いします。")
+            continue
+
+        # fast reply
+        fast_reply = ""
+        try:
+            fast_reply = await asyncio.wait_for(generate_reply_only(user_id, user_text), timeout=FAST_REPLY_TIMEOUT_SEC)
+        except Exception:
+            fast_reply = ""
+
+        if fast_reply:
+            await reply_line(reply_token, fast_reply)
+
+            async def bg():
+                lvl_raw, conf, intent, goal, reasons, override = await analyze_only(SHOP_ID, conv_key, user_text)
+                lvl_stable = stable_from_history(conv_key, lvl_raw)
+
+                if override == "OPTOUT":
+                    mark_opt_out(SHOP_ID, conv_key, user_id)
+                    return
+                if override == "LOST":
+                    mark_lost(SHOP_ID, conv_key)
+                    return
+
+                prev = get_customer_slots(SHOP_ID, conv_key)
+                merged = merge_slots(prev, extract_slots(user_text))
+                if merged and merged != prev:
+                    set_customer_slots(SHOP_ID, conv_key, merged)
+
+                upsert_customer_state(SHOP_ID, conv_key, user_id, user_text, lvl_raw, lvl_stable, conf, intent, goal)
+                save_message(SHOP_ID, conv_key, "assistant", fast_reply, lvl_raw, lvl_stable, conf, intent, goal)
+
+                flags = get_customer_flags(SHOP_ID, conv_key)
+                need, reason = compute_need_reply(goal, flags, assistant_text=fast_reply)
+                set_need_reply(SHOP_ID, conv_key, need, reason)
+
+            background.add_task(bg)
+        else:
+            await reply_line(reply_token, "ありがとうございます！内容を確認しています。少々お待ちください😊")
+
+    return {"ok": True}
